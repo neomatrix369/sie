@@ -20,9 +20,13 @@ SIE_API_KEY=your_gateway_token
 
 Restart or reload the rag-params-finder server after changing `.env`.
 
-Check the gateway, then the app health:
+Check the gateway, then the app health. Values in `.env` are not exported to
+the shell automatically:
 
 ```bash
+set -a
+source .env
+set +a
 curl -H "Authorization: Bearer $SIE_API_KEY" "$SIE_ENDPOINT/healthz"
 curl -s http://localhost:8001/health
 # → "sie":"reachable"

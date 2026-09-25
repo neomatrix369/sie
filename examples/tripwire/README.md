@@ -12,7 +12,7 @@ in that repo.
 `/v1/chat/completions` for post-scan triage). Mock demo and Live scans work
 without routing. Auto-route / `tripwire route` need **both** `SIE_*` and Model
 Studio keys today (see [SIE integration](./sie-integration.md)); upstream
-[sie-setup](https://github.com/neomatrix369/tripwire/blob/main/docs/user-guide/sie-setup.md)
+[tiered-router setup](https://github.com/neomatrix369/tripwire/blob/e0806ea01f62192346db67f4d45f745d7e7bde71/docs/user-guide/setup-commands.md#tiered-router-optional)
 may still call Model Studio “optional.”
 
 ## Who this is for
