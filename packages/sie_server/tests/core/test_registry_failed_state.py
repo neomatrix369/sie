@@ -1,6 +1,6 @@
 """Tests for the terminal ``failed`` state machine in ModelRegistry.
 
-Covers the regression tracked in sie-test#85: a load failure (gated repo,
+Covers a terminal load-failure regression: a load failure (gated repo,
 missing dependency, etc.) used to silently return the model to
 ``available``, producing an infinite retry loop. The registry now records
 a :class:`LoadFailure` and short-circuits ``start_load_async`` while the

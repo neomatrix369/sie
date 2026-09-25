@@ -557,6 +557,7 @@ def test_metric_inventory_is_exact() -> None:
         "sie.worker.scheduler.adaptive.p50",
         "sie.worker.scheduler.starvation.resets",
         "sie.worker.generation.ttft",
+        "sie.worker.generation.worker_wait",
         "sie.worker.generation.tpot",
         "sie.worker.generation.tokens",
         "sie.worker.generation.inflight",

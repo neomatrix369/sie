@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections import Counter
+from unittest.mock import MagicMock
+
 import dspy
 from sie_dspy import SIEExtractor, SIEReranker
 from sie_dspy.modules import Entity
@@ -55,6 +58,69 @@ class TestSIEReranker:
 
         assert len(result.passages) == len(ml_corpus)
         assert len(result.scores) == len(ml_corpus)
+        # Every passage comes back exactly as many times as it went in (Counter
+        # checks multiplicity, not just membership). The envelope bug tried to
+        # zip passages against the ScoreResult dict's keys.
+        assert Counter(result.passages) == Counter(ml_corpus)
+        # Distinct and descending.
+        assert result.scores == sorted(result.scores, reverse=True)
+        assert len(set(result.scores)) == len(result.scores)
+
+    def test_rerank_maps_scores_by_item_id(self, mock_sie_client: object) -> None:
+        """Top-ranked passage is the relevant one, scores mapped by item_id."""
+        passages = [f"doc-{i}" for i in range(5)]
+        # Ranked entries reference input positions via item_id (doc-3 = index 3
+        # is most relevant), out of input order.
+        mock_sie_client.score = MagicMock(
+            return_value={
+                "model": "test-reranker",
+                "scores": [
+                    {"item_id": "3", "score": 0.9, "rank": 0},
+                    {"item_id": "1", "score": 0.7, "rank": 1},
+                    {"item_id": "4", "score": 0.5, "rank": 2},
+                    {"item_id": "0", "score": 0.3, "rank": 3},
+                    {"item_id": "2", "score": 0.1, "rank": 4},
+                ],
+            }
+        )
+        reranker = SIEReranker(model="test-reranker")
+        reranker._client = mock_sie_client
+
+        result = reranker(query="query", passages=passages)
+
+        assert result.passages == ["doc-3", "doc-1", "doc-4", "doc-0", "doc-2"]
+        assert result.scores == [0.9, 0.7, 0.5, 0.3, 0.1]
+
+    def test_rerank_skips_malformed_item_id(self, mock_sie_client: object) -> None:
+        """Malformed item_ids are skipped (no crash, no misassignment)."""
+        passages = [f"doc-{i}" for i in range(3)]
+        # Only item_id "1" is usable; the rest are malformed. The float 1.5 and
+        # bool True come after the valid "1": if int() accepted them
+        # (int(1.5) == 1, int(True) == 1) they would overwrite doc-1's score.
+        mock_sie_client.score = MagicMock(
+            return_value={
+                "model": "test-reranker",
+                "scores": [
+                    {"item_id": "1", "score": 0.8, "rank": 0},
+                    {"item_id": "not-an-int", "score": 0.95, "rank": 1},
+                    {"item_id": "-1", "score": 0.9, "rank": 2},
+                    {"item_id": "99", "score": 0.7, "rank": 3},
+                    {"score": 0.5, "rank": 4},
+                    {"item_id": 1.5, "score": 0.99, "rank": 5},
+                    {"item_id": True, "score": 0.98, "rank": 6},
+                ],
+            }
+        )
+        reranker = SIEReranker(model="test-reranker")
+        reranker._client = mock_sie_client
+
+        result = reranker(query="query", passages=passages)
+
+        assert len(result.passages) == 3
+        assert Counter(result.passages) == Counter(["doc-0", "doc-1", "doc-2"])
+        by_passage = dict(zip(result.passages, result.scores, strict=True))
+        assert by_passage == {"doc-1": 0.8, "doc-0": 0.0, "doc-2": 0.0}
+        assert result.passages[0] == "doc-1"
 
     def test_rerank_k_larger_than_passages(self, mock_sie_client: object) -> None:
         """Test reranking when k is larger than passage count."""

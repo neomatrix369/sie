@@ -23,11 +23,14 @@ metadata:
     {{- include "sie-cluster.mcpEdge.labels" . | nindent 4 }}
   {{- $annotations := dict }}
   {{- /* base64 documents can be large; MCP streamable-HTTP needs unbuffered,
-         long-lived responses. */ -}}
+         long-lived responses. The edge fans out to the same workers, so its
+         read/send timeout is derived from workers.common.modelReadyTimeoutSec
+         too — see "sie-cluster.ingress.proxyTimeoutSeconds". */ -}}
+  {{- $proxyTimeoutS := include "sie-cluster.ingress.proxyTimeoutSeconds" . }}
   {{- $nginxDefaults := dict
         "nginx.ingress.kubernetes.io/proxy-body-size" "100m"
-        "nginx.ingress.kubernetes.io/proxy-read-timeout" "600"
-        "nginx.ingress.kubernetes.io/proxy-send-timeout" "600"
+        "nginx.ingress.kubernetes.io/proxy-read-timeout" $proxyTimeoutS
+        "nginx.ingress.kubernetes.io/proxy-send-timeout" $proxyTimeoutS
         "nginx.ingress.kubernetes.io/proxy-buffering" "off"
   }}
   {{- $annotations = merge $annotations $nginxDefaults }}

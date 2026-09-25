@@ -13,9 +13,46 @@ from langchain_core.documents.compressor import BaseDocumentCompressor
 from pydantic import ConfigDict
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from sie_sdk import SIEAsyncClient, SIEClient
+
+
+def _scores_by_index(results: Mapping[str, Any], count: int) -> list[float]:
+    """Map ScoreResult entries back to input positions by item_id.
+
+    Parses each entry's ``item_id`` defensively: a missing, non-integer,
+    negative, or out-of-range id is skipped (that input keeps its 0.0 default)
+    so a malformed entry can neither crash the rerank nor mis-assign a score to
+    the wrong input.
+
+    Args:
+        results: ScoreResult envelope from ``SIEClient.score()``.
+        count: Number of input items.
+
+    Returns:
+        Scores indexed by input position (0.0 for any unscored/invalid item).
+    """
+    scores = [0.0] * count
+    for entry in results.get("scores", []):
+        item_id = entry.get("item_id", entry.get("index"))
+        # Accept only a genuine integer or an integer string. Reject bool (an int
+        # subclass, int(True) == 1), float (int(1.5) == 1), and non-integer
+        # strings, so a malformed id cannot silently overwrite the wrong position.
+        if isinstance(item_id, bool):
+            continue
+        if isinstance(item_id, int):
+            idx = item_id
+        elif isinstance(item_id, str):
+            try:
+                idx = int(item_id)
+            except ValueError:
+                continue
+        else:
+            continue
+        if 0 <= idx < count:
+            scores[idx] = float(entry.get("score", 0.0))
+    return scores
 
 
 class SIEReranker(BaseDocumentCompressor):
@@ -174,39 +211,32 @@ class SIEReranker(BaseDocumentCompressor):
             return reranked[: self.top_k]
         return reranked
 
-    def _build_reranked_documents(self, documents: Sequence[Document], results: list[Any]) -> list[Document]:
+    def _build_reranked_documents(self, documents: Sequence[Document], results: Mapping[str, Any]) -> list[Document]:
         """Build reranked documents from score results.
 
         Args:
             documents: Original documents.
-            results: Score results from SIE.
+            results: ScoreResult envelope from ``SIEClient.score()``. Ranked
+                entries live under ``results["scores"]`` (each a ScoreEntry with
+                ``item_id`` = input position and ``score``), already sorted by
+                relevance descending. The envelope also carries
+                ``results["request"]`` (request id) and ``results["usage"]``
+                (token usage); those are available but intentionally not plumbed
+                through the LangChain contract.
 
         Returns:
-            Reranked documents with scores.
+            Reranked documents (relevance descending) with scores in metadata.
         """
-        reranked = []
-
-        for result in results:
-            # Handle dict or object result
-            if isinstance(result, dict):
-                idx = result.get("item_id", result.get("index", 0))
-                score = result.get("score", 0.0)
-            else:
-                idx = getattr(result, "item_id", getattr(result, "index", 0))
-                score = getattr(result, "score", 0.0)
-
-            # Parse index if it's a string
-            if isinstance(idx, str):
-                idx = int(idx)
-
-            if idx < len(documents):
-                doc = documents[idx]
-                # Create new document with score in metadata
-                reranked.append(
-                    Document(
-                        page_content=doc.page_content,
-                        metadata={**doc.metadata, "relevance_score": float(score)},
-                    )
-                )
-
-        return reranked
+        # Map each ScoreEntry back to its input position by item_id. Parse
+        # defensively: a missing, non-integer, negative, or out-of-range id is
+        # skipped (its document keeps the 0.0 default) rather than crashing the
+        # whole rerank or mis-assigning a score to the wrong document.
+        scores = _scores_by_index(results, len(documents))
+        order = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
+        return [
+            Document(
+                page_content=documents[i].page_content,
+                metadata={**documents[i].metadata, "relevance_score": scores[i]},
+            )
+            for i in order
+        ]

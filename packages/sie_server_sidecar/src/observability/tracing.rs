@@ -48,8 +48,8 @@ pub fn metrics_provider_enabled() -> bool {
     METER_PROVIDER.get().is_some()
 }
 
-// The OTLP transport/proxy/resource plumbing is shared via `sie-telemetry`
-// (#2339); the imports below keep every historical call-site and test name
+// The OTLP transport/proxy/resource plumbing is shared via `sie-telemetry`;
+// the imports below keep every historical call-site and test name
 // resolvable inside this module.
 use sie_telemetry::env::{cleaned_env, sie_tracing_enabled};
 use sie_telemetry::exporters::build_span_exporter;
@@ -222,10 +222,10 @@ fn sidecar_service_name(configured: Option<&str>) -> String {
     }
 }
 
-/// Build the resource attributes shared with the gateway and managed lanes.
+/// Build the resource attributes shared with the gateway and other runtimes.
 /// The sidecar's historical shape: no `service.version` attribute and no
 /// `SIE_DEPLOYMENT_ENV` / `AWS_REGION` fallbacks (unlike gateway + worker —
-/// drift flagged in #2339, deliberately not normalized here).
+/// deliberately not normalized here).
 fn otlp_resource(service_name: &str) -> Resource {
     otlp_resource_from_values(
         service_name,

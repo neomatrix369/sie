@@ -9,11 +9,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from sie_server.config.device_groups import validate_tensor_parallel_size
 from sie_server.config.engine import ComputePrecision
 from sie_server.config.package_artifacts import (
     PackageArtifactDeclaration,
     has_package_artifact_declaration,
     parse_package_artifact_declaration,
+)
+from sie_server.config.serving_artifacts import (
+    ServingArtifactDeclaration,
+    parse_serving_artifact_declaration,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,6 +31,14 @@ _MAX_POOL_NAME_LEN = 128
 _CHAT_TEMPLATE_KWARGS = frozenset({"enable_thinking", "guardian_config"})
 _GUARDIAN_CONFIG_KWARGS = frozenset({"risk_name"})
 _MAX_GUARDIAN_RISK_NAME_LEN = 128
+_SERVING_ARTIFACT_PRECISION: dict[str, ComputePrecision] = {
+    "bfloat16": "bfloat16",
+    "float16": "float16",
+    "float32": "float32",
+    "int8_bfloat16": "bfloat16",
+    "int8_float16": "float16",
+    "int8_float32": "float32",
+}
 
 
 def validate_chat_template_kwargs(value: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -211,9 +224,12 @@ class PrewarmGrammar(BaseModel):
 class GenerateTask(BaseModel):
     """Generation task declaration.
 
-    ``context_length`` is the maximum total tokens (prompt + completion) the
-    model can process. ``max_output_tokens`` is the per-request hard cap on
-    ``max_new_tokens`` enforced by the gateway.
+    ``context_length`` is the maximum shared prompt-plus-completion envelope by
+    default. Encoder-decoder adapters may instead declare independent axes, in
+    which case it bounds encoder input and ``max_output_tokens`` independently
+    caps decoder output. The gateway uses ``max_output_tokens`` for
+    pre-admission, and the worker authoritatively enforces it as the per-request
+    hard cap on ``max_new_tokens`` before adapter dispatch.
 
     ``chat_template_kwargs`` are a bounded operator-owned mapping forwarded
     to the tokenizer's ``apply_chat_template(**kwargs)`` call when the worker
@@ -274,6 +290,67 @@ class Tasks(BaseModel):
     score: ScoreTask | None = None
     extract: ExtractTask | None = None
     generate: GenerateTask | None = None
+
+
+_PLACEMENT_LAUNCH_FLAGS = frozenset(
+    {
+        "--tp",
+        "--tp-size",
+        "--tensor-parallel-size",
+        "--dp",
+        "--dp-size",
+        "--data-parallel-size",
+        "--ep-size",
+        "--expert-parallel-size",
+        "--pp-size",
+        "--pipeline-parallel-size",
+        "--nnodes",
+        "--node-rank",
+        "--dist-init-addr",
+        "--base-gpu-id",
+        "--gpu-id-step",
+    }
+)
+"""Launch flags that decide how many accelerators a model takes, or which.
+
+Each one is refused inside ``extra_launch_args`` because the registry reserves
+devices from the declared width, and a width passed straight to the engine
+would serve on devices nothing reserved.
+"""
+
+
+_LISTENER_LAUNCH_FLAGS = frozenset({"--host", "--nccl-port", "--port"})
+"""Launch flags that decide where the engine listens.
+
+Each one is refused inside ``extra_launch_args`` because the server owns both
+listeners: the adapter passes the HTTP host and port it then talks to, and it
+reserves the tensor-parallel rendezvous port before passing ``--nccl-port``.
+The passthrough is appended after the flags the adapter builds and the engine's
+parser keeps the last spelling of a flag, so one set here would move the HTTP
+listener away from the one the adapter reaches, or rendezvous a group on a port
+nothing reserved.
+"""
+
+_REFUSED_LAUNCH_FLAGS = _PLACEMENT_LAUNCH_FLAGS | _LISTENER_LAUNCH_FLAGS
+
+
+def _refused_launch_flag(token: object) -> str | None:
+    """The refused flag a launch-argument token spells, abbreviations included.
+
+    SGLang's parser accepts any unambiguous prefix of a long option, so
+    ``--tensor-parallel 4`` reaches ``--tensor-parallel-size`` exactly as the
+    full spelling does.
+    """
+    flag = str(token).split("=", 1)[0].strip()
+    if not flag.startswith("--") or len(flag) <= len("--"):
+        return None
+    for refused in sorted(_REFUSED_LAUNCH_FLAGS):
+        if refused.startswith(flag):
+            return refused
+    return None
+
+
+_PLACEMENT_ENV_VARS = frozenset({"CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"})
 
 
 class AdapterOptions(BaseModel):
@@ -348,6 +425,71 @@ class AdapterOptions(BaseModel):
                 "40-char commit SHA; pin the resolved draft checkpoint commit"
             )
             raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def validate_serving_artifact_shape(self) -> "AdapterOptions":
+        # Source identity lives on ModelConfig, so only parse the closed nested
+        # declaration and reject loader-owned injection fields at this layer.
+        parse_serving_artifact_declaration(self.loadtime)
+        return self
+
+    @model_validator(mode="after")
+    def validate_placement_is_not_smuggled(self) -> "AdapterOptions":
+        """Refuse placement facts hidden in the raw passthroughs.
+
+        How many accelerators a model takes has to be visible to the registry
+        that reserves them. A width reaching the engine through
+        ``extra_launch_args`` is not, so the model would serve on a group
+        nothing reserved. ``extra_env`` is refused for the same reason, and
+        because the launcher writes the device mask last, so a mask set there
+        would be silently discarded rather than honoured.
+
+        Where the engine listens is reserved the same way, so the flags that
+        move a listener are refused too: the rendezvous port has an option of
+        its own, and the HTTP listener belongs to the adapter that talks to it.
+
+        Requirements that belong to one engine, such as a read cap for a
+        group, are enforced by that engine's adapter, since a width is valid
+        for any adapter that accepts one.
+        """
+        # Key presence, not value: an explicit null is a mistake rather than a
+        # request for the default, and the adapter rejects it either way.
+        # Catching it here keeps the two layers from disagreeing.
+        if "tensor_parallel_size" in self.loadtime:
+            validate_tensor_parallel_size(self.loadtime.get("tensor_parallel_size"))
+
+        raw_args = self.loadtime.get("extra_launch_args") or []
+        if isinstance(raw_args, list):
+            for entry in raw_args:
+                refused = _refused_launch_flag(entry)
+                if refused is None:
+                    continue
+                spelled = str(entry).split("=", 1)[0].strip()
+                if refused in _LISTENER_LAUNCH_FLAGS:
+                    remedy = (
+                        "Declare loadtime.nccl_port instead, so the group rendezvouses on the port SIE reserved."
+                        if refused == "--nccl-port"
+                        else "The server passes the host and port of the engine's HTTP listener and talks to it."
+                    )
+                    msg = f"extra_launch_args carries {spelled!r}, which sets the listener flag {refused!r}. {remedy}"
+                else:
+                    msg = (
+                        f"extra_launch_args carries {spelled!r}, which sets the "
+                        f"placement flag {refused!r}. Declare the width as "
+                        "loadtime.tensor_parallel_size instead, so the registry can reserve the devices."
+                    )
+                raise ValueError(msg)
+
+        raw_env = self.loadtime.get("extra_env") or {}
+        if isinstance(raw_env, dict):
+            for key in raw_env:
+                if str(key).strip().upper() in _PLACEMENT_ENV_VARS:
+                    msg = (
+                        f"extra_env sets {key!r}, which the launcher overwrites with the "
+                        "registry's device mask. Declare loadtime.tensor_parallel_size instead."
+                    )
+                    raise ValueError(msg)
         return self
 
 
@@ -932,6 +1074,42 @@ class ModelConfig(BaseModel):
         if self.package_backed and len(declarations) != 1:
             raise ValueError("all profiles of a package-backed model must declare identical package artifacts")
         return self
+
+    @model_validator(mode="after")
+    def validate_serving_artifacts(self) -> "ModelConfig":
+        resolved_profiles = {name: self._resolve_profile_uncached(name) for name in self.profiles}
+        declarations = {
+            name: parse_serving_artifact_declaration(dict(resolved.loadtime))
+            for name, resolved in resolved_profiles.items()
+        }
+        if not any(declarations.values()):
+            return self
+        if self.package_backed or self.weights_path is not None:
+            raise ValueError("derived serving artifacts require an HF source checkpoint")
+        if self.hf_id is None or not is_immutable_revision(self.hf_revision):
+            raise ValueError("derived serving artifacts require source hf_id and an immutable 40-char hf_revision")
+        for name, declaration in declarations.items():
+            if declaration is None:
+                continue
+            # Bare CT2 ``int8`` leaves the floating-point accumulation type to
+            # runtime/device selection. Only the explicit compute types can be
+            # compared to SIE's declared profile precision without guessing.
+            expected_precision = _SERVING_ARTIFACT_PRECISION.get(declaration.compute_type)
+            if expected_precision is None:
+                continue
+            actual_precision = resolved_profiles[name].compute_precision
+            if actual_precision is not None and actual_precision != expected_precision:
+                raise ValueError(
+                    f"Profile '{name}' compute_precision={actual_precision!r} does not match "
+                    f"serving artifact compute_type={declaration.compute_type!r}; "
+                    f"expected {expected_precision!r}"
+                )
+        return self
+
+    def serving_artifact_declaration(self, profile: str = "default") -> ServingArtifactDeclaration | None:
+        """Return the effective profile's immutable derived-artifact declaration."""
+        loadtime = dict(self.resolve_profile(profile).loadtime)
+        return parse_serving_artifact_declaration(loadtime)
 
     def _effective_package_artifact_loadtime(self, name: str) -> dict[str, Any]:
         # Keep artifact validation on the exact same inheritance/replacement

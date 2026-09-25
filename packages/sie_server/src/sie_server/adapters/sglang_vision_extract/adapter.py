@@ -326,7 +326,9 @@ class SGLangVisionExtractAdapter(SGLangGenerationAdapter):
 
         results = await asyncio.gather(*(generate_one(image) for image in images))
         for result in results:
-            if result.finish_reason == "error":
+            # A typed terminal ``error_code`` is a failure even when the
+            # finish_reason stayed ``stop``/``length`` (#3104/#3136).
+            if result.finish_reason == "error" or result.error_code is not None:
                 msg = "SGLang OCR generation failed"
                 raise RuntimeError(msg)
         return results

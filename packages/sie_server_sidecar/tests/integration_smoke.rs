@@ -1141,7 +1141,7 @@ async fn work_cancel_is_namespaced_acks_before_ipc_and_excludes_generation() {
 /// answers `ProcessGenerate` with the same event sequence a real
 /// StreamingProcessor would use: progress ACK, raw publish, final ACK.
 ///
-/// This is intentionally below the full Tilt/SGLang layer. It proves
+/// This is intentionally below the full gateway/backend integration layer. It proves
 /// the sidecar-only contract that endpoint tests cannot isolate:
 /// worker-specific stream creation, direct generation subject routing,
 /// streaming IPC frames, raw NATS publish, and JetStream settlement.
@@ -2923,4 +2923,106 @@ async fn smoke_scheduler_coalesces_concurrent_encodes() {
     drop(nats);
     let _ = sock;
     sleep(Duration::from_millis(200)).await;
+}
+
+/// Stream discard-policy reconcile (architecture-review finding B3).
+///
+/// A `WORK_POOL_{pool}` / `WORK_WORKER_{worker_id}` stream created by a
+/// pre-fix gateway carries the async-nats default `DiscardPolicy::Old`,
+/// which silently discards the OLDEST queued work at the `max_messages`
+/// cap. Both sidecar ensure paths must repair such streams to `New` so a
+/// full work queue rejects the new publish loudly instead.
+///
+/// Only needs `nats-server` (no Python harness / worker binary), so the
+/// skip gate is intentionally narrower than `skip_unless_tools_available`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_paths_reconcile_stream_discard_policy_to_new() {
+    if which("nats-server").is_none() {
+        eprintln!("integration_smoke: skipping — missing tools on $PATH: nats-server");
+        return;
+    }
+    let _guard = smoke_test_guard().await;
+
+    let nats = NatsHarness::start().await;
+    eprintln!("nats: {} (port {})", nats.url, nats.port);
+
+    let (_client, js) = sie_server_sidecar::nats_consumer::connect(&nats.url)
+        .await
+        .expect("connect JetStream");
+
+    let config = sie_server_sidecar::config::WorkerConfig {
+        nats_url: Some(nats.url.clone()),
+        local_socket_path: None,
+        pool: "discardsmoke".into(),
+        bundle: "default".into(),
+        ipc_socket_path: PathBuf::from("/tmp/discard-smoke.sock"),
+        ipc_socket_paths: vec![PathBuf::from("/tmp/discard-smoke.sock")],
+        ipc_pool_size: 1,
+        ipc_request_timeout_s: 60,
+        model_ready_timeout_s: 900,
+        payload_store_url: None,
+        gateway_url: None,
+        gateway_api_key: None,
+        pool_admission_enabled: false,
+        pool_admission_check_interval_ms: 5_000,
+        pool_admission_pause_ms: 1_000,
+        pool_admission_stale_after_ms: 30_000,
+        probe_port: 9095,
+        worker_id: "discard-worker".into(),
+        ping_interval_ms: 2000,
+        ready_stale_mult: 3,
+        machine_profile: "l4".into(),
+        gpu_count: 1,
+        bundle_config_hash: String::new(),
+        config_service_url: None,
+        config_service_token: None,
+        config_poll_interval_ms: 30_000,
+        config_full_export_interval_ms: 300_000,
+        nats_config_trusted_producers: vec!["sie-config".into()],
+        health_publish_interval_ms: 5_000,
+    };
+
+    // Pre-create both streams exactly as a pre-fix gateway did: no
+    // `discard` field, so the async-nats default (`Old`) sticks.
+    for (name, subject) in [
+        (config.stream_name(), config.stream_subject_filter()),
+        (config.worker_stream_name(), config.worker_subject_filter()),
+    ] {
+        let mut legacy = js
+            .get_or_create_stream(async_nats::jetstream::stream::Config {
+                name: name.clone(),
+                subjects: vec![subject],
+                retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
+                storage: async_nats::jetstream::stream::StorageType::Memory,
+                max_age: Duration::from_secs(1_800),
+                max_messages: 100_000,
+                num_replicas: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("create legacy stream");
+        assert_eq!(
+            legacy.info().await.expect("legacy info").config.discard,
+            async_nats::jetstream::stream::DiscardPolicy::Old,
+            "precondition: {name} must carry the Old default"
+        );
+    }
+
+    sie_server_sidecar::nats_consumer::ensure_stream_and_consumer(&js, &config)
+        .await
+        .expect("ensure pool stream and consumer");
+    sie_server_sidecar::nats_consumer::ensure_worker_stream_and_consumer(&js, &config)
+        .await
+        .expect("ensure worker stream and consumer");
+
+    for name in [config.stream_name(), config.worker_stream_name()] {
+        let mut stream = js.get_stream(&name).await.expect("get reconciled stream");
+        assert_eq!(
+            stream.info().await.expect("stream info").config.discard,
+            async_nats::jetstream::stream::DiscardPolicy::New,
+            "{name} must be repaired to DiscardPolicy::New"
+        );
+    }
+
+    drop(nats);
 }

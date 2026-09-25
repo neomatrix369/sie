@@ -10,6 +10,23 @@ helm install sie-cluster oci://ghcr.io/superlinked/charts/sie-cluster \
   --create-namespace
 ```
 
+## Local validation
+
+Prepare dependencies from the checked-in `Chart.yaml` and `Chart.lock`, then
+render with an explicit non-secret payload-store choice:
+
+```bash
+mise run helm -- dependencies
+mise run helm -- lint --set payloadStore.enabled=false
+mise run helm -- template --set payloadStore.enabled=false
+mise exec -- uv run --frozen --project . pytest -q tools/ci/tests/test_helm_render.py
+```
+
+The task temporarily stages the public model and bundle YAML files into the
+chart and removes them after each render. Helm's generated `charts/` directory
+is ignored and must not be committed. The render tests need that directory, so
+run them after `dependencies`.
+
 ## Architecture
 
 ```
@@ -46,7 +63,7 @@ canonical physical tuple.
 
 ## Cold Start Expectations
 
-When scaling from zero, expect the following latencies:
+The current GKE/EKS scale-from-zero guidance is:
 
 | Step | Duration | Notes |
 |-------|----------|-------|
@@ -54,6 +71,11 @@ When scaling from zero, expect the following latencies:
 | **Container startup** | 20-40s | Pull image, start process, health checks |
 | **Model loading** | 10-120s | Download weights (if not cached), load to GPU |
 | **Total cold start** | 3-7 min | First request to a scaled-to-zero pool |
+
+These figures are not an ACK performance claim; this repository has no ACK
+cold-start baseline. The Alibaba Terraform module defaults its shared NAT EIP
+to 100 Mbit/s, and observed ACK cold start depends on current GPU inventory and
+quota, effective bandwidth, image and model size, and cache state.
 
 ### Reducing Cold Start Time
 
@@ -75,26 +97,79 @@ The SDK handles this automatically with configurable retries.
 
 Pre-populate shared object storage with model weights so worker pods don't re-download from HuggingFace on every cold start. The Python SDK pulls from the cache first and falls back to HF on miss.
 
-**AWS (Terraform-managed bucket):**
+**AWS example:**
 
 ```bash
-# 1. Provision the bucket via the AWS Terraform module (created by default; create_model_cache=true)
-cd deploy/terraform/aws/examples/dev-g6-spot
-terraform apply
+# 1. Provision object storage and populate its /models prefix with model weights.
+MODEL_CACHE_URL="s3://<bucket>/models"
 
-# 2. One-time populate from your laptop
-sie-admin cache weights sync --bundle default \
-  --dest $(terraform output -raw model_cache_bucket_url)/
-
-# 3. Wire into Helm
+# 2. Wire the readable object-store URL into Helm.
 helm upgrade --install sie-cluster . \
   --set workers.common.clusterCache.enabled=true \
-  --set workers.common.clusterCache.url=$(terraform output -raw model_cache_bucket_url)
+  --set workers.common.clusterCache.url="$MODEL_CACHE_URL"
 ```
 
-The Terraform output already includes the `/models` prefix, so the same URL is used for both `sie-admin --target` and `clusterCache.url`.
+The configured URL must include the `/models` prefix and be readable by the worker workload identity. Because `payloadStore.enabled` defaults to `true`, the chart also derives a `/payloads` URL from this cache URL; grant the gateway workload write access and worker workloads read access to that prefix, configure a separate writable `payloadStore.url`, or set `payloadStore.enabled=false`.
 
-**Other clouds / BYO bucket:** point `workers.common.clusterCache.url` at any `s3://...`, `gs://...`, `abfs://...`, or `abfss://...` URL the workload identity can read; populate it with the same `sie-admin cache weights sync --dest ...` command.
+**Other clouds / BYO bucket:** point `workers.common.clusterCache.url` at any `s3://...`, `gs://...`, `abfs://...`, `abfss://...`, or `oss://...` URL the worker workload identity can read, and populate the `/models` prefix with your object-storage tooling or existing cache pipeline. With the default payload store enabled, also grant the gateway workload write access and worker workloads read access to the derived `/payloads` prefix, configure a separate writable `payloadStore.url`, or set `payloadStore.enabled=false`.
+
+## SGLang kernel cache
+
+SGLang, FlashInfer, DeepGEMM, Triton, and the CUDA driver can compile kernels
+after model weights are available. SIE remains fully cacheless-capable, but a
+persistent compiler cache can avoid repeating that work after a container or
+worker-pod replacement. It does not remove the first compilation on a genuinely
+empty cache, and CUDA graphs are still captured by each live SGLang process.
+
+For a local CUDA container, mount one named volume at the image's default cache
+path:
+
+```bash
+docker run --gpus all -p 8080:8080 \
+  -v sie-hf-cache:/app/.cache/huggingface \
+  -v sie-kernel-cache:/app/.cache/sie-kernels \
+  ghcr.io/superlinked/sie-server:latest-cuda13-sglang-cu130
+```
+
+CUDA images use `/app/.cache/sie-kernels` automatically; the named volume only
+upgrades that container-local default to survive container replacement. The
+adapter namespaces artifacts by the installed JIT dependency ABI and exact GPU
+product name, then sets upstream cache locations only when operators have not
+set those variables explicitly. An unwritable or unidentifiable cache falls
+back to ordinary compilation.
+
+For Kubernetes, enable retained per-replica claims globally or only for a
+specific generation lane:
+
+```yaml
+workers:
+  common:
+    kernelCache:
+      enabled: false
+      storageSize: 20Gi
+      storageClassName: ""  # cluster default
+  pools:
+    h100:
+      bundles:
+        sglang-cu130:
+          kernelCache:
+            enabled: true
+          preloadModels:
+            - Qwen/Qwen3.8-27B-FP8:h100-256k
+```
+
+Each StatefulSet ordinal receives its own `ReadWriteOnce` PVC, retained across
+scale-down and pod replacement by the StatefulSet's default PVC policy. Do not
+replace this with one concurrently writable RWX DeepGEMM cache. Ensure the
+chosen StorageClass can provision in every zone that may host the GPU pool;
+retained claims otherwise constrain later scheduling to their volume topology.
+`preloadModels` fills the cache while the worker is still NotReady.
+
+Adding or removing `volumeClaimTemplates` is an immutable StatefulSet change.
+For an existing release, enable or disable this setting during a controlled
+recreation of the affected worker StatefulSet; retained cache PVCs are
+disposable acceleration state and may be deleted separately when no longer
+needed.
 
 ## Payload store
 
@@ -104,7 +179,7 @@ It is therefore **enabled by default** (`payloadStore.enabled=true`) and is **de
 
 URL resolution, in order:
 
-1. `payloadStore.url`, if set: the terraform `payload_store_url` output (the `/payloads` prefix of the shared bucket), or any `s3://` / `gs://` / `abfs(s)://` URL the workload identity can read and write.
+1. `payloadStore.url`, if set: the terraform `payload_store_url` output (the `/payloads` prefix of the shared bucket), or any `s3://` / `gs://` / `abfs(s)://` / `oss://` URL the workload identity can read and write.
 2. otherwise derived from `workers.common.clusterCache.url` by swapping the trailing `/models` prefix for `/payloads` (the same bucket).
 
 ```bash
@@ -121,6 +196,80 @@ helm upgrade --install sie-cluster . --set payloadStore.enabled=false
 ```
 
 > **Upgrade note:** the payload store is on by default. An existing queue-mode install with *no* payload store and *no* cluster cache will fail on upgrade until it either sets a URL (above) or `payloadStore.enabled=false`. Installs that already set `workers.common.clusterCache.url` keep working; the payload store derives its URL from it.
+
+### Alibaba Cloud ACK OSS and RRSA
+
+`values-ack.yaml` enables the payload store and configures every OSS-consuming
+container for `eu-central-1`, the private OSS endpoint, and disabled ECS
+metadata credentials. Install with Terraform's native OSS outputs and exact
+RRSA role-name annotation:
+
+```bash
+helm upgrade --install sie-cluster . -f values-ack.yaml \
+  --set workers.common.clusterCache.enabled=true \
+  --set workers.common.clusterCache.url="$(terraform output -raw model_cache_bucket_url)" \
+  --set payloadStore.url="$(terraform output -raw payload_store_url)" \
+  --set-string 'serviceAccount.annotations.pod-identity\.alibabacloud\.com/role-name'="$(terraform output -raw rrsa_workload_role_name)"
+```
+
+The shared `sie-server` ServiceAccount and
+`pod-identity.alibabacloud.com/injection: "on"` pod label engage ACK RRSA. Do
+not render long-lived AccessKeys or `ALIBABA_CLOUD_STS_ENDPOINT`; the Terraform
+webhook config leaves STS convenience-env injection off so the runtime keeps
+its fixed official endpoint policy. Mutable `sie-config` state remains on its
+local/PVC `SIE_CONFIG_STORE_DIR`; `oss://` is intentionally rejected for that
+epoch/CAS authority.
+
+ACK may install disk CSI classes without marking one as default. The ACK
+overlay therefore binds the config, Prometheus, Grafana, and Loki claims to
+`alicloud-disk-topology-alltype`, the topology-aware WFFC class, and raises the
+config/Grafana claims to ACK's 20 GiB dynamic-disk minimum. The retained
+capacities are 20 GiB config, 20 GiB Grafana, 100 GiB Prometheus, and 50 GiB
+Loki. The built-in class does not itself prove encryption. Deployments
+requiring encrypted PVCs must provide a governed encrypted WFFC class and
+override all four paths together:
+
+```yaml
+config:
+  configStore:
+    storageClassName: your-encrypted-class
+kube-prometheus-stack:
+  prometheus:
+    prometheusSpec:
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: your-encrypted-class
+  grafana:
+    persistence:
+      storageClassName: your-encrypted-class
+loki:
+  singleBinary:
+    persistence:
+      storageClass: your-encrypted-class
+```
+
+The overlay also runs `sie-config` as UID/GID 1000 with `fsGroup: 1000` and
+`fsGroupChangePolicy: OnRootMismatch`, keeping the CSI volume writable without
+granting root execution.
+
+Storage class is not an ordinary values-only in-place migration for a bound
+PVC, and a StatefulSet volume-claim template is immutable. For an empty failed
+install, uninstall the exact release, independently prove that every retained
+old claim is `Pending`, unbound, and has no volume, delete only those exact
+empty claims, verify their absence, and then reinstall. StatefulSet and
+operator-created claims can survive Helm uninstall. A data-bearing installation
+requires a separately planned backup and volume migration; do not apply these
+overrides as an in-place Helm-only change.
+
+### Alibaba Cloud ACK ingress
+
+`values-ack.yaml` sets `ingress.enabled=false` because the Alibaba Terraform
+module does not install an ingress controller. Install and secure an
+ACK-compatible controller such as ingress-nginx first, wait for its controller
+and load balancer to be ready, and only then enable this chart's Ingress with a
+matching `ingress.className`. Until then, use cluster-private service access or
+an explicitly controlled port-forward.
 
 ## Autoscaling
 
@@ -200,13 +349,18 @@ the collector, Prometheus, KEDA, image, quota, or permission issue, and rerun
 the same forward upgrade. There is no extra migration command, pause
 annotation, values overlay, second release, or target-owned migration state.
 Canonical `0.6.20` can leave one inert hook ConfigMap containing obsolete
-manifest text; remove it once after success using the upgrade runbook's exact
-post-success check. Fresh installs and later compatible releases use the normal
-Helm procedure as well.
+manifest text. After the target health hooks succeed, inspect that exact source
+object and remove it once; deletion is post-success hygiene, not part of the
+cutover:
 
-The complete preflight, external-dependency requirements, over-limit lane
-reduction, verification, and one-time inert ConfigMap cleanup are in the
-[upgrade runbook](../../upgrade-runbook.md).
+```bash
+LEGACY_KEDA_CONFIGMAP="<SOURCE_FULLNAME>-keda-scaledobjects"
+kubectl get configmap "$LEGACY_KEDA_CONFIGMAP" -n <NAMESPACE> -o yaml
+# Delete only after confirming component=keda-apply and the old Helm hook annotations.
+kubectl delete configmap "$LEGACY_KEDA_CONFIGMAP" -n <NAMESPACE> --ignore-not-found
+```
+
+Fresh installs and later compatible releases use the normal Helm procedure.
 
 Disabling autoscaling or uninstalling runs a small hook that deletes only
 ScaledObjects carrying this release's managed identity or the exact canonical
@@ -232,6 +386,20 @@ client timeout of at least 20 minutes. Helm applies that timeout to each
 Kubernetes operation/hook; it exceeds the longest default 15-minute Job. With
 a custom `pollingInterval` above 30 seconds, also make the timeout exceed the
 KEDA health deadline of `3 * pollingInterval + 240` seconds.
+
+Size `keda-apply`, `keda-cleanup`, and the KEDA ScaledObject/HPA gate with
+`hooks.resources`. The default memory limit is 1Gi. Requests stay at 128Mi.
+
+```yaml
+hooks:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "200m"
+      memory: "1Gi"
+```
 
 ### Scale-from-Zero Trigger
 
@@ -333,10 +501,14 @@ See `values.yaml` for all options. Key settings:
 **Important**: All worker pools are disabled by default. You must explicitly enable
 the pools you need in your values override.
 
-The values below are an illustrative shape; concrete per-cluster sizes
-live in each cluster's own values file (e.g. the tester cluster's
-rtx6000 default bundle scales 3–10 — see
-`deploy/terraform/aws/internal-examples/tester-cluster/DEPLOY.md`).
+> **Bundle rename:** the CUDA 13 SGLang bundle formerly named `gemma` is now
+> `sglang-cu130`, and its image tag is `cuda13-sglang-cu130`. Existing values
+> overrides must rename the `workers.common.bundlePlatforms` key, worker bundle
+> key, and any explicit image tag together. There is no runtime alias because
+> the bundle name is part of worker routing and release-image identity.
+
+The values below are an illustrative shape; concrete per-cluster sizes belong
+in each deployment's own values file.
 
 ```yaml
 # Worker pool configuration (must explicitly enable pools)
@@ -405,13 +577,13 @@ fixed sidecar policy.
 
 For local CPU-only dev, `workers.pools.<name>.sidecar.emulatedChildCount` can
 render multiple CPU worker children with distinct IPC sockets and no
-`nvidia.com/gpu` request. This is intended for Tilt/e2e coverage of child
+`nvidia.com/gpu` request. This is intended for local integration coverage of child
 routing and metrics only; GPU pools must use `gpu.count` for real capacity.
 
 This is the Req6 one-child-at-a-time model placement topology. It distributes
 different models from one runtime bundle across the pod's GPU slots. A child can
-own multiple models, but one model is not spread across children, replicated for
-throughput, or tensor/model-parallelized for an oversized model.
+own multiple models, but one model is not spread across children or replicated
+for throughput. A model too large for one GPU needs a device group instead.
 
 Each worker pod serves exactly one runtime bundle. Different bundles render as
 different worker StatefulSets and therefore different worker identities.
@@ -433,6 +605,87 @@ workers:
           minReplicas: 0
           maxReplicas: 3
 ```
+
+### Tensor-Parallel Device Groups
+
+To serve one model across several GPUs, set `gpu.deviceGroup: true` alongside
+`gpu.count`. The pod then runs a single worker child that owns every GPU in the
+pod (`SIE_DEVICES=cuda:0,...,cuda:N-1`) instead of one child per GPU, and the
+model profile declares how many of them it uses:
+
+```yaml
+profiles:
+  default:
+    adapter_path: sie_server.adapters.sglang.generation:SGLangGenerationAdapter
+    adapter_options:
+      loadtime:
+        tensor_parallel_size: 4
+        request_read_timeout_s: 600
+        startup_timeout_s: 900
+```
+
+A complete device-group pool follows. Its CPU, memory, and shared-memory sizes
+are placeholders. Size them for the model and the node:
+
+```yaml
+workers:
+  pools:
+    l4-4x-group:
+      enabled: true
+      machineProfile: l4-4x
+      gpuType: nvidia-l4
+      gpu:
+        count: 4
+        product: NVIDIA-L4
+        deviceGroup: true
+      shmSize: 32Gi
+      resources:
+        requests:
+          cpu: "16"
+          memory: "64Gi"
+        limits:
+          cpu: "32"
+          memory: "128Gi"
+      bundles:
+        sglang:
+          minReplicas: 0
+          maxReplicas: 1
+```
+
+- The worker claims a contiguous block of `tensor_parallel_size` devices for
+  the model exclusively, evicting unpinned models to free a block when it has
+  to, and releases the block when the model unloads. Loading a single-GPU model
+  while every device is held evicts the least recently used unpinned group.
+- The SGLang generation and embedding adapters accept a width. The generation
+  adapter also requires `request_read_timeout_s` above width one, because a
+  stalled collective produces no bytes and no error, and its own
+  `startup_timeout_s`, because startup at a width is dominated by per-rank graph
+  compilation and capture, so neither `workers.common.modelReadyTimeoutSec` nor
+  the built-in default describes it. Keep the declared budget within
+  `workers.common.modelReadyTimeoutSec` and below the liveness probe budget.
+- A declared `startup_timeout_s` that is not a finite number of seconds above
+  zero is refused when the model loads rather than replaced by a default.
+- Width and placement are declared only through `tensor_parallel_size`. Engine
+  placement flags in `extra_launch_args` (including abbreviations such as
+  `--tp`) and device-visibility variables in `extra_env` are refused. So are the
+  flags that decide where the engine listens: `--nccl-port`, which has the
+  `loadtime.nccl_port` option instead, and `--host` and `--port`, which the
+  server passes for the engine's own HTTP listener and then talks to. They are
+  not this pod's `--host`/`--port`, which the chart sets on the worker
+  container.
+- `gpu.deviceGroup` requires `gpu.count >= 2`. `SIE_GPU_COUNT` and the cluster
+  health `gpu_count` count serving slots, so a device-group pod reports one
+  slot however many GPUs it holds.
+- Every worker pod mounts `/dev/shm` as an in-memory `emptyDir` whose size limit
+  is the pool's `shmSize`, or `workers.common.shmSize` (default `8Gi`) when the
+  pool sets none. Whatever the worker writes there counts against its container
+  memory limit. A tensor-parallel engine runs one process per GPU, and those
+  processes can exchange data through shared memory, so a device-group pool may
+  need a larger `shmSize`. Raise `resources.limits.memory` with it so the limit
+  covers both the engine processes and their shared memory.
+- Splitting a model across GPUs on a node without a fast GPU interconnect adds
+  communication overhead. For a model that fits one GPU, fan-out children
+  serving replicas usually deliver more throughput for the same GPUs.
 
 ### Queue Pool Patterns
 
@@ -483,6 +736,93 @@ For emergency or legacy static namespaces that are not backed by either
 `queueRouting.poolAdmission.enabled` lets workers pull without the admission
 gate. Prefer declaring static pools instead, so capped/dynamic pools keep their
 fail-closed isolation behavior.
+
+### High availability in one file
+
+`values-ha.yaml` is the tested composition of the durability knobs below with
+a replicated broker and a second gateway: two gateway replicas, a three-member
+NATS cluster with a JetStream file store per member, and file-backed work-queue
+streams replicated across all three. Layer it under a provider overlay:
+
+```bash
+helm install sie deploy/helm/sie-cluster \
+  -f deploy/helm/sie-cluster/values-aws.yaml \
+  -f deploy/helm/sie-cluster/values-ha.yaml
+```
+
+It does not make `sie-config` redundant; that service stays at one replica by
+template design until the chart provides leader election. And because a live
+stream's storage type cannot be changed, apply it to a fresh install or convert
+the streams during a maintenance window as described below.
+
+### Work-queue durability (memory vs file storage)
+
+The work queues ship **memory-backed and single-replica**, which is the only
+behavior this chart has ever had. `WORK_POOL_{pool}`, the per-worker
+direct-dispatch streams, and `DEAD_LETTERS` live in the NATS broker's RAM. That
+is durable against *worker* failure — a pod that dies mid-item leaves the item
+unacked and another worker picks it up — but **not** against *broker* failure. A
+restart of the NATS pod erases every queued and delivered-but-unacked item along
+with the dead-letter records that would have named them, and because the gateway
+is queue-only with no direct-HTTP fallback, the restart is a full inference
+outage for its duration.
+
+The trigger is specifically a restart of the **NATS** pod: an OOM kill, a NATS
+version or config rollout, or a node drain that evicts that pod. Draining a node
+that hosts only workers or gateways is harmless here, as is a worker or gateway
+rollout. At the default `streamReplicas: 1` any eviction of that single pod
+loses the state; with a replicated stream it survives while one peer holding it
+stays up, which is what makes rolling NATS maintenance safe.
+
+To opt into file-backed, replicated storage:
+
+```yaml
+queueRouting:
+  streamStorage: file   # default: memory
+  streamReplicas: 3     # default: 1
+nats:
+  config:
+    cluster:
+      enabled: true     # required for streamReplicas > 1
+      replicas: 3
+    jetstream:
+      fileStore:
+        enabled: true   # required for streamStorage=file
+        pvc:
+          size: 10Gi
+```
+
+`streamStorage` and `streamReplicas` are rendered into `SIE_STREAM_STORAGE` /
+`SIE_STREAM_REPLICAS` on **both** the gateway and the worker sidecars. Both
+create streams and whoever gets there first wins, so the chart is the single
+source of truth for the pair; the template rejects a render where the requested
+durability outruns what the broker is configured to provide, and both env names
+are reserved, so a `gateway.extraEnv` or
+`workers.common.workerSidecar.extraEnv` entry that tried to override one on a
+single side fails the render rather than silently splitting the two creators.
+
+That render guard is load-bearing for `streamReplicas`, because **NATS will not
+catch the mistake for you**: a single-node server accepts `num_replicas: 3` and
+then reports R3, with no peers to replicate to (verified against nats-server
+2.12.6). Without the guard, a replicated-looking stream would run
+single-copy.
+
+**The trade-off.** File storage puts a disk write in front of every publish
+ACK, so it costs publish latency on the inference hot path, and it needs a PVC
+per NATS pod sized for peak queue depth (`max_msgs` is 100,000 per pool stream)
+plus 24 h of `DEAD_LETTERS` retention. Replication multiplies that cost by the
+replica count and adds a quorum round trip. This is why the default is left
+memory-backed: whether the latency and disk are worth the durability depends on
+the workload, and that is an operator decision, not a chart default.
+
+**Changing it on a live cluster.** JetStream refuses an in-place storage-type
+change (err_code 10052), so flipping `streamStorage` does **not** convert
+existing streams. The gateway and sidecars log a warning naming the divergence
+and leave the streams alone, which is deliberate: converting would mean deleting
+and recreating the stream, destroying exactly the queued work that durability is
+meant to protect. Drain the pool and delete the streams during a maintenance
+window to pick up the new storage. `streamReplicas`, by contrast, **is**
+reconciled onto existing streams.
 
 ### Upgrading from the legacy single-bundle pool schema
 
@@ -848,13 +1188,10 @@ telemetry:
   deploymentEnv: staging  # production (default) | staging | development | ci
 ```
 
-> **Internal Superlinked clusters:** any cluster owned by Superlinked that is
-> not a customer-facing production install MUST set `telemetry.deploymentEnv`
-> to one of `staging | development | ci`. The chart default is `production`
-> so that customer Helm installs are correctly tagged out of the box; internal
-> stacks must opt out explicitly to keep them out of the production telemetry
-> dashboards. See `deploy/terraform/{aws,gcp}/internal-examples/` for the
-> per-cluster mapping.
+> **Non-production deployments:** set `telemetry.deploymentEnv` to one of
+> `staging | development | ci`. The chart default is `production`, so every
+> non-production values overlay must opt out explicitly to keep its signals out
+> of production dashboards.
 
 ## Observability
 

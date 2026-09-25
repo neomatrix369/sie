@@ -21,6 +21,8 @@ authority.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import math
@@ -37,12 +39,13 @@ from sie_sdk.queue_types import denormalize_model_id
 from sie_server.adapters._generation_base import (
     ReasoningFormat,
     ThinkingBlockStripper,
+    aclose_with_error_precedence,
     resolve_reasoning_format,
     thinking_blocks_must_be_hidden,
 )
 from sie_server.adapters.mlx.generation import MLXGenerationAdapter, normalize_mlx_seed
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
-from sie_server.api.helpers import ModelStateChecker
+from sie_server.api.helpers import ModelStateChecker, ensure_finite_scores, openai_error_response
 from sie_server.api.options import resolve_runtime_options
 from sie_server.api.score import score_usage_from_output
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
@@ -50,9 +53,15 @@ from sie_server.config.model import validate_chat_template_kwargs
 from sie_server.core.inference_output import ScoreOutput
 from sie_server.core.score_cost import MAX_SCORE_ITEMS, build_score_prepared_items
 from sie_server.core.timing import RequestTiming
+from sie_server.core.video_frames import (
+    MAX_VIDEO_BYTES,
+    VideoDecodeError,
+    check_generation_video_bounds,
+    sniff_video_container,
+)
 from sie_server.observability.tracing import tracer
 from sie_server.processors.streaming import _decode_data_uri_image
-from sie_server.types.inputs import Item
+from sie_server.types.inputs import Item, item_size_error
 from sie_server.types.responses import ErrorCode
 
 logger = logging.getLogger(__name__)
@@ -73,6 +82,7 @@ _MAX_BODY_BYTES = int(os.environ.get("SIE_CHAT_MAX_BODY_BYTES", str(8 * 1024 * 1
 _MAX_CHAT_RESPONSE_BYTES = int(os.environ.get("SIE_CHAT_MAX_RESPONSE_BYTES", str(32 * 1024 * 1024)))
 _MAX_CHAT_MESSAGES = 4096
 _MAX_CHAT_CHOICES = 128
+_MAX_CHAT_VIDEOS = 1
 _MAX_U32 = (1 << 32) - 1
 _ALLOWED_CHAT_ROLES = frozenset({"system", "user", "assistant", "tool", "developer"})
 # Compatibility requests project onto the same native score bound.
@@ -339,6 +349,12 @@ def _validate_chat_messages(messages: list[Any]) -> None:
                         f"'{part_path}.image_url' is required for image content parts",
                         param=f"{part_path}.image_url",
                     )
+            elif part_type == "video_url":
+                if "video_url" not in part_obj:
+                    raise _bad_request(
+                        f"'{part_path}.video_url' is required for video content parts",
+                        param=f"{part_path}.video_url",
+                    )
             else:
                 raise _bad_request(
                     f"unsupported content part type {part_type!r}",
@@ -396,8 +412,44 @@ def _validate_mlx_chat_body(body: dict[str, Any]) -> None:
         raise _bad_request(f"field '{unknown}' is not supported", param=unknown, code="unsupported_field")
 
 
-def _validate_chat_message_media(messages: Any) -> None:
-    """Reject child-side remote media fetches before proxying to a child."""
+def _decode_data_uri_video(url: str) -> tuple[bytes, str]:
+    """Decode an inline video data URI into ``(bytes, decoder suffix)``.
+
+    The container is identified from its magic bytes, never the declared media
+    type: FFmpeg picks its demuxer by content, so a playlist or concat script
+    labelled ``video/mp4`` must not reach it.
+    """
+    if not url.startswith("data:"):
+        raise ValueError("video content must be an inline base64 'data:' URI; remote URL fetching is not supported")
+    header, sep, payload = url[len("data:") :].partition(",")
+    if not sep:
+        raise ValueError("malformed video data URI (missing ',')")
+    params = header.split(";")
+    if "base64" not in params[1:]:
+        raise ValueError("video data URI must be base64-encoded")
+    media_type, _, subtype = params[0].partition("/")
+    if media_type != "video" or not subtype:
+        raise ValueError("video data URI must have a video/<subtype> media type")
+    if (len(payload) * 3) // 4 > MAX_VIDEO_BYTES:
+        raise ValueError(f"video too large: exceeds the {MAX_VIDEO_BYTES}-byte limit")
+    try:
+        data = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError(f"invalid base64 video data: {exc}") from exc
+    if not data:
+        raise ValueError("video data URI decoded to empty bytes")
+    container = sniff_video_container(data)
+    if container is None:
+        raise ValueError("video data must be an MP4/MOV, WebM/Matroska, or AVI container")
+    return data, f".{container}"
+
+
+def _validate_chat_message_media(messages: Any) -> list[tuple[str, bytes, str]]:
+    """Reject child-side remote media fetches before proxying to a child.
+
+    Returns every inline video as ``(param path, bytes, decoder suffix)``.
+    """
+    videos: list[tuple[str, bytes, str]] = []
 
     def _walk(value: Any, path: str) -> None:
         if isinstance(value, list):
@@ -420,7 +472,25 @@ def _validate_chat_message_media(messages: Any) -> None:
                 except ValueError as exc:
                     raise _bad_request(str(exc), param=item_path) from exc
                 continue
-            if key in {"audio_url", "video_url"}:
+            if key == "video_url":
+                url = item.get("url") if isinstance(item, dict) else None
+                if not isinstance(item, dict) or item.keys() != {"url"} or not isinstance(url, str) or not url:
+                    raise _bad_request(
+                        f"'{item_path}' must be an object with only a non-empty 'url'",
+                        param=item_path,
+                    )
+                if len(videos) >= _MAX_CHAT_VIDEOS:
+                    raise _bad_request(
+                        f"'messages' exceeds the maximum of {_MAX_CHAT_VIDEOS} video part(s) per request",
+                        param=item_path,
+                    )
+                try:
+                    data, suffix = _decode_data_uri_video(url)
+                except ValueError as exc:
+                    raise _bad_request(str(exc), param=item_path) from exc
+                videos.append((item_path, data, suffix))
+                continue
+            if key == "audio_url":
                 raise _bad_request(
                     f"'{item_path}' is not supported; remote media fetching is disabled",
                     param=item_path,
@@ -429,6 +499,15 @@ def _validate_chat_message_media(messages: Any) -> None:
             _walk(item, item_path)
 
     _walk(messages, "messages")
+    return videos
+
+
+def _probe_chat_videos(videos: list[tuple[str, bytes, str]]) -> None:
+    for path, data, suffix in videos:
+        try:
+            check_generation_video_bounds(data, suffix=suffix)
+        except VideoDecodeError as exc:
+            raise _bad_request(str(exc), param=path) from exc
 
 
 def _validated_child_chat_url(server_url: object) -> str:
@@ -687,11 +766,13 @@ async def _sanitize_sse_stream(
     buffered = bytearray()
     received = 0
     saw_done = False
+    terminal_outcome_selected = False
     try:
         async for chunk in response.aiter_bytes():
             received += len(chunk)
             if received > _MAX_CHAT_RESPONSE_BYTES:
                 logger.error("generation child SSE exceeded %d bytes", _MAX_CHAT_RESPONSE_BYTES)
+                terminal_outcome_selected = True
                 yield _upstream_error_event("upstream response exceeded the byte limit")
                 return
             buffered.extend(chunk)
@@ -707,6 +788,7 @@ async def _sanitize_sse_stream(
                 data = line[len(b"data:") :].lstrip()
                 if data == b"[DONE]":
                     saw_done = True
+                    terminal_outcome_selected = True
                     yield b"data: [DONE]\n"
                     continue
                 if not data:
@@ -729,21 +811,36 @@ async def _sanitize_sse_stream(
             line = bytes(buffered).removesuffix(b"\r")
             if line.startswith(b"data:") and line[len(b"data:") :].lstrip() == b"[DONE]":
                 saw_done = True
+                terminal_outcome_selected = True
                 yield b"data: [DONE]\n"
             elif line:
                 raise ValueError("upstream SSE ended with an incomplete event")
         if not saw_done:
             logger.warning("generation child SSE ended without [DONE]")
+            terminal_outcome_selected = True
             yield _upstream_error_event("upstream stream ended unexpectedly")
     except (httpx.HTTPError, UnicodeError, ValueError, json.JSONDecodeError):
         logger.warning("generation child chat proxy stream failed", exc_info=True)
         if not saw_done:
+            terminal_outcome_selected = True
             yield _upstream_error_event()
     finally:
-        await response.aclose()
-        await client.aclose()
-        if slot is not None:
-            slot.release()
+        try:
+            await aclose_with_error_precedence(
+                response,
+                outcome_selected=terminal_outcome_selected,
+                context="generation child SSE response",
+            )
+        finally:
+            try:
+                await aclose_with_error_precedence(
+                    client,
+                    outcome_selected=terminal_outcome_selected,
+                    context="generation child SSE client",
+                )
+            finally:
+                if slot is not None:
+                    slot.release()
 
 
 # -- /v1/chat/completions (proxy to the managed generation child) ------------
@@ -759,7 +856,20 @@ async def chat_completions(
     MLX remains the non-CUDA backend. CUDA profiles proxy to the exact SGLang
     subprocess the registry loaded for the requested model/profile. The child
     URL and served model name always come from that adapter, never the body.
+
+    Errors are emitted as top-level OpenAI ``{"error": {...}}`` envelopes
+    (never FastAPI's ``{"detail": ...}`` wrapper), matching ``/v1/completions``.
     """
+    try:
+        return await _chat_completions(http_request, x_machine_profile)
+    except HTTPException as exc:
+        return openai_error_response(exc)
+
+
+async def _chat_completions(
+    http_request: Request,
+    x_machine_profile: str | None,
+) -> Response | StreamingResponse:
     validate_machine_profile_header(x_machine_profile)
 
     body = await _read_json_body(http_request)
@@ -776,7 +886,7 @@ async def chat_completions(
             param="messages",
         )
     _validate_chat_messages(messages)
-    _validate_chat_message_media(messages)
+    videos = _validate_chat_message_media(messages)
     chat_template_kwargs = body.get("chat_template_kwargs")
     if chat_template_kwargs is not None and not isinstance(chat_template_kwargs, dict):
         raise _bad_request("'chat_template_kwargs' must be an object", param="chat_template_kwargs")
@@ -809,6 +919,22 @@ async def chat_completions(
             raise _bad_request(
                 f"Model '{model}' does not support generation (no generate task). Use a generation model."
             )
+        streaming_supported = getattr(getattr(gen_task, "capabilities", None), "streaming", True)
+        if bool(stream_opt) and not streaming_supported:
+            raise _bad_request(
+                f"Model '{model}' does not support streaming generation",
+                param="stream",
+                code="unsupported_field",
+            )
+        if videos:
+            if not (config.inputs.video and str(device).startswith("cuda")):
+                raise _bad_request(
+                    f"Model '{model}' does not accept video input on this device",
+                    param="messages",
+                    code="unsupported_field",
+                )
+            # The child decodes video on its event loop; bound that work here.
+            await asyncio.to_thread(_probe_chat_videos, videos)
         if str(device).startswith("cuda"):
             _validate_cuda_chat_body(body)
         else:
@@ -984,7 +1110,20 @@ async def rerank(
     Request: ``{model, query, documents: [str], top_n?, return_documents?}``.
     Response: ``{model, results: [{index, relevance_score, document?}], usage}``
     sorted by descending relevance.
+
+    Errors are emitted as top-level OpenAI ``{"error": {...}}`` envelopes
+    (never FastAPI's ``{"detail": ...}`` wrapper), matching ``/v1/completions``.
     """
+    try:
+        return await _rerank(http_request, x_machine_profile)
+    except HTTPException as exc:
+        return openai_error_response(exc)
+
+
+async def _rerank(
+    http_request: Request,
+    x_machine_profile: str | None,
+) -> JSONResponse:
     validate_machine_profile_header(x_machine_profile)
 
     body = await _read_json_body(http_request)
@@ -1011,6 +1150,13 @@ async def rerank(
     return_documents = body.get("return_documents", False)
     if not isinstance(return_documents, bool):
         raise _bad_request("'return_documents' must be a boolean", param="return_documents")
+    query_item = Item(text=query)
+    doc_items = [Item(id=str(i), text=str(doc)) for i, doc in enumerate(documents)]
+    if error := item_size_error(query_item, "query"):
+        raise _bad_request(error, param="query")
+    for index, doc_item in enumerate(doc_items):
+        if error := item_size_error(doc_item, f"documents[{index}]"):
+            raise _bad_request(error, param="documents")
 
     registry = http_request.app.state.registry
     device = registry.device
@@ -1033,8 +1179,6 @@ async def rerank(
         checker.check_not_loading()
         await checker.ensure_loaded(device)
 
-        query_item = Item(text=query)
-        doc_items = [Item(id=str(i), text=str(doc)) for i, doc in enumerate(documents)]
         options_raw = body.get("options")
         if options_raw is not None and not isinstance(options_raw, dict):
             raise _bad_request("'options' must be an object", param="options")
@@ -1060,11 +1204,14 @@ async def rerank(
             logger.warning("rerank failed for %s", model, exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={"code": "inference_error", "message": str(exc)},
+                detail={"code": "inference_error", "message": "internal error during reranking"},
             ) from exc
 
         score_output: ScoreOutput = worker_result.output
         scores = [float(score_output.scores[i]) for i in range(score_output.batch_size)]
+        # Fail closed on non-finite (NaN/inf) model output before serialization;
+        # the HTTPException is re-emitted as the OpenAI error envelope by rerank().
+        ensure_finite_scores(scores, model)
         usage = score_usage_from_output(score_output)
         if usage is None:
             raise HTTPException(

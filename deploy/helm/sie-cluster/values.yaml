@@ -86,6 +86,10 @@ config:
   # -- Pod annotations
   podAnnotations: {}
 
+  # -- Optional pod-level security context. Set fsGroup when a CSI-backed
+  # configStore volume needs to be writable by the non-root sie-config user.
+  podSecurityContext: {}
+
   # -- Node selector
   nodeSelector: {}
 
@@ -158,6 +162,52 @@ gateway:
   # restart is an unacceptable blip on inference traffic.
   replicas: 1
 
+  # -- Graceful-shutdown budget for a terminating gateway pod. The chart
+  # DERIVES `terminationGracePeriodSeconds` from these two knobs (helper
+  # `sie-cluster.gateway.terminationGracePeriodSeconds`) instead of carrying a
+  # second magic number that can drift:
+  #
+  #   terminationGracePeriodSeconds
+  #     = preStopSleepSeconds + inFlightSeconds + 5s queue drain
+  #     = 10 + 120 + 5 = 135s with the defaults below
+  #
+  # The trailing 5s is the gateway's own post-serve `drain_pending(5s)`
+  # (packages/sie_gateway/src/main.rs) and is not chart-configurable.
+  drain:
+    # -- Seconds the pod stays up, still serving, after it goes Terminating
+    # and before its container is signalled. Endpoint removal is eventually
+    # consistent, so without this delay kube-proxy and the ingress can still
+    # be routing new requests to a pod that has already begun shutting down —
+    # on every rolling deploy, node drain and KEDA scale-in. Set 0 to drop the
+    # hook. Rendered as the native `lifecycle.preStop.sleep` action (the
+    # gateway image is distroless, so there is no shell for an exec hook),
+    # which needs Kubernetes >= 1.30; older API servers drop the field and the
+    # pod simply loses the delay.
+    preStopSleepSeconds: 10
+    # -- Seconds the gateway may spend finishing in-flight work after SIGTERM.
+    # axum's graceful shutdown is unbounded in the binary, so this is the real
+    # bound: anything still running when the derived grace period expires is
+    # SIGKILLed mid-response (a cut SSE generation stream or queued-result
+    # wait). The default matches the gateway's own SIE_GATEWAY_REQUEST_TIMEOUT
+    # default of 120s, which caps every queued-result wait; raise it for
+    # deployments serving longer streams.
+    inFlightSeconds: 120
+
+  # -- PodDisruptionBudget for the gateway tier. Without one, a node drain or
+  # cluster upgrade may evict every gateway pod simultaneously and take the
+  # whole inference gateway down at once.
+  podDisruptionBudget:
+    # -- Empty (default) lets the chart decide: a PDB is created only when
+    # `gateway.replicas` is above 1, i.e. when the tier is guaranteed to have a
+    # spare pod. At a single replica a maxUnavailable=1 budget is worse than
+    # none — once that pod is unhealthy `disruptionsAllowed` drops to 0 and the
+    # PDB blocks the drain that would have rescheduled it. Set true/false to
+    # force the decision (for example true on an autoscaled cluster that keeps
+    # `gateway.replicas: 1` as the KEDA floor but normally runs several pods).
+    enabled: ""
+    # -- Voluntary disruptions tolerated at once.
+    maxUnavailable: 1
+
   # -- Worker-health discovery mode. Empty lets the chart choose the
   # routing-safe default: "nats" when NATS and the worker-sidecar are
   # enabled, otherwise the gateway binary default.
@@ -205,7 +255,17 @@ gateway:
   # -- Tolerations
   tolerations: []
 
-  # -- Affinity rules
+  # -- Affinity rules. Empty keeps the chart default: a PREFERRED pod
+  # anti-affinity on `kubernetes.io/hostname` that spreads gateway replicas
+  # across nodes, mirroring the worker StatefulSet. Preferred rather than
+  # required so a single-node dev cluster still schedules every replica.
+  # Setting this replaces the default outright (no merge).
+  #
+  # `topologySpreadConstraints` are deliberately not rendered: nothing in this
+  # chart declares a zone topology (no zone nodeSelectors, no zone-aware
+  # storage), the worker tier already establishes host-level anti-affinity as
+  # the chart's spreading idiom, and a DoNotSchedule constraint would leave
+  # replicas Pending on the single- and two-node clusters the chart supports.
   affinity: {}
 
   # -- Gateway auth (static token)
@@ -380,14 +440,16 @@ workers:
 
     # -- Map of imageBundle -> required platform. Mirrors each bundle's
     # -- `platform:` field in packages/sie_server/bundles/*.yaml and the
-    # -- `.github/release-matrix.json` `include` pairs (KEEP IN SYNC). The chart
+    # -- published image variants (KEEP IN SYNC). The chart
     # -- fails fast if a pool places a listed bundle on a different platform:
     # -- the release pipeline only builds the matching `<platform>-<bundle>`
     # -- image, so a mismatch would otherwise ImagePullBackOff at runtime.
     # -- Bundles not listed here default to the common `platform` above.
     bundlePlatforms:
-      # gemma 4 (sglang 0.5.13 / torch 2.11 cu130) ships only as a CUDA 13 image.
-      gemma: cuda13
+      # SGLang cu130 (Gemma 4 plus newer Qwen profiles) ships only as a CUDA 13 image.
+      sglang-cu130: cuda13
+      # TensorRT-LLM direct-HF encoder-decoder workers ship only as CUDA 13 images.
+      tensorrt-llm: cuda13
 
     # -- Image pre-pull DaemonSet (caches worker image on GPU nodes before worker pods schedule)
     imagePrepull:
@@ -432,8 +494,41 @@ workers:
     # -- Runtime class for workers (e.g., "nvidia" to enable GPU runtime)
     runtimeClassName: ""
 
-    # -- Model cache size limit (emptyDir - ephemeral, no zone-lock issues)
+    # -- Model cache size limit (emptyDir - ephemeral, no zone-lock issues).
+    # This is a sizeLimit on an emptyDir, which lives on the NODE's root
+    # volume: it caps the cache, it does not reserve the space. Keep the GPU
+    # node disk comfortably above this value (Terraform
+    # `gpu_disk_size_gb` / `gpu_node_groups[*].disk_size_gb` on AWS,
+    # `gpu_node_pools[*].disk_size_gb` on GCP, `os_disk_size_gb` on Azure --
+    # defaults leave ~100GiB of headroom over this 300Gi). If the disk is
+    # smaller, a worker lazily loading several large models fills the root
+    # volume first and kubelet evicts it (and its co-located pods) on disk
+    # pressure mid-inference, long before this sizeLimit ever engages.
     cacheStorageSize: 300Gi
+
+    # -- Size limit of the in-memory `/dev/shm` volume (an emptyDir with
+    # `medium: Memory`) mounted into worker containers. It caps the volume
+    # without reserving memory, but whatever a worker writes there counts
+    # against that container's memory limit, so raise a pool's
+    # `resources.limits.memory` together with it. Override per pool with
+    # `workers.pools.<name>.shmSize`. The resolved value must be non-empty.
+    shmSize: 8Gi
+
+    # -- Optional persistent cache for SGLang/FlashInfer/DeepGEMM/Triton
+    # compiled kernels. Disabled by default: workers remain cacheless-capable
+    # and no PVC is required for a normal install. When enabled, every worker
+    # StatefulSet replica gets its own ReadWriteOnce claim; claims are never
+    # shared across replicas because upstream JIT writers are not safe under
+    # concurrent cross-process mutation. A bundle-level
+    # `kernelCache.enabled` overrides this common default.
+    kernelCache:
+      enabled: false
+      # -- Requested storage for each retained per-replica compiler cache.
+      storageSize: 20Gi
+      # -- StorageClass for compiler-cache claims. Empty uses the cluster
+      # default. Prefer a class available in every zone that can host the
+      # corresponding GPU pool.
+      storageClassName: ""
 
     # -- Cluster cache (object storage) for model WEIGHTS only. Optional
     # perf/offline feature (a cache miss falls back to HuggingFace), default
@@ -447,7 +542,7 @@ workers:
       #   - s3://<bucket>/models                                            (AWS — terraform output -raw model_cache_bucket_url)
       #   - gs://<bucket>/models                                            (GCP — same output name)
       #   - abfs(s)://<container>@<account>.dfs.core.windows.net/models     (Azure ADLS Gen2 — same output name)
-      # Pre-populate the bucket once with `sie-admin cache weights sync --bundle default --dest <url>/`.
+      # Pre-populate the /models prefix with your object-storage tooling or cache pipeline.
       url: ""
 
     # -- HuggingFace cache configuration
@@ -499,6 +594,13 @@ workers:
     # SIE_WORKER_LIVENESS_BUDGET_S as periodSeconds * failureThreshold and both
     # Python and sidecar reject larger cold-start timeouts so kubelet does not
     # kill the pod before the cleanup-safe startup timeout can finish.
+    # The nginx ingress proxy-read/send-timeout annotations are DERIVED from
+    # this value (max(this + 60, 600) seconds, see
+    # `sie-cluster.ingress.proxyTimeoutSeconds`) so the edge never 504s a first
+    # request that is still legitimately waiting on a cold model load. This is
+    # the only knob for that edge budget: raising this raises the edge timeout
+    # with it, and the chart's nginx annotation defaults take precedence over
+    # `ingress.annotations`.
     modelReadyTimeoutSec: 900
 
     # -- Liveness/readiness/startup probe timing for worker pods. The httpGet
@@ -709,7 +811,19 @@ workers:
   #                    worker process env var.
   #   gpu.count:       int. 0 disables nvidia.com/gpu request on the pod.
   #                    Values >1 render one adapter child container per GPU
-  #                    plus one sidecar routing across child IPC sockets.
+  #                    plus one sidecar routing across child IPC sockets,
+  #                    unless gpu.deviceGroup is set.
+  #   gpu.deviceGroup: bool, default false. Inverts what gpu.count means. One
+  #                    adapter child owns every GPU in the pod instead of one
+  #                    child per GPU, which is what a model too large for a
+  #                    single accelerator needs. The child sees the full
+  #                    device list in SIE_DEVICES and requests every GPU, and
+  #                    the model profile declares the matching
+  #                    adapter_options.loadtime.tensor_parallel_size. Requires
+  #                    gpu.count >= 2. The pod, the lane tuple and the
+  #                    autoscaling unit are otherwise unchanged. SIE_GPU_COUNT
+  #                    advertises serving slots rather than cards, so a device
+  #                    group publishes one however many accelerators it holds.
   #   sidecar.emulatedChildCount:
   #                    int. CPU-only local/dev fanout for exercising the same
   #                    sidecar child routing without GPU resources. GPU pools
@@ -738,6 +852,12 @@ workers:
   #                    Optional per-pool Rust Candle CUDA compute capability
   #                    override. If omitted, the chart resolves it from
   #                    workers.common.rust.image.computeCapabilityByMachineProfile.
+  #   shmSize:         Optional override of common.shmSize, the size limit of
+  #                    the in-memory /dev/shm volume. Writes there count against
+  #                    the worker container's memory limit. A gpu.deviceGroup
+  #                    engine runs one process per GPU, and those processes can
+  #                    exchange data through /dev/shm, so such a pool may need
+  #                    a larger size and a matching resources.limits.memory.
   #   tolerations:     extra tolerations on top of the chart defaults.
   #
   # bundles: map keyed by bundle name (matches a bundle in sie_config;
@@ -750,6 +870,8 @@ workers:
   #                    `sglang-vision-extract` -> `sglang`).
   #     preloadModels: Optional list of models to preload for this specific
   #                    worker lane. Overrides pool/common preloadModels.
+  #     kernelCache:   Optional `{enabled: bool}` override for the common
+  #                    per-replica SGLang compiler-cache policy.
   #     extraEnv:      list. Extra env vars on the ``worker`` container.
   #                    Rendered after workers.common.extraEnv so a
   #                    bundle-level entry wins on duplicate names.
@@ -858,16 +980,17 @@ workers:
           minReplicas: 0
           maxReplicas: 3
 
-    # Gemma 4 (CUDA 13 / cu130). NOTE the `platform: cuda13` — the gemma image
-    # is built/tagged cuda13-gemma; omitting this (defaulting to cuda12) makes
+    # SGLang cu130 generation (Gemma 4 plus newer Qwen profiles). NOTE the
+    # `platform: cuda13` — the image is built/tagged cuda13-sglang-cu130;
+    # omitting this (defaulting to cuda12) makes
     # the chart fail fast (see workers.common.bundlePlatforms). The 26B-A4B model
     # needs a 96 GB+ card (H200 / RTX PRO 6000); E2B/E4B fit smaller GPUs.
     # When productionizing, also add a matching entry under the top-level
     # `machineProfiles:` map so it surfaces in the machine-profiles ConfigMap,
     # and set `gpu.product` to your node's actual GPU label.
-    gemma:
+    sglang-cu130:
       enabled: false
-      machineProfile: gemma
+      machineProfile: sglang-cu130
       gpuType: h200
       platform: cuda13
       nodeSelector: {}
@@ -886,7 +1009,7 @@ workers:
           operator: Exists
           effect: NoSchedule
       bundles:
-        gemma:
+        sglang-cu130:
           minReplicas: 0
           maxReplicas: 2
 
@@ -1099,11 +1222,15 @@ auth:
 #        and pod annotation iam.gke.io/gcp-service-account
 #   EKS: module.sie_irsa_role namespace_service_accounts = ["sie:sie-server"]
 #        and pod annotation eks.amazonaws.com/role-arn
+#   ACK: RRSA role trust subject "system:serviceaccount:sie:sie-server"
+#        and pod annotation pod-identity.alibabacloud.com/role-name
 # If you override serviceAccount.name, update the matching TF variable sie_service_account_name.
 # If you override the Kubernetes namespace (or deploy the SA in a different namespace),
 # also update the corresponding Workload Identity / IRSA bindings and Terraform variables
-# (e.g. sie_service_account_name) and pod annotations (iam.gke.io/gcp-service-account or
-# eks.amazonaws.com/role-arn) so they reference the same namespace and KSA name "sie-server".
+# (e.g. sie_service_account_name) and pod annotations
+# (iam.gke.io/gcp-service-account, eks.amazonaws.com/role-arn, or
+# pod-identity.alibabacloud.com/role-name) so they reference the same namespace
+# and KSA name "sie-server".
 serviceAccount:
   # -- Create service account
   create: true
@@ -1161,6 +1288,17 @@ healthGates:
   # This cannot disable the mandatory autoscaling control-path gates.
   enabled: false
 
+# -- Resource requests/limits for kubectl-based KEDA hook Jobs
+# (keda-apply, keda-cleanup, and the KEDA ScaledObject/HPA gate).
+hooks:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "200m"
+      memory: "1Gi"
+
 # -- HuggingFace token secret (optional)
 # Create via Helm instead of kubectl for fully declarative deploys.
 # Pass token at install time: --set hfToken.create=true --set hfToken.value=<token>
@@ -1214,6 +1352,13 @@ nats:
   # NOTE: These keys are passed to the NATS sub-chart (nats/nats) which expects
   # config.jetstream.memoryStore.maxSize (not memStorage/size).
   config:
+    # -- NATS server clustering. Off by default: a single NATS pod is the
+    # shipped topology. A replicated work queue
+    # (queueRouting.streamReplicas > 1) needs this enabled with
+    # replicas >= streamReplicas, otherwise stream creation fails.
+    cluster:
+      enabled: false
+      replicas: 3
     jetstream:
       # -- Enable JetStream for the NATS work queue.
       # Required when clusterRouting=queue (the default).
@@ -1223,10 +1368,22 @@ nats:
       memoryStore:
         enabled: true
         maxSize: 512MB
-      # -- File storage (disabled for memory-only work queues).
-      # Enable with a PVC if you need persistent DLQ or large stream retention.
+      # -- File storage. Off by default, matching the memory-backed default
+      # of queueRouting.streamStorage.
+      # NOTE: enabling this alone changes NOTHING about the work queue or the
+      # DLQ — the gateway and sidecars create their streams with whatever
+      # queueRouting.streamStorage says, and server-side fileStore only backs
+      # streams explicitly created with File storage. Set
+      # queueRouting.streamStorage=file to actually persist them; the chart
+      # then requires this to be enabled (see the gateway-deployment guard).
       fileStore:
         enabled: false
+        # Sub-chart PVC template for the JetStream store, mounted on each NATS
+        # pod. Size must comfortably exceed peak queue depth (max_msgs is
+        # 100_000 per pool stream) plus the 24 h DEAD_LETTERS retention.
+        pvc:
+          enabled: true
+          size: 10Gi
   # -- Prometheus NATS exporter sidecar.
   # Exposes NATS server internals (connections, JetStream streams/consumers) to Prometheus.
   promExporter:
@@ -1271,6 +1428,40 @@ queueRouting:
   # Keep above maxDeliver * 30s so failed work remains fetchable
   # after the retry/DLQ envelope for operator inspection.
   streamMaxAgeSec: 1800
+  # -- JetStream storage backing for the work-queue streams
+  # (`WORK_POOL_{pool}`, the per-worker direct-dispatch streams, and
+  # `DEAD_LETTERS`). One of "memory" (default) or "file". Rendered into
+  # SIE_STREAM_STORAGE on BOTH the gateway and the worker sidecars so the two
+  # stream creators cannot disagree — whoever creates a stream first wins.
+  #
+  # "memory" (the shipped default, and the only behaviour that existed before
+  # this knob) keeps queued and delivered-but-unacked work only in the
+  # broker's RAM. A restart of the NATS pod — an OOM kill, a NATS rollout, or
+  # a node drain that evicts THAT pod — erases every queued item AND the
+  # DEAD_LETTERS record that would have named them. (Draining a node hosting
+  # only workers or gateways is harmless here; at streamReplicas=1 any
+  # eviction of the single NATS pod loses the state, while a replicated stream
+  # survives as long as a peer holding it stays up.) The gateway is queue-only
+  # with no direct fallback, so a broker restart is a full inference outage for
+  # its duration, and in-flight work does not come back.
+  #
+  # "file" persists work across a broker restart. It is NOT a free upgrade:
+  # it requires nats.config.jetstream.fileStore.enabled=true (a PVC per NATS
+  # pod), adds a disk write to every publish, and raises publish latency on
+  # the inference hot path. Sizing the PVC is on the operator.
+  #
+  # Flipping this on an existing cluster does NOT convert live streams:
+  # JetStream refuses an in-place storage-type change, so the gateway and
+  # sidecars log a loud warning and leave existing streams alone. The new
+  # setting takes effect only for streams created afterwards — drain the pool
+  # and delete the streams during a maintenance window to convert.
+  streamStorage: memory
+  # -- JetStream replica count for those same streams (SIE_STREAM_REPLICAS).
+  # 1 (default) means a single copy: losing the broker holding it loses the
+  # work even with file storage. Values above 1 require a clustered NATS
+  # (nats.config.cluster.enabled=true with at least this many replicas).
+  # Unlike streamStorage, this IS reconciled on existing streams.
+  streamReplicas: 1
   # -- Non-expiring pool objects synthesized by the gateway for Helm-declared
   # physical queue namespaces. Keys are queue pool names; names are normalized to
   # lowercase before gateway storage/routing. Use this when
@@ -1324,12 +1515,17 @@ queueRouting:
 #      filesystems) and are rejected.
 #   2. else derived from workers.common.clusterCache.url by swapping a trailing
 #      "/models" prefix for "/payloads" (shared bucket, sibling prefixes:
-#        <bucket>/models/...    model weights (managed by sie-admin)
+#        <bucket>/models/...    model weights (populated separately)
 #        <bucket>/payloads/...  large work-item refs (managed by gateway)).
 # Supported schemes: s3:// (AWS), gs:// (GCP), abfs:// + abfss:// (Azure ADLS
-# Gen2). All three terraform modules expose `payload_store_url` (the /payloads
-# URL) and scope the workload IAM grant to that prefix, so the wiring aligns
-# out of the box.
+# Gen2), and oss:// (Alibaba Cloud). All four terraform modules expose
+# `payload_store_url` (the /payloads URL). For managed storage, payload object
+# actions are prefix-scoped. AWS also
+# conditions bucket-level ListBucket on payloads/; GCP grants object listing
+# separately bucket-wide; and Azure exempts Blob.List from its payloads/ ABAC
+# condition; Alibaba conditions bucket-level ListObjects on models/* and
+# payloads/*. The legacy GCP BYO path grants objectViewer bucket-wide;
+# operators own IAM scoping for other explicitly configured BYO storage.
 #
 # If enabled and clusterRouting=queue but no URL resolves, the chart FAILS the
 # install with guidance (see deploy/helm/sie-cluster/README.md). Set
@@ -1337,7 +1533,7 @@ queueRouting:
 payloadStore:
   # -- Enable the payload store. Default true: required for >1MB work items.
   enabled: true
-  # -- Payload store URL (object storage: s3://, gs://, abfs://, abfss://).
+  # -- Payload store URL (object storage: s3://, gs://, abfs://, abfss://, oss://).
   # Empty derives from workers.common.clusterCache.url (the shared bucket's
   # /payloads sibling). Set explicitly to the terraform `payload_store_url`
   # output (or a separate bucket). Local paths are rejected in queue mode.
@@ -1900,10 +2096,16 @@ mcpEdge:
   # Connector secrets (the per-user auth shim). Comma-separated `secret[:user_id]`.
   # Rendered into a chart-managed Secret when set; or point existingSecretName at
   # a Secret you manage (key: connector-secrets). NEVER commit a real secret here.
+  # Local-only demo example: `local-dev-secret:local-dev`. Replace it before any
+  # shared or production deployment.
   connectorSecrets: ""
   existingSecretName: ""
   # SIE_MCP_PUBLIC_URL — the externally reachable https origin (e.g.
-  # https://mcp.example.com). Pin it so OAuth metadata URLs are stable.
+  # https://mcp.example.com) advertised as the OAuth issuer and endpoints.
+  # Empty => https://<mcpEdge.ingress.host> when the edge ingress is enabled
+  # (https even with chart TLS off, which implies upstream TLS termination).
+  # Set it explicitly for any other exposure (LoadBalancer, external proxy):
+  # unpinned, the edge refuses OAuth metadata for non-loopback hosts.
   publicUrl: ""
   # OAuth bridge for claude.ai / desktop connectors (#1312). Disable for
   # connector-secret-only (e.g. Cowork header) deployments.

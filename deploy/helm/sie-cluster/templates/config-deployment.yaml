@@ -58,6 +58,10 @@ spec:
         checksum/otel-resource: {{ include "sie-cluster.otel.resourceChecksum" . | quote }}
     spec:
       {{- include "sie-cluster.imagePullSecrets" . | nindent 6 }}
+      {{- with .Values.config.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       serviceAccountName: {{ include "sie-cluster.serviceAccountName" . }}
       containers:
         - name: config

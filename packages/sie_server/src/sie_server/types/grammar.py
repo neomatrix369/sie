@@ -39,6 +39,12 @@ from typing import Literal
 # building cache keys don't import the cache module just for the tag.
 GrammarKind = Literal["json_schema", "regex", "ebnf"]
 
+OUTLINES_JSON_SCHEMA_TYPE_DIAGNOSTIC = "'type' must be a string"
+OUTLINES_JSON_SCHEMA_TYPE_MESSAGE = (
+    "JSON Schema 'type' must be a string for this backend. Type arrays are unsupported; "
+    "express unions, including null, with 'anyOf' branches."
+)
+
 
 @dataclass(frozen=True)
 class GrammarSpec:

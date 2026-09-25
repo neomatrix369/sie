@@ -10,14 +10,14 @@ Provides a Python client for the Search Inference Engine server.
 Example:
     >>> from sie_sdk import SIEClient
     >>> client = SIEClient("http://localhost:8080")
-    >>> result = client.encode("bge-m3", {"text": "Hello world"})
+    >>> result = client.encode("BAAI/bge-m3", {"text": "Hello world"})
     >>> result["dense"]  # np.ndarray, shape [1024]
 
 GPU Selection and Auto-Retry:
     >>> # Request specific GPU, auto-retry while scaling up
     >>> client = SIEClient("http://gateway:8080")
     >>> result = client.encode(
-    ...     "bge-m3",
+    ...     "BAAI/bge-m3",
     ...     {"text": "Hello"},
     ...     gpu="l4",
     ...     wait_for_capacity=True,  # Auto-retry explicit capacity 503s and transient transport errors
@@ -28,7 +28,7 @@ Resource Pools:
     >>> # Create pool for isolated capacity
     >>> client = SIEClient("http://gateway:8080")
     >>> client.create_pool("eval-bench", {"l4": 2})  # 2 L4 GPUs
-    >>> result = client.encode("bge-m3", {"text": "Hello"}, gpu="eval-bench/l4")
+    >>> result = client.encode("BAAI/bge-m3", {"text": "Hello"}, gpu="eval-bench/l4")
     >>> client.delete_pool("eval-bench")  # Cleanup when done
 """
 
@@ -40,6 +40,7 @@ import json
 import logging
 import threading
 import time
+import warnings
 import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from functools import partial
@@ -48,15 +49,15 @@ from typing import IO, Any, Literal, Self, cast, overload
 from urllib.parse import quote, urlencode
 
 import httpx
-import msgpack
-import msgpack_numpy as m
 
+from sie_sdk._msgpack import packb as pack_msgpack
 from sie_sdk.audio import convert_item_audio
 from sie_sdk.documents import convert_item_document
 from sie_sdk.files import resolve_upload
 from sie_sdk.images import ImageLike, convert_images_for_json, convert_item_images
 from sie_sdk.jobs import (
     TERMINAL_JOB_STATES,
+    MalformedChunkError,
     build_job_body,
     decode_chunk_bytes,
     job_chunks,
@@ -93,6 +94,7 @@ from sie_sdk.types import (
     OutputType,
     PoolInfo,
     PoolSpec,
+    Recommendation,
     RequestMetadata,
     ResponseInputMessage,
     ResponseResult,
@@ -108,22 +110,27 @@ from ._shared import (
     HTTP_CLIENT_ERROR,
     HTTP_GATEWAY_TIMEOUT,
     HTTP_SERVICE_UNAVAILABLE,
+    JOB_NOT_TERMINAL_ERROR_CODE,
     JOB_RESULT_NOT_FOUND_ERROR_CODE,
     JOB_RESULT_REF_MAX_REFRESHES,
     JSON_CONTENT_TYPE,
     LORA_LOADING_DEFAULT_DELAY_S,
     LORA_LOADING_ERROR_CODE,
     LORA_LOADING_MAX_RETRIES,
+    MODAL_CONTINUATION_MAX_HOPS,
     MODEL_LOADING_DEFAULT_DELAY_S,
     MODEL_LOADING_ERROR_CODE,
     MODEL_REVISION_HEADER,
     MSGPACK_CONTENT_TYPE,
     PROVISIONING_ERROR_CODE,
+    RECOMMEND_PATH,
+    REQUEST_ID_HEADER,
     RESOURCE_EXHAUSTED_ERROR_CODE,
     RESOURCE_EXHAUSTED_MAX_RETRIES,
     SDK_VERSION_HEADER,
     SERVER_VERSION_HEADER,
     _coerce_token_count,
+    admission_retry_delay,
     attach_request_metadata,
     base_url_accepts_origin_credentials,
     build_chat_body,
@@ -135,10 +142,12 @@ from ._shared import (
     convert_score_images_for_wire,
     copy_base_url_headers,
     get_error_code,
+    get_error_param,
     get_retry_after,
     get_sdk_version,
     handle_error,
     is_transient_connect_error,
+    modal_continuation_path,
     next_stream_retry_delay,
     parse_encode_results,
     parse_extract_results,
@@ -146,6 +155,7 @@ from ._shared import (
     parse_request_metadata,
     parse_score_result,
     parse_terminal_json_object,
+    parse_terminal_msgpack_object,
     provisioning_retry_delay,
     raise_if_estimate_unroutable,
     raise_if_input_too_long,
@@ -155,13 +165,16 @@ from ._shared import (
     settled_charge_from_usage,
     sse_chunk_error,
     sse_headers,
-    validate_encode_result_count,
+    valid_stream_request_id,
+    validate_base_url,
+    validate_batch_result_count,
     validate_generate_grammar,
     validate_generate_request_body,
     websocket_matches_base_url_origin,
 )
 from ._sse import iter_sse_payloads
 from .errors import (
+    JobFailedError,
     LoraLoadingError,
     ModelLoadingError,
     PoolError,
@@ -188,12 +201,6 @@ _RETRYABLE_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 )
 
 _LEASE_RENEWAL_MAX_RETRIES = 5
-
-# NOTE: msgpack_numpy.patch() is called lazily in SIEClient.__init__
-# to avoid monkey-patching the global msgpack module at import time.
-# This prevents overhead in processes that import sie_sdk but don't use
-# the client (e.g., the gateway only needs sie_sdk.types/queue_types).
-_NUMPY_PATCHED = False
 
 
 def _parse_generate_result(
@@ -232,6 +239,9 @@ def _parse_generate_result(
             "completion_tokens": _coerce_token_count(usage.get("completion_tokens")),
             "total_tokens": _coerce_token_count(usage.get("total_tokens")),
         }
+        images = usage.get("images")
+        if isinstance(images, int) and not isinstance(images, bool) and 0 < images <= 2**32 - 1:
+            parsed_usage["images"] = images
         settled = settled_charge_from_usage(usage)
         if settled is not None:
             parsed_usage["credits_charged"], parsed_usage["rate_book_version"] = settled
@@ -300,7 +310,9 @@ def _handle_oom_retry(
             msg,
             model=model,
             retries=oom_retries,
+            param=get_error_param(response),
             request=parse_request_metadata(response.headers),
+            retry_after=get_retry_after(response),
         )
     retry_after = get_retry_after(response)
     raw_delay = compute_oom_backoff(retry_after, oom_retries)
@@ -329,7 +341,9 @@ def _handle_oom_retry(
             msg,
             model=model,
             retries=oom_retries,
+            param=get_error_param(response),
             request=parse_request_metadata(response.headers),
+            retry_after=get_retry_after(response),
         )
     delay = raw_delay
     # First retry surfaces at WARNING so a user with default log level
@@ -370,7 +384,7 @@ class SIEClient:
 
     Example:
         >>> client = SIEClient("http://localhost:8080")
-        >>> result = client.encode("bge-m3", {"text": "Hello world"})
+        >>> result = client.encode("BAAI/bge-m3", {"text": "Hello world"})
         >>> print(result["dense"].shape)
         (1024,)
 
@@ -380,13 +394,13 @@ class SIEClient:
         ...     gpu="l4",
         ...     options={"normalize": True},
         ... )
-        >>> result = client.encode("bge-m3", {"text": "Hello"})  # uses l4
-        >>> result = client.encode("bge-m3", {"text": "Hello"}, gpu="a100")  # overrides
+        >>> result = client.encode("BAAI/bge-m3", {"text": "Hello"})  # uses l4
+        >>> result = client.encode("BAAI/bge-m3", {"text": "Hello"}, gpu="a100")  # overrides
 
         >>> # With resource pool for isolated capacity (new API)
         >>> client = SIEClient("http://gateway:8080")
         >>> client.create_pool("eval-bench", {"l4": 2})
-        >>> result = client.encode("bge-m3", {"text": "Hello"}, gpu="eval-bench/l4")
+        >>> result = client.encode("BAAI/bge-m3", {"text": "Hello"}, gpu="eval-bench/l4")
         >>> client.delete_pool("eval-bench")
     """
 
@@ -406,15 +420,8 @@ class SIEClient:
         org: str | None = None,
         base_url_headers: Mapping[str, str] | None = None,
     ) -> None:
-        # Ensure msgpack-numpy hooks are installed (once per process).
-        # Done lazily here instead of at module level to avoid monkey-patching
-        # msgpack in processes that import sie_sdk but never use the client.
-        global _NUMPY_PATCHED
-        if not _NUMPY_PATCHED:
-            m.patch()
-            _NUMPY_PATCHED = True
-
         # Normalize base_url (remove trailing slash)
+        validate_base_url(base_url)
         self._base_url = base_url.rstrip("/")
         self._base_url_headers = copy_base_url_headers(base_url_headers)
         if self._base_url_headers and not base_url_accepts_origin_credentials(self._base_url):
@@ -517,7 +524,12 @@ class SIEClient:
         """Return the deployed execution revision observed on the latest call in this thread.
 
         The property name is retained for wire compatibility with
-        ``X-SIE-Model-Revision``.
+        ``X-SIE-Model-Revision``. On a gateway buffered response this is the
+        lowercase 64-hex executed bundle/config SHA-256, not the catalog's
+        weights revision (for example, a 40-hex Hugging Face commit).
+        It is ``None`` when the header is absent, including gateway SSE:
+        headers precede the terminal execution evidence. Fully consuming a
+        stream does not populate this property from terminal chunk fields.
         """
         value = getattr(self._request_state, "last_model_revision", None)
         return str(value) if value is not None else None
@@ -542,6 +554,37 @@ class SIEClient:
         if warning:
             logger.warning(warning)
             SIEClient._version_warning_logged = True
+
+    def _follow_modal_continuations(
+        self,
+        response: httpx.Response,
+        *,
+        start_time: float,
+        budget_s: float,
+        accept: str = JSON_CONTENT_TYPE,
+    ) -> httpx.Response:
+        """Consume bounded same-origin Modal 303 result URLs without replaying POST."""
+        for _ in range(MODAL_CONTINUATION_MAX_HOPS):
+            path = modal_continuation_path(self._base_url, response)
+            if path is None:
+                return response
+            remaining = budget_s - (time.monotonic() - start_time)
+            if remaining <= 0:
+                msg = f"Provision timeout ({budget_s:.1f}s) exceeded while awaiting request result"
+                raise ProvisioningError(msg)
+            try:
+                response = self._client.get(
+                    path,
+                    headers={"Accept": accept},
+                    timeout=min(self._timeout, remaining),
+                )
+            except httpx.HTTPError as exc:
+                msg = f"Failed to retrieve the in-flight generation result: {type(exc).__name__}"
+                raise SIEConnectionError(msg) from exc
+        if modal_continuation_path(self._base_url, response) is not None:
+            msg = f"Provisioning result remained in flight after {MODAL_CONTINUATION_MAX_HOPS} continuation hops"
+            raise ProvisioningError(msg)
+        return response
 
     def _resolve_gpu(self, gpu: str | None) -> str | None:
         """Resolve GPU, using default if not specified."""
@@ -776,7 +819,7 @@ class SIEClient:
 
         Example:
             >>> client.create_pool("eval", {"l4": 2}, bundle="default", minimum_worker_count=1)
-            >>> result = client.encode("bge-m3", {"text": "Hello"}, gpu="eval/l4")
+            >>> result = client.encode("BAAI/bge-m3", {"text": "Hello"}, gpu="eval/l4")
             >>> client.delete_pool("eval")
         """
         with self._pools_lock:
@@ -1099,7 +1142,7 @@ class SIEClient:
         """Encode items into vector representations.
 
         Args:
-            model: Model name to use for encoding (e.g., "bge-m3").
+            model: Model name to use for encoding (e.g., "BAAI/bge-m3").
             items: Single Item or list of Items to encode.
             output_types: Which outputs to return: ["dense"], ["sparse"], ["dense", "sparse", "multivector"].
                          Default: ["dense"].
@@ -1130,6 +1173,12 @@ class SIEClient:
                 under ``ModelLoadingError`` / ``LoraLoadingError`` /
                 ``ResourceExhaustedError`` below; the ``RESOURCE_EXHAUSTED``
                 branch can be disabled by passing ``max_oom_retries=0``.
+                The pre-dispatch admission signals ``429 RATE_LIMIT``,
+                ``503 BILLING_CAPACITY_UNAVAILABLE`` and ``503 QUEUE_FULL``
+                are likewise retried regardless of this flag — no work has
+                been published yet — honouring ``Retry-After`` and capped by
+                ``provision_timeout_s``. On give-up they raise
+                ``RateLimitError`` (429) or the server's terminal 503.
             provision_timeout_s: Maximum time to wait for capacity when wait_for_capacity=True.
                 Default: 900 seconds (15 minutes).
             max_oom_retries: Public retry knob capping the number of
@@ -1169,19 +1218,19 @@ class SIEClient:
 
         Example:
             >>> # Single item
-            >>> result = client.encode("bge-m3", {"text": "Hello"})
+            >>> result = client.encode("BAAI/bge-m3", {"text": "Hello"})
             >>> result["dense"]  # np.ndarray
 
             >>> # Batch
-            >>> results = client.encode("bge-m3", [{"text": "Hello"}, {"text": "World"}])
+            >>> results = client.encode("BAAI/bge-m3", [{"text": "Hello"}, {"text": "World"}])
             >>> len(results)  # 2
 
             >>> # With GPU selection (for gateway)
-            >>> result = client.encode("bge-m3", {"text": "Hello"}, gpu="l4")
+            >>> result = client.encode("BAAI/bge-m3", {"text": "Hello"}, gpu="l4")
 
             >>> # Auto-wait for capacity during scale-up
             >>> result = client.encode(
-            ...     "bge-m3",
+            ...     "BAAI/bge-m3",
             ...     {"text": "Hello"},
             ...     gpu="l4",
             ...     wait_for_capacity=True,
@@ -1190,7 +1239,7 @@ class SIEClient:
 
             >>> # Query embedding with instruction (for E5, GTE-Qwen, etc.)
             >>> result = client.encode(
-            ...     "gte-qwen2-7b",
+            ...     "Alibaba-NLP/gte-Qwen2-7B-instruct",
             ...     {"text": "What is ML?"},
             ...     instruction="Retrieve passages that answer the question",
             ...     is_query=True,
@@ -1242,7 +1291,7 @@ class SIEClient:
             request_body["params"] = params
 
         # Serialize with msgpack
-        body = msgpack.packb(request_body, use_bin_type=True)
+        body = pack_msgpack(request_body, use_bin_type=True)
 
         # Build headers with optional GPU and pool routing
         headers: dict[str, str] = {}
@@ -1262,6 +1311,7 @@ class SIEClient:
         # cause unbounded blocking; each retry uses bounded exponential
         # backoff via ``compute_oom_backoff``.
         oom_retries = 0
+        connect_retries = 0
 
         # Retry loop for retryable provisioning/capacity responses.
         while True:
@@ -1285,8 +1335,11 @@ class SIEClient:
                         timeout=timeout,
                         error_label="Connect error",
                         error=e,
+                        attempt=connect_retries,
+                        target=self._base_url,
                     )
                     if delay_s is not None:
+                        connect_retries += 1
                         self._record_retry()
                         time.sleep(delay_s)
                         continue
@@ -1313,11 +1366,18 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
+            response = self._follow_modal_continuations(
+                response,
+                start_time=start_time,
+                budget_s=timeout,
+                accept=MSGPACK_CONTENT_TYPE,
+            )
+
             # Short-circuit terminal load failures BEFORE engaging the
             # MODEL_LOADING retry budget. The server emits 502
             # MODEL_LOAD_FAILED for permanent classes (gated repos,
             # missing deps) — retrying would waste 5 minutes on a
-            # known-bad config (sie-test#85).
+            # known-bad configuration.
             raise_if_model_load_failed(response, model=model)
 
             # Handle 503 with LORA_LOADING or MODEL_LOADING - auto-retry
@@ -1396,6 +1456,25 @@ class SIEClient:
                     self._record_retry()
                     continue
 
+            # Retryable pre-execution admission backpressure (pass-2 audit
+            # B1/B2/B7): a 429 RATE_LIMIT, or a retryable 503
+            # (BILLING_CAPACITY_UNAVAILABLE / QUEUE_FULL) the ladder above did
+            # not match. No work was published, so retry within the
+            # provision-timeout budget honoring Retry-After; a give-up raises a
+            # typed RateLimitError (429) or the server's terminal 503.
+            # 402/403 credit/account errors are terminal and NOT handled here.
+            admission_delay = admission_retry_delay(response, start_time=start_time, timeout=timeout)
+            if admission_delay is not None:
+                logger.info(
+                    "Admission backpressure (HTTP %d), retrying in %.1fs (timeout: %.1fs)",
+                    response.status_code,
+                    admission_delay,
+                    timeout,
+                )
+                self._record_retry()
+                time.sleep(admission_delay)
+                continue
+
             # Handle 504 (gateway timeout): queued work was published, but the
             # gateway did not receive a worker result before its deadline.
             # Encode/score/extract are idempotent, so callers that opted into
@@ -1427,7 +1506,7 @@ class SIEClient:
         self._check_server_version(response)
 
         # Deserialize response
-        response_data = msgpack.unpackb(response.content, raw=False)
+        response_data = parse_terminal_msgpack_object(response, owner="encode")
 
         # Get timing info if present
         timing = response_data.get("timing")
@@ -1439,12 +1518,15 @@ class SIEClient:
             for result in results:
                 result["model"] = response_model
         # Guard the 1:1 input↔output contract before any positional access
-        # (``results[0]`` below, or batch reassembly in callers). A desynced
-        # count otherwise surfaces as a context-free ``IndexError`` (#1526).
-        validate_encode_result_count(
+        # (``results[0]`` below, or batch reassembly in callers). The gateway's
+        # queue path returns mixed-success batches as 200 with only the
+        # successful items, so a desynced count otherwise misaligns every
+        # zip-inputs-to-outputs consumer (#1526, finding U1).
+        validate_batch_result_count(
             results,
-            len(items_list),
+            items_list,  # ty: ignore[invalid-argument-type]
             model,
+            operation="encode",
             request=parse_request_metadata(response.headers),
         )
         if timing:
@@ -1542,7 +1624,7 @@ class SIEClient:
             >>> quote["estimated_credits"]
             1
             >>> quote["rate_book_version"]
-            '2026-07-26-production-bootstrap-v2'
+            '2026-08-09-production-bootstrap-v3'
         """
         # Every other public method opens with this. Without it `estimate()`
         # inherits whatever `last_retry_count` / `last_model_revision` the
@@ -1573,6 +1655,72 @@ class SIEClient:
             handle_error(response)
 
         return cast("CostEstimate", response.json())
+
+    def recommend(self, task: str, *, timeout: float | None = None) -> Recommendation:
+        """Ask which model to use for a task family (``POST /v1/recommend``).
+
+        Read-only and non-billable: no dispatch, no reservation, no credits.
+        The managed gateway answers from evidence compiled into the release it
+        is running, so the recommendation and the ``/v1/catalog`` entry it
+        names can never disagree.
+
+        The answer always states its ``basis``. ``ranked`` means two or more of
+        the family's choices were measured on the same benchmark, so the
+        ordering rests on a comparison somebody ran. ``curated`` means evidence
+        exists but no two choices share a benchmark, so the pick is the
+        catalog's judgement and is labelled as such rather than dressed up as a
+        measurement. ``no_evidence`` means the family cites nothing. Read it
+        before trusting a pick — that is what it is for.
+
+        Args:
+            task: A catalog task family id, e.g. ``"rerank"``. A 404 names
+                every id this release recommends for.
+            timeout: Per-call timeout override in seconds.
+
+        Returns:
+            :class:`~sie_sdk.types.Recommendation` with ``fast`` and/or
+            ``best``, each carrying its alias, evidence refs, and
+            ``evidence_guarded``. Both are optional: a pick names only a model
+            this release can serve, so a family with nothing serveable answers
+            200 with its evidence and no picks.
+
+        Raises:
+            RequestError: 400 for an empty or malformed ``task``; 404 when the
+                task family is unknown to this release.
+            SIEConnectionError: If unable to connect to the server.
+            ServerError: For other 5xx responses.
+
+        Example:
+            >>> pick = client.recommend("rerank")
+            >>> pick["best"]["alias"]
+            'rerank-best'
+            >>> pick["basis"]
+            'ranked'
+        """
+        # Same reason every other public method opens with this: without it the
+        # call inherits the previous call's retry/revision state on this thread.
+        self._reset_retry_count()
+        try:
+            response = self._client.post(
+                RECOMMEND_PATH,
+                json={"task": task},
+                headers={
+                    "Accept": JSON_CONTENT_TYPE,
+                    "Content-Type": JSON_CONTENT_TYPE,
+                },
+                timeout=timeout if timeout is not None else self._timeout,
+            )
+        except httpx.ConnectError as e:
+            msg = f"Failed to connect to {self._base_url}: {e}"
+            raise SIEConnectionError(msg) from e
+        except httpx.TimeoutException as e:
+            msg = f"Request timed out: {e}"
+            raise SIEConnectionError(msg) from e
+
+        if response.status_code >= HTTP_CLIENT_ERROR:
+            handle_error(response)
+
+        return cast("Recommendation", response.json())
 
     def get_model(self, model: str) -> ModelInfo:
         """Get details for a specific model.
@@ -1834,7 +1982,7 @@ class SIEClient:
             >>> print(f"Ready with {capacity['worker_count']} L4 workers")
 
             >>> # Wait and pre-load a model
-            >>> capacity = client.wait_for_capacity("l4", model="bge-m3")
+            >>> capacity = client.wait_for_capacity("l4", model="BAAI/bge-m3")
         """
         timeout = timeout_s if timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
         start_time = time.monotonic()
@@ -1918,7 +2066,13 @@ class SIEClient:
                 Their budgets are documented under ``ModelLoadingError`` /
                 ``ResourceExhaustedError`` below; the
                 ``RESOURCE_EXHAUSTED`` branch can be disabled by passing
-                ``max_oom_retries=0``.
+                ``max_oom_retries=0``. The pre-dispatch admission signals
+                ``429 RATE_LIMIT``, ``503 BILLING_CAPACITY_UNAVAILABLE`` and
+                ``503 QUEUE_FULL`` are likewise retried regardless of this
+                flag — no work has been published yet — honouring
+                ``Retry-After`` and capped by ``provision_timeout_s``. On
+                give-up they raise ``RateLimitError`` (429) or the server's
+                terminal 503.
             provision_timeout_s: Maximum time to wait for capacity when wait_for_capacity=True.
                 Default: 900 seconds (15 minutes).
             max_oom_retries: Public retry knob capping the number of
@@ -1954,7 +2108,7 @@ class SIEClient:
 
         Example:
             >>> result = client.score(
-            ...     "bge-reranker-v2",
+            ...     "BAAI/bge-reranker-v2-m3",
             ...     query={"text": "What is machine learning?"},
             ...     items=[{"text": "ML is AI..."}, {"text": "Python is..."}],
             ... )
@@ -1976,7 +2130,7 @@ class SIEClient:
             request_body["options"] = resolved_options
 
         # Serialize with msgpack
-        body = msgpack.packb(request_body, use_bin_type=True)
+        body = pack_msgpack(request_body, use_bin_type=True)
 
         # Build headers with optional GPU and pool routing
         headers: dict[str, str] = {}
@@ -1992,6 +2146,7 @@ class SIEClient:
         # Model loading uses time-based timeout only (no retry counter)
         # OOM retry counter (RESOURCE_EXHAUSTED) — bounded with exponential backoff.
         oom_retries = 0
+        connect_retries = 0
 
         # Retry loop for retryable provisioning/capacity responses.
         while True:
@@ -2015,8 +2170,11 @@ class SIEClient:
                         timeout=timeout,
                         error_label="Connect error",
                         error=e,
+                        attempt=connect_retries,
+                        target=self._base_url,
                     )
                     if delay_s is not None:
+                        connect_retries += 1
                         self._record_retry()
                         time.sleep(delay_s)
                         continue
@@ -2043,7 +2201,14 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
-            # Short-circuit terminal load failures (sie-test#85).
+            response = self._follow_modal_continuations(
+                response,
+                start_time=start_time,
+                budget_s=timeout,
+                accept=MSGPACK_CONTENT_TYPE,
+            )
+
+            # Short-circuit terminal load failures.
             raise_if_model_load_failed(response, model=model)
 
             # Handle 503 with MODEL_LOADING - auto-retry
@@ -2100,6 +2265,25 @@ class SIEClient:
                     self._record_retry()
                     continue
 
+            # Retryable pre-execution admission backpressure (pass-2 audit
+            # B1/B2/B7): a 429 RATE_LIMIT, or a retryable 503
+            # (BILLING_CAPACITY_UNAVAILABLE / QUEUE_FULL) the ladder above did
+            # not match. No work was published, so retry within the
+            # provision-timeout budget honoring Retry-After; a give-up raises a
+            # typed RateLimitError (429) or the server's terminal 503.
+            # 402/403 credit/account errors are terminal and NOT handled here.
+            admission_delay = admission_retry_delay(response, start_time=start_time, timeout=timeout)
+            if admission_delay is not None:
+                logger.info(
+                    "Admission backpressure (HTTP %d), retrying in %.1fs (timeout: %.1fs)",
+                    response.status_code,
+                    admission_delay,
+                    timeout,
+                )
+                self._record_retry()
+                time.sleep(admission_delay)
+                continue
+
             # Handle 504 (gateway timeout): queued work was published, but the
             # gateway did not receive a worker result before its deadline.
             # Encode/score/extract are idempotent, so callers that opted into
@@ -2131,7 +2315,7 @@ class SIEClient:
         self._check_server_version(response)
 
         # Deserialize response
-        response_data = msgpack.unpackb(response.content, raw=False)
+        response_data = parse_terminal_msgpack_object(response, owner="score")
 
         # Build ScoreResult
         result = parse_score_result(response_data)
@@ -2165,20 +2349,22 @@ class SIEClient:
     ) -> GenerateResult:
         """Generate text from a prompt (walking-skeleton SDK surface).
 
-        The SDK does not currently expose streaming chunks to the caller;
-        the worker streams chunks to the gateway, the gateway aggregates,
-        and the SDK returns the assembled result plus SIE-native timing
-        metadata (``ttft_ms``, ``tpot_ms``, ``attempt_id``).
+        This method returns the aggregated outcome: the worker streams
+        chunks to the gateway, the gateway aggregates, and the SDK
+        returns the assembled result plus SIE-native timing metadata
+        (``ttft_ms``, ``tpot_ms``, ``attempt_id``). To consume chunks as
+        they arrive, use :meth:`stream_generate` instead.
 
         Args:
             model: Model name. HF-style IDs such as
                 ``"Qwen/Qwen3-4B-Instruct-2507"`` are normalized to the
                 gateway's SIE-safe path id
                 ``"Qwen__Qwen3-4B-Instruct-2507"`` for this endpoint.
-            prompt: Raw prompt string. Chat-template rendering, if any,
-                is performed by the worker — this surface has no chat-template
-                helpers in the SDK (use the OpenAI SDK against
-                ``/v1/chat/completions`` for chat-shaped requests).
+            prompt: Raw continuation input for text-only requests, passed
+                unchanged without a chat template. Served template settings
+                such as ``enable_thinking`` and ``guardian_config`` do not
+                apply to raw input. Use :meth:`chat_completions` with messages
+                for chat, instruction-based structured output, and guard checks.
             max_new_tokens: Hard cap on output tokens.
             images: Optional native image inputs. When present, the worker
                 renders one user turn containing the images and ``prompt``
@@ -2205,15 +2391,24 @@ class SIEClient:
                 sampler arguments win. Select non-default profiles through the
                 ``model:profile`` identity rather than ``options.profile``.
             gpu: Target GPU type / pool spec; see ``encode``.
-            wait_for_capacity: Auto-retry 503 PROVISIONING / MODEL_LOADING responses
+            wait_for_capacity: Auto-retry 503 PROVISIONING responses
                 under ``provision_timeout_s``. See ``encode``. Unlike the
                 idempotent encode/score/extract paths, a ``504`` gateway
                 timeout is NOT retried here: generation is non-idempotent
                 and a 504 is a post-publish timeout, so retrying could
                 double-bill an inference. A ``504`` is surfaced as a
                 terminal :class:`ServerError`. Pass ``False`` to surface
-                pre-execution provisioning and model-loading responses without
-                retrying them.
+                pre-execution provisioning responses without retrying them.
+                ``503 MODEL_LOADING`` is retried regardless of this flag
+                (matching encode/score/extract): the worker has already
+                accepted the request and is loading the target model. The
+                pre-dispatch admission signals ``429 RATE_LIMIT``,
+                ``503 BILLING_CAPACITY_UNAVAILABLE`` and ``503 QUEUE_FULL``
+                are also retried regardless of this flag — they reject the
+                request before any generation is published, so retrying
+                cannot double-bill — honouring ``Retry-After`` and capped by
+                ``provision_timeout_s``; on give-up they raise
+                ``RateLimitError`` (429) or the server's terminal 503.
             provision_timeout_s: Maximum time to wait for capacity.
 
         Returns:
@@ -2266,6 +2461,7 @@ class SIEClient:
         timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
         start_time = time.monotonic()
         oom_retries = 0
+        connect_retries = 0
 
         while True:
             elapsed = time.monotonic() - start_time
@@ -2291,8 +2487,11 @@ class SIEClient:
                         timeout=timeout,
                         error_label="Connect error",
                         error=e,
+                        attempt=connect_retries,
+                        target=self._base_url,
                     )
                     if delay_s is not None:
+                        connect_retries += 1
                         self._record_retry()
                         time.sleep(delay_s)
                         continue
@@ -2315,6 +2514,7 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
+            response = self._follow_modal_continuations(response, start_time=start_time, budget_s=timeout)
             raise_if_model_load_failed(response, model=model)
 
             if response.status_code == 503:
@@ -2331,16 +2531,29 @@ class SIEClient:
                     time.sleep(actual_delay)
                     continue
 
-                if error_code == MODEL_LOADING_ERROR_CODE and wait_for_capacity:
+                if error_code == MODEL_LOADING_ERROR_CODE:
+                    # Retried regardless of ``wait_for_capacity``, matching
+                    # encode/score/extract/chat/responses/streaming: the worker
+                    # has already accepted the request and is loading the model,
+                    # so this is a pre-execution signal, not a capacity wait.
                     elapsed = time.monotonic() - start_time
                     if elapsed >= timeout:
                         msg = f"Model loading timeout after {elapsed:.1f}s for '{model}'"
                         raise ModelLoadingError(msg, model=model)
                     retry_after = get_retry_after(response)
                     delay = retry_after_or_default(retry_after, MODEL_LOADING_DEFAULT_DELAY_S)
-                    actual_delay = min(delay, timeout - elapsed)
+                    remaining = timeout - elapsed
+                    if delay >= remaining:
+                        # Sleeping through the rest of the budget would make
+                        # the NEXT loop iteration raise a generic
+                        # ProvisioningError; surface the typed root cause now.
+                        msg = (
+                            f"Model loading retry delay ({delay:.1f}s) would exceed the "
+                            f"provision timeout ({timeout:.1f}s, {elapsed:.1f}s elapsed) for '{model}'"
+                        )
+                        raise ModelLoadingError(msg, model=model)
                     self._record_retry()
-                    time.sleep(actual_delay)
+                    time.sleep(delay)
                     continue
                 if error_code == RESOURCE_EXHAUSTED_ERROR_CODE:
                     oom_retries = _handle_oom_retry(
@@ -2354,6 +2567,26 @@ class SIEClient:
                     self._record_retry()
                     continue
 
+            # Retryable pre-execution admission backpressure (pass-2 audit
+            # B1/B2/B7): a 429 RATE_LIMIT, or a retryable 503
+            # (BILLING_CAPACITY_UNAVAILABLE / QUEUE_FULL). These are admission
+            # rejections BEFORE the generate work is published, so retrying is
+            # safe (unlike the post-publish 504 below). Honor Retry-After within
+            # the provision-timeout budget; a give-up raises a typed
+            # RateLimitError (429) or the server's terminal 503. 402/403
+            # credit/account errors are terminal and NOT handled here.
+            admission_delay = admission_retry_delay(response, start_time=start_time, timeout=timeout)
+            if admission_delay is not None:
+                logger.info(
+                    "Admission backpressure (HTTP %d), retrying in %.1fs (timeout: %.1fs)",
+                    response.status_code,
+                    admission_delay,
+                    timeout,
+                )
+                self._record_retry()
+                time.sleep(admission_delay)
+                continue
+
             # Do NOT retry 504 here. Unlike the idempotent encode/score/extract
             # paths (which keep the 504 retry block), generation is NOT
             # idempotent and carries no dedup key. A 504 GATEWAY_TIMEOUT is a
@@ -2363,8 +2596,9 @@ class SIEClient:
             # surface it as a terminal ServerError instead (same reasoning as
             # the mid-flight transport-error block above). The pre-execution
             # 503 MODEL_LOADING / PROVISIONING retries above remain because
-            # those fire *before* any generation can have started and the
-            # caller has opted into capacity waiting.
+            # those fire *before* any generation can have started
+            # (MODEL_LOADING unconditionally; PROVISIONING when the caller
+            # has opted into capacity waiting).
             if response.status_code == HTTP_GATEWAY_TIMEOUT:
                 msg = (
                     "Gateway timed out (504) after the generate request was published to the "
@@ -2375,6 +2609,7 @@ class SIEClient:
                     msg,
                     code=get_error_code(response),
                     status_code=response.status_code,
+                    param=get_error_param(response),
                     request=parse_request_metadata(response.headers),
                 )
 
@@ -2466,6 +2701,7 @@ class SIEClient:
         timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
         start_time = time.monotonic()
         oom_retries = 0
+        connect_retries = 0
         while True:
             remaining = timeout - (time.monotonic() - start_time)
             if remaining <= 0:
@@ -2485,8 +2721,11 @@ class SIEClient:
                         timeout=timeout,
                         error_label="Connect error",
                         error=e,
+                        attempt=connect_retries,
+                        target=self._base_url,
                     )
                     if delay_s is not None:
+                        connect_retries += 1
                         self._record_retry()
                         time.sleep(delay_s)
                         continue
@@ -2496,6 +2735,7 @@ class SIEClient:
                 msg = f"Connection lost mid-request ({type(e).__name__}): {e}"
                 raise SIEConnectionError(msg) from e
 
+            response = self._follow_modal_continuations(response, start_time=start_time, budget_s=timeout)
             if response.status_code == 200:
                 break
             delay, oom_retries = next_stream_retry_delay(
@@ -2603,6 +2843,7 @@ class SIEClient:
         timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
         start_time = time.monotonic()
         oom_retries = 0
+        connect_retries = 0
         while True:
             remaining = timeout - (time.monotonic() - start_time)
             if remaining <= 0:
@@ -2618,9 +2859,15 @@ class SIEClient:
             except httpx.ConnectError as e:
                 if wait_for_capacity and is_transient_connect_error(e):
                     delay_s = compute_retry_delay(
-                        start_time=start_time, timeout=timeout, error_label="Connect error", error=e
+                        start_time=start_time,
+                        timeout=timeout,
+                        error_label="Connect error",
+                        error=e,
+                        attempt=connect_retries,
+                        target=self._base_url,
                     )
                     if delay_s is not None:
+                        connect_retries += 1
                         self._record_retry()
                         time.sleep(delay_s)
                         continue
@@ -2632,6 +2879,7 @@ class SIEClient:
                 msg = f"Connection lost mid-request ({type(e).__name__}): {e}"
                 raise SIEConnectionError(msg) from e
 
+            response = self._follow_modal_continuations(response, start_time=start_time, budget_s=timeout)
             if response.status_code == 200:
                 break
             delay, oom_retries = next_stream_retry_delay(
@@ -2773,6 +3021,15 @@ class SIEClient:
         Yields :class:`GenerateChunk` events; the terminal chunk carries
         ``done: true`` plus ``usage`` / ``ttft_ms``. Error semantics match
         :meth:`stream_chat_completions`.
+
+        Successful terminal chunks may carry the optional complete pair
+        ``execution_identity_sha256`` / ``execution_binding_sha256``.
+        These worker-origin digests are distinct from the catalog weights
+        revision and :attr:`last_model_revision`; gateway SSE omits the
+        ``X-SIE-Model-Revision`` header.
+
+        Text-only prompts are raw continuation input, as in :meth:`generate`.
+        Use :meth:`stream_chat_completions` to apply the served chat template.
         """
         resolved_grammar = validate_generate_grammar(grammar) if grammar is not None else None
         pool_name, resolved_gpu = self._resolve_pool_and_gpu(gpu)
@@ -2850,6 +3107,7 @@ class SIEClient:
         timeout = provision_timeout_s if provision_timeout_s is not None else DEFAULT_PROVISION_TIMEOUT_S
         start_time = time.monotonic()
         oom_retries = 0
+        connect_retries = 0
         while True:
             remaining = timeout - (time.monotonic() - start_time)
             if remaining <= 0:
@@ -2887,11 +3145,32 @@ class SIEClient:
                             if isinstance(chunk, dict):
                                 err = sse_chunk_error(chunk)
                                 if err is not None:
-                                    code, message = err
+                                    code, message, param, retry_after_s = err
+                                    # Terminal error chunks — on both the
+                                    # SIE-native generate shape and the OpenAI
+                                    # chat shape — carry the gateway request
+                                    # id in-band (streamed responses have no
+                                    # terminal headers); forward it so typed
+                                    # errors like ``empty_model_output`` stay
+                                    # correlatable (#3136).
+                                    request_id = valid_stream_request_id(chunk.get("request_id"))
+                                    error_headers: dict[str, str] = {}
+                                    if request_id:
+                                        error_headers[REQUEST_ID_HEADER] = request_id
+                                    if retry_after_s is not None:
+                                        error_headers["Retry-After"] = str(retry_after_s)
                                     if not yielded_chunk:
                                         capacity_response = httpx.Response(
                                             HTTP_SERVICE_UNAVAILABLE,
-                                            json={"error": {"code": code, "message": message}},
+                                            json={
+                                                "error": {
+                                                    "code": code,
+                                                    "message": message,
+                                                    "param": param,
+                                                    "retry_after_s": retry_after_s,
+                                                }
+                                            },
+                                            headers=error_headers or None,
                                         )
                                         retry_delay, oom_retries = next_stream_retry_delay(
                                             capacity_response,
@@ -2905,7 +3184,13 @@ class SIEClient:
                                         )
                                         self._record_retry()
                                         break
-                                    raise ServerError(message, code=code)
+                                    raise ServerError(
+                                        message,
+                                        code=code,
+                                        param=param,
+                                        request=parse_request_metadata(error_headers),
+                                        retry_after=float(retry_after_s) if retry_after_s is not None else None,
+                                    )
                             yield chunk
                             yielded_chunk = True
                         else:
@@ -2913,9 +3198,15 @@ class SIEClient:
             except httpx.ConnectError as e:
                 if wait_for_capacity and is_transient_connect_error(e):
                     delay_s = compute_retry_delay(
-                        start_time=start_time, timeout=timeout, error_label="Connect error", error=e
+                        start_time=start_time,
+                        timeout=timeout,
+                        error_label="Connect error",
+                        error=e,
+                        attempt=connect_retries,
+                        target=self._base_url,
                     )
                     if delay_s is not None:
+                        connect_retries += 1
                         self._record_retry()
                         time.sleep(delay_s)
                         continue
@@ -2979,7 +3270,7 @@ class SIEClient:
         """Extract entities or structured data from items.
 
         Args:
-            model: Model name to use for extraction (e.g., "gliner-multi-v2.1").
+            model: Model name to use for extraction (e.g., "urchade/gliner_multi-v2.1").
             items: Single Item or list of Items to extract from.
             labels: Entity types to extract (e.g., ["person", "organization"]).
             output_schema: JSON schema for structured extraction output.
@@ -3005,7 +3296,13 @@ class SIEClient:
                 Their budgets are documented under ``ModelLoadingError`` /
                 ``ResourceExhaustedError`` below; the
                 ``RESOURCE_EXHAUSTED`` branch can be disabled by passing
-                ``max_oom_retries=0``.
+                ``max_oom_retries=0``. The pre-dispatch admission signals
+                ``429 RATE_LIMIT``, ``503 BILLING_CAPACITY_UNAVAILABLE`` and
+                ``503 QUEUE_FULL`` are likewise retried regardless of this
+                flag — no work has been published yet — honouring
+                ``Retry-After`` and capped by ``provision_timeout_s``. On
+                give-up they raise ``RateLimitError`` (429) or the server's
+                terminal 503.
             provision_timeout_s: Maximum time to wait for capacity when wait_for_capacity=True.
                 Default: 900 seconds (15 minutes).
             max_oom_retries: Public retry knob capping the number of
@@ -3042,7 +3339,7 @@ class SIEClient:
         Example:
             >>> # Single item
             >>> result = client.extract(
-            ...     "gliner-multi-v2.1",
+            ...     "urchade/gliner_multi-v2.1",
             ...     {"text": "Apple was founded by Steve Jobs."},
             ...     labels=["person", "organization"],
             ... )
@@ -3053,7 +3350,7 @@ class SIEClient:
 
             >>> # Batch
             >>> results = client.extract(
-            ...     "gliner-multi-v2.1",
+            ...     "urchade/gliner_multi-v2.1",
             ...     [{"text": "Tesla CEO Elon Musk..."}, {"text": "Google's Sundar Pichai..."}],
             ...     labels=["person", "organization"],
             ... )
@@ -3096,7 +3393,7 @@ class SIEClient:
             request_body["params"] = params
 
         # Serialize with msgpack
-        body = msgpack.packb(request_body, use_bin_type=True)
+        body = pack_msgpack(request_body, use_bin_type=True)
 
         # Build headers with optional GPU and pool routing
         headers: dict[str, str] = {}
@@ -3112,6 +3409,7 @@ class SIEClient:
         # Model loading uses time-based timeout only (no retry counter)
         # OOM retry counter (RESOURCE_EXHAUSTED) — bounded with exponential backoff.
         oom_retries = 0
+        connect_retries = 0
 
         # Retry loop for retryable provisioning/capacity responses.
         while True:
@@ -3135,8 +3433,11 @@ class SIEClient:
                         timeout=timeout,
                         error_label="Connect error",
                         error=e,
+                        attempt=connect_retries,
+                        target=self._base_url,
                     )
                     if delay_s is not None:
+                        connect_retries += 1
                         self._record_retry()
                         time.sleep(delay_s)
                         continue
@@ -3163,7 +3464,14 @@ class SIEClient:
                     )
                 raise SIEConnectionError(msg) from e
 
-            # Short-circuit terminal load failures (sie-test#85).
+            response = self._follow_modal_continuations(
+                response,
+                start_time=start_time,
+                budget_s=timeout,
+                accept=MSGPACK_CONTENT_TYPE,
+            )
+
+            # Short-circuit terminal load failures.
             raise_if_model_load_failed(response, model=model)
 
             # Short-circuit token-budget overruns (#849).
@@ -3223,6 +3531,25 @@ class SIEClient:
                     self._record_retry()
                     continue
 
+            # Retryable pre-execution admission backpressure (pass-2 audit
+            # B1/B2/B7): a 429 RATE_LIMIT, or a retryable 503
+            # (BILLING_CAPACITY_UNAVAILABLE / QUEUE_FULL) the ladder above did
+            # not match. No work was published, so retry within the
+            # provision-timeout budget honoring Retry-After; a give-up raises a
+            # typed RateLimitError (429) or the server's terminal 503.
+            # 402/403 credit/account errors are terminal and NOT handled here.
+            admission_delay = admission_retry_delay(response, start_time=start_time, timeout=timeout)
+            if admission_delay is not None:
+                logger.info(
+                    "Admission backpressure (HTTP %d), retrying in %.1fs (timeout: %.1fs)",
+                    response.status_code,
+                    admission_delay,
+                    timeout,
+                )
+                self._record_retry()
+                time.sleep(admission_delay)
+                continue
+
             # Handle 504 (gateway timeout): queued work was published, but the
             # gateway did not receive a worker result before its deadline.
             # Encode/score/extract are idempotent, so callers that opted into
@@ -3254,7 +3581,7 @@ class SIEClient:
         self._check_server_version(response)
 
         # Deserialize response
-        response_data = msgpack.unpackb(response.content, raw=False)
+        response_data = parse_terminal_msgpack_object(response, owner="extract")
 
         # Parse results
         results = parse_extract_results(response_data["items"])
@@ -3262,6 +3589,16 @@ class SIEClient:
         if isinstance(response_model, str) and response_model:
             for result in results:
                 result["model"] = response_model
+        # Same positional contract as encode: ``results[0]`` below and
+        # index-based reassembly in batch callers both assume one result per
+        # input, and the queue path drops failed items from a 200 body.
+        validate_batch_result_count(
+            results,
+            items_list,  # ty: ignore[invalid-argument-type]
+            model,
+            operation="extract",
+            request=parse_request_metadata(response.headers),
+        )
 
         attach_request_metadata(results, response.headers, response_data)
 
@@ -3440,23 +3777,58 @@ class _SyncJobs(_SyncNamespace):
         )
 
     def results(self, job_id: str) -> JobResults:
-        """Retrieve a finished job's chunk refs and decode the per-item results.
+        """Retrieve a terminal job's chunk refs and decode the per-item results.
 
-        Reads each succeeded chunk's TTL'd payload-store ref (local path or
-        http(s) URL in the POC) and unpacks the msgpack ``WorkResult`` array;
-        dense embeddings decode to numpy arrays (like :meth:`encode`).
+        Reads every chunk that published a TTL'd payload-store ref (local path
+        or http(s) URL in the POC) and unpacks the msgpack ``WorkResult`` array;
+        dense embeddings decode to numpy arrays (like :meth:`encode`). A
+        ``failed`` chunk still carries a ref with its SUCCESSFUL siblings (which
+        are billed) plus the per-item failures, so those refs are read too — only
+        chunks with no ref at all are skipped. Each item's ``success`` and
+        ``error`` distinguish the two.
+
+        Raises:
+            RequestError: With code ``job_not_terminal`` when the job has not
+                reached a terminal state — decoding one then would return a
+                partial subset indistinguishable from a partial-failure subset.
+
+        Warns:
+            UserWarning: Neutrally, when fewer items are retrieved than
+                ``total_items`` (the returned set is incomplete) — without
+                asserting a cause. Separately, and distinctly, when a chunk ref's
+                bytes could not be decoded (a decode fault), so a garbage ref is
+                not conflated with a genuinely-unpublished chunk.
         """
         refreshes = 0
         while True:
             job = self.get(job_id)
+            state = job.get("state")
+            if state not in TERMINAL_JOB_STATES:
+                msg = (
+                    f"job {job_id} is {state!r}, not terminal; results are decodable only after the "
+                    "job reaches a terminal state (succeeded/failed/suspended/cancelled)"
+                )
+                raise RequestError(msg, code=JOB_NOT_TERMINAL_ERROR_CODE, status_code=409)
             chunks = job_chunks(job)
             items = []
             try:
                 for chunk in chunks:
                     ref = chunk.get("ref")
-                    if chunk.get("state") != "succeeded" or not ref:
+                    if not ref:
                         continue
-                    items.extend(decode_chunk_bytes(self._read_ref(ref)))
+                    raw = self._read_ref(ref)
+                    try:
+                        items.extend(decode_chunk_bytes(raw))
+                    except MalformedChunkError:
+                        # Garbage bytes are a DECODE fault, not proof of failed
+                        # publication/billing — confine it and flag it distinctly
+                        # rather than folding it into the neutral incompleteness
+                        # warning below.
+                        warnings.warn(
+                            f"job {job_id} chunk (seq={chunk.get('seq')}) ref could not be decoded "
+                            "(malformed bytes); its items are omitted from the results",
+                            stacklevel=2,
+                        )
             except RequestError as exc:
                 refreshable = exc.status_code == 404 and exc.code == JOB_RESULT_NOT_FOUND_ERROR_CODE
                 if refreshable and refreshes < JOB_RESULT_REF_MAX_REFRESHES:
@@ -3464,26 +3836,67 @@ class _SyncJobs(_SyncNamespace):
                     continue
                 raise
             dims = next((it["dims"] for it in items if it.get("dims")), None)
+            retrieved = len(items)
+            total_items = job.get("total_items")
+            if total_items is not None and retrieved < total_items:
+                # Neutral: state only what is known (fewer items decoded than the
+                # job's item count). Do NOT assert a cause — the shortfall may be
+                # an unpublished chunk OR an undecodable ref, and this call cannot
+                # prove billing from the status doc.
+                warnings.warn(
+                    f"job {job_id} results are incomplete: retrieved {retrieved} of {total_items} items",
+                    stacklevel=2,
+                )
             return {
                 "job_id": job.get("id", job_id),
-                "state": job.get("state"),
-                "total_items": job.get("total_items"),
+                "state": state,
+                "total_items": total_items,
                 "settled_credits": job.get("settled_credits"),
                 "chunks": chunks,
-                "retrieved": len(items),
+                "retrieved": retrieved,
                 "dims": dims,
                 "items": items,
             }
 
-    def wait(self, job_id: str, *, timeout_s: float = 600.0, poll_s: float = 2.0) -> JobStatus:
-        """Poll until terminal, or return a connector plan at its stable planned phase."""
+    def wait(
+        self,
+        job_id: str,
+        *,
+        timeout_s: float = 600.0,
+        poll_s: float = 2.0,
+        raise_on_failure: bool = False,
+    ) -> JobStatus:
+        """Poll until terminal, or return a connector plan at its stable planned phase.
+
+        With ``raise_on_failure=True`` a non-successful terminal
+        (``failed``/``suspended``/``cancelled``) raises :class:`JobFailedError`
+        carrying the status doc's ``outcome``/``error_code`` so the failure is
+        actionable without re-reading the doc. The default is unchanged and
+        back-compatible: every terminal (and the ``planned`` plan phase) is
+        returned as-is.
+        """
         deadline = time.monotonic() + timeout_s
         while True:
             job = self.get(job_id)
-            if job.get("state") in TERMINAL_JOB_STATES or job.get("phase") == "planned":
+            if job.get("phase") == "planned":
+                return job
+            state = job.get("state")
+            if state in TERMINAL_JOB_STATES:
+                if raise_on_failure and state != "succeeded":
+                    outcome = job.get("outcome")
+                    error_code = job.get("error_code")
+                    reason = f" (outcome={outcome!r}, error_code={error_code!r})" if outcome or error_code else ""
+                    msg = f"job {job_id} terminated {state!r}{reason}"
+                    raise JobFailedError(
+                        msg,
+                        job_id=job.get("id", job_id),
+                        state=state,
+                        outcome=outcome,
+                        error_code=error_code,
+                    )
                 return job
             if time.monotonic() >= deadline:
-                msg = f"job {job_id} still {job.get('state')!r} after {timeout_s:.0f}s"
+                msg = f"job {job_id} still {state!r} after {timeout_s:.0f}s"
                 raise RequestError(msg, code="job_wait_timeout", status_code=504)
             time.sleep(poll_s)
 

@@ -11,11 +11,12 @@ from sie_server.api.helpers import (
     RequestParser,
     ResponseBuilder,
     oom_retry_after_from_registry,
+    validated_total,
 )
 from sie_server.api.options import resolve_runtime_options
 from sie_server.api.serialization import MsgPackResponse
 from sie_server.api.validation import validate_machine_profile_header
-from sie_server.core.extract_cost import build_extract_prepared_items
+from sie_server.core.extract_cost import adapter_extract_item_costs, build_extract_prepared_items
 from sie_server.core.inference_output import ExtractOutput
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker import QueueFullError, WorkerResult
@@ -34,6 +35,7 @@ from sie_server.types.responses import (
     ExtractResponse,
     ExtractResult,
     Relation,
+    Usage,
 )
 
 if TYPE_CHECKING:
@@ -141,7 +143,20 @@ async def _extract_via_worker(
     else:
         # Text/document model: cost is text characters or document byte size.
         # GLiNER/GLiClass tokenize internally; document adapters (Docling) parse internally.
-        prepared_items = build_extract_prepared_items(items)
+        # Adapters that run several model rows per item report their own cost.
+        try:
+            adapter = registry.get(model)
+        except (AttributeError, KeyError):
+            adapter = None
+        item_costs = adapter_extract_item_costs(
+            adapter,
+            items,
+            labels=labels,
+            output_schema=output_schema,
+            instruction=instruction,
+            options=options,
+        )
+        prepared_items = build_extract_prepared_items(items, item_costs=item_costs)
 
     timing.end_tokenization()
 
@@ -264,12 +279,13 @@ def _build_response(
         },
         400: {"description": "Invalid request"},
         404: {"description": "Model not found"},
+        413: {"description": "Request body exceeds the configured size limit"},
         502: {
             "description": (
                 "Terminal model-load failure (MODEL_LOAD_FAILED). "
                 "Carried in the ``detail`` envelope: ``{code, message, "
                 "error_class, permanent, attempts}``. No ``Retry-After`` "
-                "header — clients MUST NOT auto-retry. See sie-test#85."
+                "header — clients MUST NOT auto-retry."
             ),
         },
         503: {"description": "Model not loaded or service unavailable"},
@@ -367,6 +383,12 @@ async def extract(
         # Request-level instruction takes precedence; fall back to profile instruction
         if instruction is None:
             instruction = options.get("instruction")
+        if instruction is not None and not isinstance(instruction, str):
+            span.set_attribute("error", "invalid_instruction")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": ErrorCode.INVALID_INPUT.value, "message": "instruction must be a string"},
+            )
 
         items = request.items
 
@@ -403,6 +425,13 @@ async def extract(
 
         # Build response
         response = _build_response(model, items, extraction_results)
+
+        # Same worker counts the telemetry block below meters from, reported to
+        # the caller so `usage` and the bill can be reconciled. Absent counts
+        # leave `usage` off rather than substituting an estimate.
+        extract_tokens = validated_total(extract_output.input_token_counts, len(items))
+        if extract_tokens is not None:
+            response["usage"] = Usage(input_tokens=extract_tokens)
 
         if worker_telemetry_enabled():
             units: dict[str, int] = {}

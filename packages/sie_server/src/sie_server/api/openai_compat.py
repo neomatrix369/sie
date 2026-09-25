@@ -16,21 +16,37 @@ from __future__ import annotations
 import base64
 import logging
 import time
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import numpy as np
 from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from sie_server.api.helpers import check_sdk_version, oom_retry_after_from_registry
+from sie_server.api.helpers import (
+    WORKER_DRAINED_RETRY_AFTER_S,
+    ModelStateChecker,
+    check_sdk_version,
+    oom_retry_after_from_registry,
+    openai_error_response,
+)
 from sie_server.api.validation import validate_machine_profile_header
 from sie_server.core.encode_pipeline import EncodePipeline
+from sie_server.core.model_suggestions import suggestion_suffix
 from sie_server.core.oom import is_oom_error
 from sie_server.core.worker import QueueFullError
+from sie_server.core.worker.types import WorkerDrainedError
 from sie_server.observability.tracing import tracer
 from sie_server.observability.worker_telemetry import worker_telemetry, worker_telemetry_enabled
-from sie_server.types.inputs import Item
+from sie_server.types.inputs import Item, item_size_error
+from sie_server.types.openapi import (
+    OpenAIEmbeddingsErrorResponse,
+    OpenAIEmbeddingsModelLoadFailedErrorResponse,
+)
 from sie_server.types.responses import ErrorCode
+
+if TYPE_CHECKING:
+    from sie_server.core.registry import ModelRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +80,14 @@ class OpenAIEmbeddingRequest(BaseModel):
     ]
     dimensions: Annotated[
         int | None,
-        Field(default=None, description="Number of dimensions (not supported by SIE, ignored)"),
+        Field(
+            default=None,
+            description=(
+                "Requested embedding width. SIE always returns the model's native dense "
+                "width, so this is accepted only when it equals that width; any other "
+                "value is rejected with 400 `unsupported_field` rather than ignored."
+            ),
+        ),
     ]
     user: Annotated[
         str | None,
@@ -204,25 +227,71 @@ def _decode_tokens(tokens: list[int], registry: object, model: str) -> str:
     return f"[{len(tokens)} tokens]"
 
 
-async def _load_model_if_needed(registry: object, model: str, device: str, span: object) -> None:
-    """Load model if not already loaded."""
-    if not registry.is_loaded(model):  # type: ignore
-        try:
-            logger.info("Loading model %s on device %s", model, device)
-            await registry.load_async(model, device=device)  # type: ignore
-        except Exception as e:
-            logger.exception("Failed to load model %s", model)
-            span.set_attribute("error", "model_load_failed")  # type: ignore
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "error": {
-                        "code": "model_not_available",
-                        "message": f"Failed to load model: {e}",
-                        "type": "server_error",
-                    }
-                },
-            ) from e
+def _openai_state_error(error: HTTPException) -> HTTPException:
+    """Re-wrap a native model-state ``detail`` in this surface's OpenAI envelope.
+
+    :class:`ModelStateChecker` raises the SIE-native ``{code, message, ...}``
+    detail shape served by the native routes. This surface keeps errors
+    OpenAI-parseable, so rebuild the detail as ``{"error": {...}}`` while
+    preserving the SIE-native ``code`` (``MODEL_LOADING`` /
+    ``MODEL_LOAD_FAILED``) plus auxiliary fields (``error_class``,
+    ``permanent``, ``attempts``) — the SDK's ``get_error_code`` and
+    ``raise_if_model_load_failed`` branch on exactly those. Headers are
+    preserved verbatim: ``Retry-After`` presence/absence carries the
+    retryability contract (present on 503 ``MODEL_LOADING``, absent on the
+    terminal 502 ``MODEL_LOAD_FAILED``).
+    """
+    detail = error.detail if isinstance(error.detail, dict) else {}
+    if "error" in detail:
+        return error
+    inner: dict[str, object] = dict(detail)
+    inner.setdefault("message", "service unavailable")
+    inner["type"] = "server_error"
+    return HTTPException(status_code=error.status_code, detail={"error": inner}, headers=error.headers)
+
+
+def _validate_dimensions(requested: int | None, registry: ModelRegistry, model: str) -> None:
+    """Reject a ``dimensions`` value this model cannot honour.
+
+    In OpenAI's API ``dimensions`` truncates the embedding (Matryoshka), so a
+    client migrating from ``text-embedding-3-*`` may legitimately send it. SIE
+    always returns the model's native dense width. Ignoring the field — as this
+    endpoint used to — means such a client silently receives vectors of a width
+    it never asked for and writes them into a vector store. That surfaces much
+    later, either as a dimension error on insert or, worse, as a silently
+    wrong index built against the wrong width.
+
+    Failing loudly matches ``/v1/completions``, which already rejects fields it
+    cannot honour with ``400 unsupported_field``. An exact match is accepted so
+    a client that simply pins its model's real width keeps working.
+
+    Raises:
+        HTTPException: 400 when the value cannot be honoured.
+    """
+    if requested is None:
+        return
+
+    native = registry.get_config(model).dims.get("dense")
+    if native is not None and requested == native:
+        return
+
+    detail = (
+        f"'dimensions' is not supported by this endpoint: model '{model}' returns "
+        f"{native}-dimensional embeddings and SIE does not truncate them."
+        if native is not None
+        else f"'dimensions' is not supported by this endpoint: model '{model}' declares no dense embedding width."
+    )
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "error": {
+                "code": "unsupported_field",
+                "message": f"{detail} Omit 'dimensions', or set it to {native}." if native is not None else detail,
+                "type": "invalid_request_error",
+                "param": "dimensions",
+            }
+        },
+    )
 
 
 def _build_embeddings_response(
@@ -293,6 +362,7 @@ def _build_embeddings_response(
 
 @router.post(
     "/embeddings",
+    response_model=OpenAIEmbeddingResponse,
     responses={
         200: {"description": "Embeddings generated successfully"},
         400: {"description": "Invalid request"},
@@ -300,23 +370,47 @@ def _build_embeddings_response(
         502: {
             "description": (
                 "Terminal model-load failure (MODEL_LOAD_FAILED). "
-                "Carried in the ``detail`` envelope: ``{code, message, "
-                "error_class, permanent, attempts}``. No ``Retry-After`` "
-                "header — clients MUST NOT auto-retry. See sie-test#85."
+                "Carried in the top-level OpenAI ``error`` envelope, whose "
+                "object adds the model-load extras ``error_class``, "
+                "``permanent``, and ``attempts`` to ``{message, type, param, "
+                "code}``. No ``Retry-After`` header — clients MUST NOT "
+                "auto-retry."
             ),
+            "model": OpenAIEmbeddingsModelLoadFailedErrorResponse,
         },
-        503: {"description": "Service unavailable"},
+        503: {
+            "description": (
+                "Service unavailable (retryable). A cold model starts a "
+                "background load and returns ``MODEL_LOADING`` with a "
+                "``Retry-After`` header immediately instead of blocking the "
+                "request — clients should retry after the indicated delay. "
+                "Also returned while unloading, on a full queue, and under "
+                "transient resource exhaustion. The body is the top-level "
+                "OpenAI ``error`` envelope."
+            ),
+            "model": OpenAIEmbeddingsErrorResponse,
+            "headers": {
+                "Retry-After": {
+                    "description": "Seconds to wait before retrying the MODEL_LOADING request.",
+                    "schema": {"type": "integer", "minimum": 1},
+                }
+            },
+        },
     },
 )
 async def create_embeddings(
     request: OpenAIEmbeddingRequest,
     http_request: Request,
     x_machine_profile: Annotated[str | None, Header(alias="X-SIE-MACHINE-PROFILE")] = None,
-) -> OpenAIEmbeddingResponse:
+) -> OpenAIEmbeddingResponse | JSONResponse:
     """Create embeddings using OpenAI-compatible API.
 
     This endpoint is compatible with OpenAI's /v1/embeddings API, allowing
-    drop-in replacement for any OpenAI SDK or client.
+    drop-in replacement for any OpenAI SDK or client. Route-generated errors
+    are emitted as top-level OpenAI ``{"error": {...}}`` envelopes, matching
+    ``/v1/completions``. The one exception is 422 request-body validation,
+    which still returns FastAPI's ``HTTPValidationError`` ``{"detail": [...]}``
+    shape (out of scope for this route's error handling; known residual).
 
     Args:
         request: OpenAI-format embedding request.
@@ -326,6 +420,17 @@ async def create_embeddings(
     Returns:
         OpenAI-format embedding response with embeddings and usage info.
     """
+    try:
+        return await _create_embeddings(request, http_request, x_machine_profile)
+    except HTTPException as exc:
+        return openai_error_response(exc)
+
+
+async def _create_embeddings(
+    request: OpenAIEmbeddingRequest,
+    http_request: Request,
+    x_machine_profile: str | None,
+) -> OpenAIEmbeddingResponse:
     # Validate machine profile header
     validate_machine_profile_header(x_machine_profile)
     check_sdk_version(http_request)
@@ -346,11 +451,15 @@ async def create_embeddings(
                 detail={
                     "error": {
                         "code": "model_not_found",
-                        "message": f"Model '{model}' not found",
+                        "message": f"Model '{model}' not found{suggestion_suffix(model, registry.model_names)}",
                         "type": "invalid_request_error",
                     }
                 },
             )
+
+        # Validated before any load work: an unhonourable 'dimensions' must not
+        # cost the caller a cold model load first.
+        _validate_dimensions(request.dimensions, registry, model)
 
         # Check if model is being unloaded
         if registry.is_unloading(model):
@@ -372,18 +481,50 @@ async def create_embeddings(
         if not texts:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"code": "invalid_request_error", "message": "Input cannot be empty"},
+                detail={
+                    "error": {
+                        "code": "invalid_request",
+                        "message": "Input cannot be empty",
+                        "type": "invalid_request_error",
+                        "param": "input",
+                    }
+                },
             )
+
+        items = [Item(text=text) for text in texts]
+        for index, item in enumerate(items):
+            if error := item_size_error(item, f"input[{index}]"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "error": {
+                            "code": "invalid_request",
+                            "message": error,
+                            "type": "invalid_request_error",
+                            "param": "input",
+                        }
+                    },
+                )
 
         span.set_attribute("batch_size", len(texts))
 
-        # Load model if needed
+        # Model load states: mirror the native routes' ModelStateChecker
+        # contract instead of blocking the request on a cold load. A recorded
+        # terminal failure short-circuits as 502 MODEL_LOAD_FAILED with no
+        # Retry-After (and, critically, no re-triggered doomed load); a cold
+        # model kicks off a background load and returns 503 MODEL_LOADING +
+        # Retry-After immediately so clients retry instead of hanging. This is
+        # single-node parity with the gateway's /v1/embeddings behavior.
         device = registry.device
-        await _load_model_if_needed(registry, model, device, span)
+        checker = ModelStateChecker(registry, model, span)
+        try:
+            checker.check_not_failed()
+            checker.check_not_loading()
+            await checker.ensure_loaded(device)
+        except HTTPException as error:
+            raise _openai_state_error(error) from error
 
-        # Get config and convert texts to SIE Items
         config = registry.get_config(model)
-        items = [Item(text=text) for text in texts]
 
         # Run encoding
         telemetry_enabled = worker_telemetry_enabled()
@@ -419,6 +560,33 @@ async def create_embeddings(
                         "type": "server_error",
                     }
                 },
+            ) from e
+        except WorkerDrainedError as e:
+            # The model was evicted while this request sat in the worker
+            # queue, so it never ran. Mirror the native endpoints' retryable
+            # 503 MODEL_LOADING — in the OpenAI envelope — so the SDK retries
+            # (and re-triggers the load) instead of seeing a terminal 500.
+            logger.info("Embeddings request drained on eviction for model %s: %s", model, e)
+            span.set_attribute("error", "model_loading")
+            if inference_started is not None:
+                worker_telemetry().item_completed(
+                    operation="embeddings",
+                    outcome="retry",
+                    model=model,
+                    profile="default",
+                    duration_s=time.perf_counter() - inference_started,
+                    item_count=len(items),
+                )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": {
+                        "code": ErrorCode.MODEL_LOADING.value,
+                        "message": f"Model '{model}' was evicted before this request ran, please retry",
+                        "type": "server_error",
+                    }
+                },
+                headers={"Retry-After": str(WORKER_DRAINED_RETRY_AFTER_S)},
             ) from e
         except Exception as e:
             if is_oom_error(e):
@@ -465,7 +633,7 @@ async def create_embeddings(
                 detail={
                     "error": {
                         "code": "inference_error",
-                        "message": f"Inference error: {e}",
+                        "message": "internal error during embeddings",
                         "type": "server_error",
                     }
                 },

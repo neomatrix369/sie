@@ -63,7 +63,7 @@ const MODEL_LOADING_ERROR_CODE: &str = "MODEL_LOADING";
 /// executor reports [`ReadinessState::Failed`] (registry holds a PERMANENT
 /// `LoadFailure`). The gateway maps this code to a typed HTTP 502 via
 /// `build_model_load_failed_response` (unary/batch path) — the fast-path twin
-/// of the #1786 `run_batch` mapping. Kept byte-identical to the gateway
+/// of the `run_batch` mapping. Kept byte-identical to the gateway
 /// constant `sie_gateway::handlers::proxy::MODEL_LOAD_FAILED_ERROR_CODE` and
 /// the Python `ErrorCode.MODEL_LOAD_FAILED`.
 const MODEL_LOAD_FAILED_ERROR_CODE: &str = "MODEL_LOAD_FAILED";
@@ -759,6 +759,13 @@ impl Dispatcher {
         let state = Arc::new(Mutex::new(LocalGenerateState::default()));
         let callback_state = Arc::clone(&state);
 
+        // The local-ingest streaming lane's execution-commit point, past its
+        // own bundle-hash barrier above. Local ingest bypasses the broker, so
+        // these observations are normally near zero — which is the correct
+        // answer for this lane, not a reason to omit it. Omitting it would
+        // rebuild the blind spot this metric was fixed for: a generation path
+        // that executes real work and reports nothing.
+        record_work_item_ages(&self.runtime_state.telemetry, std::iter::once(&wi));
         let _inflight_guard = InflightBatchGuard::enter(Arc::clone(&self.runtime_state));
         let result = self
             .worker_pool
@@ -1439,7 +1446,7 @@ impl Dispatcher {
             }
             ReadinessState::Failed => {
                 // Terminal load failure (permanent cooldown). Re-driving would
-                // hang the streaming client forever (#1786 fast-path gap), so
+                // hang the streaming client forever, so
                 // publish a terminal MODEL_LOAD_FAILED chunk + ACK — the
                 // gateway's streaming collector maps the code to a typed
                 // failure exactly like the batch path.
@@ -1736,6 +1743,11 @@ impl Dispatcher {
         let msg_for_events = Arc::clone(&msg);
         let delivery_log_for_events = Arc::clone(&delivery_log);
         let telemetry_for_events = self.runtime_state.telemetry.clone();
+        // Generation's execution-commit point. It never reaches
+        // `apply_outcome`, so without this call the most expensive operation in
+        // the system — and the one B2 singles out as excluded from
+        // cancellation — would be entirely absent from the age distribution.
+        record_work_item_ages(&self.runtime_state.telemetry, std::iter::once(&wi));
         self.runtime_state.inflight_batches.inc();
         let result = self
             .worker_pool
@@ -1864,7 +1876,7 @@ impl Dispatcher {
             if readiness_resp.state == ReadinessState::Failed {
                 // Terminal load failure (permanent cooldown on the Python
                 // registry). Re-driving `EnsureModelReady` would loop forever
-                // and hang the client (#1786 fast-path gap), so dead-letter
+                // and hang the client, so dead-letter
                 // the whole group as `MODEL_LOAD_FAILED` — the gateway maps
                 // that code to a typed 502, exactly like the batch/`run_batch`
                 // path. ACK each item after publishing its error so JetStream
@@ -2189,6 +2201,10 @@ impl Dispatcher {
         if resolved.is_empty() {
             return Ok(());
         }
+        record_work_item_ages(
+            &self.runtime_state.telemetry,
+            resolved.iter().map(|(wi, _, _, _, _)| wi),
+        );
 
         let batch_items: Vec<EncodeBatchItem> = resolved
             .iter()
@@ -2353,6 +2369,10 @@ impl Dispatcher {
         if prepared.is_empty() {
             return Ok(());
         }
+        record_work_item_ages(
+            &self.runtime_state.telemetry,
+            prepared.iter().map(|(wi, _, _, _, _)| wi),
+        );
 
         // Rust-tokenisation wire-noop on score: Python's
         // `_process_single_score` does not consume `prepared_tokens`
@@ -2544,6 +2564,10 @@ impl Dispatcher {
         if resolved.is_empty() {
             return Ok(());
         }
+        record_work_item_ages(
+            &self.runtime_state.telemetry,
+            resolved.iter().map(|(wi, _, _, _, _)| wi),
+        );
 
         let mut batch_items = Vec::with_capacity(resolved.len());
         for (wi, _, item, prepared_audio, fm) in &mut resolved {
@@ -2714,6 +2738,11 @@ impl Dispatcher {
             Disposition::PublishAndAck | Disposition::PublishErrorAndAck => {
                 if should_publish(&outcome.disposition) {
                     let queue_ms = queue_ms_from(wi.timestamp);
+                    // NOTE: `sie.worker.work_item.age` is NOT recorded here.
+                    // It is recorded at each execution-commit point (see
+                    // [`record_work_item_ages`]) so that every operation shares
+                    // one definition and generation, which never reaches this
+                    // function, is not silently missing from the distribution.
                     let timings = Some(Timings {
                         queue_ms,
                         payload_fetch_ms,
@@ -2901,7 +2930,7 @@ impl Dispatcher {
     /// Dead-letter a whole (op, model) group on a TERMINAL load failure:
     /// publish a typed `MODEL_LOAD_FAILED` error `WorkResult` for every item
     /// and ACK it. This is the [`ReadinessState::Failed`] fast-path twin of
-    /// the batch/`run_batch` `MODEL_LOAD_FAILED` mapping (#1786) — the gateway
+    /// the batch/`run_batch` `MODEL_LOAD_FAILED` mapping — the gateway
     /// turns the code into an HTTP 502 so the client fails fast instead of
     /// blocking while the sidecar re-drives a doomed model forever.
     ///
@@ -3692,6 +3721,79 @@ where
         }
     }
     out
+}
+
+/// Record the transport-queue age of every work item this worker is COMMITTING
+/// TO EXECUTE, measured from the gateway publish timestamp on each envelope.
+///
+/// Call this at an execution-commit point: after the cancellation filter has
+/// removed abandoned items, AFTER the bundle-config execution barrier, and
+/// immediately before the batch (or the generation stream) is handed to the
+/// backend. There are six such points — the three batch handlers, the scheduler
+/// drain, the NATS generation lane, and the local-ingest generation lane — and
+/// every one of them must call this, because `sie.worker.work_item.age` exists
+/// to answer "how much work does this cluster execute after its client gave up"
+/// and a missing path silently biases that distribution toward zero.
+///
+/// The barrier ordering is load-bearing in the other direction. A bundle-hash
+/// change NAKs the whole batch without ever calling the backend, so recording
+/// before the barrier would count redelivered work as executed. Hash changes
+/// land during a config rollout, which is also when backlog builds, so that
+/// over-count would land exactly where the number has to be trustworthy.
+///
+/// Age at execution START is deliberate, and it is the reason this is not
+/// recorded next to the result publish in [`Dispatcher::apply_outcome`]:
+///
+/// - Generation never passes through `apply_outcome` at all. It streams from
+///   its own task, so a publish-time observation would omit the single most
+///   expensive operation to run for nobody — which is precisely the case the
+///   measurement exists to size.
+/// - Age at publish is age at execution start PLUS execution time. For an
+///   embedding batch that difference is milliseconds, but for generation it is
+///   tens of seconds, so mixing the two would make the per-operation
+///   comparison meaningless.
+/// - Age at execution start is the quantity a deadline check would actually
+///   evaluate: it is what a worker knows at the instant it decides whether
+///   spending GPU on this item is still worth anything.
+///
+/// Items that never execute are deliberately NOT observed: cancellation
+/// ack-drops, payload-fetch failures, unknown-operation rejections,
+/// bundle-hash mismatches, and NAK-for-redelivery all leave before this point.
+/// Counting them would answer a different question ("how long do items sit in
+/// the queue") with a series whose name promises this one. A NAK'd item that is
+/// later redelivered and does execute is observed then, carrying its full age
+/// since the original gateway publish, which is the correct and more alarming
+/// number.
+///
+/// One caveat for readers of the resulting distribution: broker-delivered work
+/// and local-ingest work share a series when one sidecar serves both. Local
+/// ingest has no broker hop, so it contributes near-zero ages and pulls the p50
+/// down. That is an accurate statement about the work this process ran, but it
+/// is not a statement about broker staleness alone.
+///
+/// One clock read covers the whole batch: a 4096-item request would otherwise
+/// pay 4096 `SystemTime::now()` calls for a diagnostic.
+fn record_work_item_ages<'a>(
+    telemetry: &crate::observability::metrics::SidecarTelemetry,
+    items: impl IntoIterator<Item = &'a WorkItem>,
+) {
+    if !telemetry.is_enabled() {
+        return;
+    }
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    let now_s = now.as_secs_f64();
+    for wi in items {
+        // A zero/absent publish timestamp has no measurable age. Recording 0
+        // would plant a false spike in the lowest bucket rather than admitting
+        // the envelope carried nothing. Negative and non-finite deltas (clock
+        // skew) are dropped by the facade for the same reason.
+        if wi.timestamp <= 0.0 {
+            continue;
+        }
+        telemetry.work_item_age_observed(&wi.operation, now_s - wi.timestamp);
+    }
 }
 
 fn queue_ms_from(timestamp_s: f64) -> f64 {
@@ -4647,6 +4749,20 @@ async fn process_scheduler_batch(
         None
     };
 
+    // AFTER the config execution barrier above, not before it. The barrier can
+    // still NAK the whole batch for a bundle-hash change, and a NAK'd batch
+    // never reaches `run_batch` — counting it here would report work as
+    // executed that was only redelivered. That matters more than it sounds:
+    // hash changes land during a config rollout, which is also when backlog
+    // builds, so the over-count would bias the distribution exactly under the
+    // conditions B2 needs it to be trustworthy. The three batch handlers and
+    // both generation paths clear their barrier before recording for the same
+    // reason.
+    record_work_item_ages(
+        &dispatcher.runtime_state.telemetry,
+        batch.metadata.iter().map(|meta| &meta.wi),
+    );
+
     // Capture this monotonic boundary immediately before the backend RPC. The
     // enqueue→dispatch histogram therefore includes time parked behind the
     // scheduler pipeline permit, config execution barrier, and local request
@@ -5526,20 +5642,24 @@ mod tests {
         }
 
         let work = wi("req-load", 0, "Qwen/Qwen3-4B-Instruct-2507", "generate");
-        let bytes =
-            encode_generate_terminal_error_chunk(&work, MODEL_LOADING_ERROR_CODE, "loading")
-                .expect("chunk encodes");
-        let decoded: DecodedChunk = rmp_serde::from_slice(&bytes).expect("chunk decodes");
+        for (code, message) in [
+            (MODEL_LOADING_ERROR_CODE, "loading"),
+            (MODEL_LOAD_FAILED_ERROR_CODE, "load failed"),
+        ] {
+            let bytes =
+                encode_generate_terminal_error_chunk(&work, code, message).expect("chunk encodes");
+            let decoded: DecodedChunk = rmp_serde::from_slice(&bytes).expect("chunk decodes");
 
-        assert_eq!(decoded.kind, "chunk");
-        assert_eq!(decoded.request_id, "req-load");
-        assert_eq!(decoded.attempt_id, "req-load.0:model-loading");
-        assert_eq!(decoded.seq, 0);
-        assert_eq!(decoded.text_delta, "");
-        assert!(decoded.done);
-        assert_eq!(decoded.finish_reason, "error");
-        assert_eq!(decoded.error.code, MODEL_LOADING_ERROR_CODE);
-        assert_eq!(decoded.error.message, "loading");
+            assert_eq!(decoded.kind, "chunk");
+            assert_eq!(decoded.request_id, "req-load");
+            assert_eq!(decoded.attempt_id, "req-load.0:model-loading");
+            assert_eq!(decoded.seq, 0);
+            assert_eq!(decoded.text_delta, "");
+            assert!(decoded.done);
+            assert_eq!(decoded.finish_reason, "error");
+            assert_eq!(decoded.error.code, code);
+            assert_eq!(decoded.error.message, message);
+        }
     }
 
     #[test]
@@ -5904,6 +6024,109 @@ mod tests {
         // 'é' is two bytes — truncate should not split it.
         assert_eq!(truncate("café", 3), "caf");
         assert_eq!(truncate("café", 4), "café");
+    }
+
+    /// Every point that hands work to the backend must record work-item age.
+    ///
+    /// This is a tripwire for a real defect, not a style rule: the first
+    /// version of `sie.worker.work_item.age` recorded only at the batch result
+    /// publish, so generation — which streams from its own task and never
+    /// reaches `apply_outcome` — was entirely absent from the distribution.
+    /// The metric exists to size how much work runs after its client gave up,
+    /// and generation is the most expensive case of exactly that, so the
+    /// omission biased the number toward zero precisely where it mattered.
+    ///
+    /// Only production code is counted — the test module below calls the
+    /// recorder too — and the needle is assembled at compile time so this test
+    /// does not match itself.
+    #[test]
+    fn every_execution_commit_point_records_work_item_age() {
+        let source = include_str!("dispatcher.rs");
+        let production = source
+            .split("\nmod tests {")
+            .next()
+            .expect("dispatcher.rs must have a production section");
+        let needle = concat!("record_work_item_ages", "(");
+        assert_eq!(
+            production.matches(needle).count(),
+            6,
+            "expected exactly six execution-commit call sites (encode, score, extract, \
+             scheduler drain, NATS generate, local-ingest generate). If you added a path that \
+             hands work to the backend, record the age there too and update this count — a \
+             missing path silently biases sie.worker.work_item.age toward zero for that \
+             operation."
+        );
+    }
+
+    /// Every recording site must sit AFTER its bundle-config execution
+    /// barrier, because a hash mismatch NAKs the batch without ever calling the
+    /// backend. Recording first would count redelivered work as executed, and
+    /// hash changes land during config rollouts — exactly when backlog builds
+    /// and the number has to be trustworthy.
+    ///
+    /// Checked structurally rather than by driving each handler: the ordering
+    /// is the invariant, and a positional assertion catches a future
+    /// reordering that a behavioural test on one handler would miss.
+    #[test]
+    fn work_item_age_is_recorded_after_every_config_execution_barrier() {
+        let source = include_str!("dispatcher.rs");
+        let production = source
+            .split("\nmod tests {")
+            .next()
+            .expect("dispatcher.rs must have a production section");
+        let record = concat!("record_work_item_ages", "(");
+        let barrier = concat!("unknown_bundle_config_hash", "(");
+        let accepts = concat!("accepts_bundle_config_hash", "(");
+
+        // Pair each barrier with the next recording site and require that the
+        // barrier comes first. Five of the six sites sit behind a barrier; the
+        // sixth (local-ingest generate) uses the `accepts_` spelling.
+        let mut barriers: Vec<usize> = production.match_indices(barrier).map(|(i, _)| i).collect();
+        barriers.extend(production.match_indices(accepts).map(|(i, _)| i));
+        barriers.sort_unstable();
+        let records: Vec<usize> = production.match_indices(record).map(|(i, _)| i).collect();
+        assert_eq!(records.len(), 6, "expected six recording sites");
+
+        for &site in &records {
+            let preceding_barrier = barriers.iter().rev().find(|&&b| b < site);
+            assert!(
+                preceding_barrier.is_some(),
+                "a recording site at byte {site} has no config barrier before it — \
+                 a bundle-hash NAK would be counted as executed work"
+            );
+            // No recording site may be the first thing after a barrier's own
+            // NAK-and-return: require the barrier and the record to be in the
+            // same neighbourhood rather than separated by another record.
+            let intervening = records
+                .iter()
+                .filter(|&&r| r > *preceding_barrier.unwrap() && r < site)
+                .count();
+            assert_eq!(
+                intervening, 0,
+                "recording site at byte {site} does not pair 1:1 with its barrier"
+            );
+        }
+    }
+
+    /// Hostile envelope timestamps must cost a dropped observation, never a
+    /// panic on the execution path. A disabled facade must not even look.
+    #[test]
+    fn recording_work_item_ages_tolerates_absent_and_skewed_timestamps() {
+        let telemetry = crate::observability::metrics::SidecarTelemetry::default();
+        assert!(!telemetry.is_enabled());
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            + 86_400.0;
+        let mut absent = wi("r", 0, "m", "encode");
+        absent.timestamp = 0.0;
+        let mut negative = wi("r", 1, "m", "generate");
+        negative.timestamp = -1.0;
+        let mut skewed = wi("r", 2, "m", "encode");
+        skewed.timestamp = far_future;
+        let items = [absent, negative, skewed];
+        record_work_item_ages(&telemetry, items.iter());
     }
 
     #[test]

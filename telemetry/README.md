@@ -12,10 +12,10 @@ conditionally owned queue/adaptive-scheduler surfaces. Only authoritative lane
 lifecycle signals remain excluded until a deployed producer owns them;
 undeclared new instruments are not permitted.
 
-The current inventory is 117 application families: 115 may reach the remote
+The current inventory is 122 application families: 120 may reach the remote
 OTLP branch and two remain Prometheus-only controls. Nine additional,
 exact collector-self families form a separate operational allowlist. The
-Better Stack dashboard code therefore covers 124 remotely eligible families
+Better Stack dashboard code therefore covers 129 remotely eligible families
 without turning collector self-telemetry into a version-dependent wildcard.
 
 `sie.gateway.pool.pinned_model.loaded` is intentionally Prometheus-only. Its
@@ -66,6 +66,15 @@ The facade may update the counter, duration histogram, admission counter, and
 safe completion log that belong to that one semantic event. The request path
 still calls the facade only once. It must never call a Prometheus client and an
 OTel client for the same event.
+
+The sampled `inference.request.completed` log schema v2 carries the canonical
+model, machine profile, request duration, admission outcome, HTTP outcome, and
+operation. It does not carry account, WorkOS user, API-key, request, contact,
+or payload identifiers. Durable per-account product events belong to the
+authenticated control-plane analytics export, not the Better Stack pipeline.
+Collectors accept schema v1 only while older gateway pods drain during a
+rolling update; they preserve its version and never relabel an incomplete v1
+record as v2.
 
 Every deployment uses the same application path: OTel instruments and log
 records leave the process through OTLP. Prometheus is a collector exporter, not
@@ -195,8 +204,8 @@ process lifecycles. The semantic methods and their emitted instruments are
 nevertheless governed by the one contract:
 
 - `sie_gateway` owns HTTP completion, admission, KEDA capacity state, and the
-  request span/log boundary. `sie_cloud/gateway` calls the gateway facade for
-  the final i6pn-or-Modal dispatch result.
+  request span/log boundary. Downstream deployments can reuse that facade for
+  their final dispatch result.
 - The Modal dispatcher owns actual substrate invocation attempts.
 - `sie_config` owns config HTTP and authoritative state changes.
 - `sie_server_sidecar` owns realtime queueing and batch formation plus its
@@ -276,11 +285,14 @@ For the sidecar's six declared queue operations, the budget is
 Every sidecar instrument nevertheless has an explicit SDK view derived from
 its full checked-in attribute domains. Batch size/cost omit `flush.reason`
 because it does not change their batch-shape semantics; fill ratio retains it.
-The resulting high-product ceilings are 14,392 fill-ratio series and 4,112
-generation-loading series, while all other sidecar ceilings are at or below
-1,799. These are upper bounds on retained SDK series, not expected steady-state
-usage or byte-size claims; the machine-checked formulas live in
-`contract.yaml`.
+`sie.worker.work_item.age` omits the catalog pair entirely and costs seven
+series: transport-queue age is a property of the queue rather than of the
+model on the far side of it, so the catalog factor would multiply the series
+count without adding an answer. The resulting high-product ceilings are 14,392
+fill-ratio series and 4,112 generation-loading series, while all other sidecar
+ceilings are at or below 1,799. These are upper bounds on retained SDK series,
+not expected steady-state usage or byte-size claims; the machine-checked
+formulas live in `contract.yaml`.
 
 ## KEDA is a control API
 
@@ -355,8 +367,7 @@ Helm uses `lookup` to render each existing Deployment or StatefulSet's live
 Helm resource patch from resetting the observed HPA-controlled replica count and leaves no
 permanent replica-pin data in values, annotations, or release history.
 
-The `0.6.20` boundary is one supervised maintenance-window upgrade, documented
-in the [deployment runbook](../deploy/upgrade-runbook.md).
+The `0.6.20` boundary requires one supervised maintenance-window upgrade.
 Stop external traffic and topology/config writes, keep the effective namespace,
 lane catalog, names, scale targets, Prometheus backend, and KEDA ownership
 unchanged, and run one normal
@@ -585,7 +596,7 @@ CI should reject a change unless it proves all of the following:
    fields, events, linked spans, trace-state and status text while the local
    Tempo branch remains unchanged;
 9. median-of-three warmed telemetry-off/on benchmarks cover the gateway
-   facade/Tower path, the managed cloud-gateway final-dispatch wrapper, Python
+   facade/Tower path, the downstream final-dispatch facade integration, Python
    and Rust workers, config, sidecar, and dispatcher hot paths; a paired
    durability-disabled/enabled benchmark separately gates the gateway
    dispatch-durability lifecycle before the change is declared ready;

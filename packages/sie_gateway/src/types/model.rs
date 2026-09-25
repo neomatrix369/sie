@@ -32,6 +32,10 @@ pub struct ModelInfoExtras {
     /// ``generate`` task; empty ``Vec`` when grammar is explicitly
     /// disabled.
     pub grammar_capabilities: Option<Vec<String>>,
+    /// Resolved ``tasks.generate.capabilities.streaming`` value. ``None``
+    /// means the model has no generation task; a generation task with no
+    /// explicit capability inherits the worker default of ``true``.
+    pub streaming_supported: Option<bool>,
     /// ``tasks.generate.grammar_profile`` from the model YAML — the name of a
     /// profile that grammar-constrained requests must be served on. When set,
     /// the chat/completions/generate handlers rewrite a grammar request's model
@@ -197,6 +201,12 @@ impl ModelInfoExtras {
                     })
                     .unwrap_or_default();
                 extras.grammar_capabilities = Some(grammar);
+                extras.streaming_supported = Some(
+                    capabilities
+                        .and_then(|m| m.get("streaming"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                );
                 // ``tasks.generate.grammar_profile: <name>`` — optional profile
                 // that grammar requests are routed to (the gateway rewrites the
                 // model id to ``{model}:{name}``). Absent => no rewrite.
@@ -344,6 +354,7 @@ impl ModelInfoExtras {
                 max_output_tokens: None,
                 profile_max_output_tokens: HashMap::new(),
                 grammar_capabilities: None,
+                streaming_supported: None,
                 grammar_profile: None,
                 profile_parents: HashMap::new(),
                 tools_supported: None,
@@ -364,6 +375,13 @@ impl ModelInfoExtras {
     /// task is present (see ``from_yaml_raw``).
     pub fn supports_vision_generation(&self) -> bool {
         self.inputs.iter().any(|s| s == "image") && self.outputs.iter().any(|s| s == "tokens")
+    }
+
+    /// Whether the model can serve video *generation* on
+    /// ``/v1/chat/completions``: ``inputs.video`` AND a generation task
+    /// (``inputs.video`` alone is also set by video encode models).
+    pub fn supports_video_generation(&self) -> bool {
+        self.inputs.iter().any(|s| s == "video") && self.outputs.iter().any(|s| s == "tokens")
     }
 }
 
@@ -478,6 +496,7 @@ impl ModelEntry {
                 "lora_adapters": self.info_extras.lora_adapters,
                 "profile_lora_adapters": self.info_extras.profile_lora_adapters,
                 "grammar": self.info_extras.grammar_capabilities,
+                "streaming": self.info_extras.streaming_supported,
                 "tools": self.info_extras.tools_supported,
                 "code": self.info_extras.code,
                 "sql": self.info_extras.sql,
@@ -1091,6 +1110,37 @@ tasks:
     }
 
     #[test]
+    fn test_model_info_extras_streaming_capability_is_resolved_and_advertised() {
+        let disabled: serde_yaml::Value = serde_yaml::from_str(
+            "name: m\ntasks:\n  generate:\n    capabilities:\n      streaming: false\n",
+        )
+        .unwrap();
+        let defaulted: serde_yaml::Value =
+            serde_yaml::from_str("name: m\ntasks:\n  generate: {}\n").unwrap();
+
+        let disabled_extras = ModelInfoExtras::from_yaml_raw(&disabled);
+        let defaulted_extras = ModelInfoExtras::from_yaml_raw(&defaulted);
+
+        assert_eq!(disabled_extras.streaming_supported, Some(false));
+        assert_eq!(defaulted_extras.streaming_supported, Some(true));
+        assert_eq!(
+            ModelEntry {
+                name: "m".to_string(),
+                canonical_base_model: "m".to_string(),
+                canonical_profile: "default".to_string(),
+                pool: None,
+                bundles: Vec::new(),
+                adapter_modules: HashSet::new(),
+                profile_names: HashSet::new(),
+                profile_configs: HashMap::new(),
+                info_extras: disabled_extras,
+            }
+            .to_model_info_value(false)["capabilities"]["streaming"],
+            json!(false)
+        );
+    }
+
+    #[test]
     fn test_model_info_extras_code_sql_guard_capabilities_parsed() {
         // Qwen3-4B-Instruct-2507 advertises code + sql (and tools); it is
         // not a guard model. Mirrors
@@ -1268,6 +1318,27 @@ tasks:
 
         let extras = ModelInfoExtras::from_yaml_raw(&raw);
         assert_eq!(extras.outputs, vec!["tokens"]);
+    }
+
+    #[test]
+    fn test_supports_video_generation_requires_video_and_generate() {
+        let video_gen = ModelInfoExtras::from_yaml_raw(
+            &serde_yaml::from_str(
+                "name: m\ninputs:\n  text: true\n  video: true\ntasks:\n  generate: {}\n",
+            )
+            .unwrap(),
+        );
+        assert!(video_gen.supports_video_generation());
+        let video_encode = ModelInfoExtras::from_yaml_raw(
+            &serde_yaml::from_str("name: m\ninputs:\n  video: true\ntasks:\n  encode: {}\n")
+                .unwrap(),
+        );
+        assert!(!video_encode.supports_video_generation());
+        let image_gen = ModelInfoExtras::from_yaml_raw(
+            &serde_yaml::from_str("name: m\ninputs:\n  image: true\ntasks:\n  generate: {}\n")
+                .unwrap(),
+        );
+        assert!(!image_gen.supports_video_generation());
     }
 
     #[test]

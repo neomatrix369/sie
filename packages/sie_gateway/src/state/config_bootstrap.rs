@@ -5,16 +5,16 @@
 //! authoritative state in two phases:
 //!
 //! 1. `GET /v1/configs/bundles` (+ per-bundle `GET /v1/configs/bundles/{id}`)
-//!    — fetches the bundle/adapter surface and installs it via
-//!    `ModelRegistry::install_bundles`. This MUST happen before the model
-//!    fetch because `add_model_config` rejects any adapter not in a known
-//!    bundle. Historically the gateway image baked these bundles in, which
-//!    drifted from `sie-config`'s view and made every published model fail
-//!    validation with `Adapter(s) not in any known bundle`. Pulling them
-//!    over HTTP makes `sie-config` the single source of truth.
+//!    — fetches the bundle/adapter surface. Historically the gateway image
+//!    baked these bundles in, which drifted from `sie-config`'s view and made
+//!    every published model fail validation with `Adapter(s) not in any
+//!    known bundle`. Pulling them over HTTP makes `sie-config` the single
+//!    source of truth.
 //! 2. `GET /v1/configs/export` (admin-auth) — fetches every persisted model
-//!    config and replaces the registry's model set so the gateway's served
-//!    view matches `sie-config`'s view, including removals.
+//!    config. Both halves are then installed as ONE snapshot via
+//!    `ModelRegistry::replace_authoritative_surface`, which validates each
+//!    model's adapters against the bundles it was exported with and replaces
+//!    the served view, including removals.
 //!
 //! Live updates after bootstrap arrive via NATS deltas
 //! (`sie.config.models.*`), which the `NatsManager` feeds into
@@ -206,12 +206,20 @@ pub enum BootstrapError {
         failed: usize,
         total: usize,
     },
+    /// The bundle surface changed between the reads that make up one
+    /// bootstrap, so the bundles and the model export may come from different
+    /// `sie-config` generations. Nothing was installed; the next attempt
+    /// re-reads both.
+    #[error("torn read: bundles hash moved from {before} to {after} during bootstrap")]
+    TornRead { before: String, after: String },
 }
 
 pub(crate) fn telemetry_outcome(error: &BootstrapError) -> ConfigOutcome {
     match error {
         BootstrapError::PartialApply { .. } => ConfigOutcome::PartialApply,
-        BootstrapError::Http(_) | BootstrapError::BadStatus { .. } => ConfigOutcome::FetchError,
+        BootstrapError::Http(_)
+        | BootstrapError::BadStatus { .. }
+        | BootstrapError::TornRead { .. } => ConfigOutcome::FetchError,
     }
 }
 
@@ -488,9 +496,10 @@ impl BootstrapClient {
         Ok(out)
     }
 
-    /// Fetch bundles + the model snapshot, install both into `registry`.
-    /// Bundles MUST be installed first so the model-apply loop can validate
-    /// each profile's `adapter_path` against the freshly-fetched adapter set.
+    /// Fetch bundles + the model snapshot and install both into `registry`
+    /// as one matched snapshot, so every profile's `adapter_path` is
+    /// validated against the bundle set it was exported with and neither half
+    /// can land without the other.
     pub async fn bootstrap(
         &self,
         registry: &ModelRegistry,
@@ -502,7 +511,6 @@ impl BootstrapClient {
         // caught up on a stale registry.
         let pre_bootstrap = self.fetch_epoch().await?;
         let bundles = self.fetch_bundles().await?;
-        registry.install_bundles(bundles);
 
         let url = format!("{}/v1/configs/export", self.base_url.trim_end_matches('/'));
         let req = self.apply_auth(self.http.get(&url));
@@ -548,9 +556,36 @@ impl BootstrapClient {
             }
         }
 
+        // The bundles and the export are separate reads, and `sie-config`
+        // serves them from different structures: the export from its locked
+        // internal snapshot, the bundles from files that change on redeploy.
+        // Re-read the epoch and refuse the pair if the bundle surface moved in
+        // between, so the two halves installed together always belong to one
+        // generation; the retry loop simply reads both again.
+        let post_bootstrap = self.fetch_epoch().await?;
+        let hash_published =
+            !pre_bootstrap.bundles_hash.is_empty() && !post_bootstrap.bundles_hash.is_empty();
+        if hash_published {
+            if post_bootstrap.bundles_hash != pre_bootstrap.bundles_hash {
+                return Err(BootstrapError::TornRead {
+                    before: pre_bootstrap.bundles_hash,
+                    after: post_bootstrap.bundles_hash,
+                });
+            }
+        } else {
+            // A control plane that publishes no bundle fingerprint cannot
+            // vouch for the pair, and two empty hashes prove nothing. Read the
+            // bundle surface again and compare the two reads directly.
+            let before = bundle_fingerprint(&bundles);
+            let after = bundle_fingerprint(&self.fetch_bundles().await?);
+            if before != after {
+                return Err(BootstrapError::TornRead { before, after });
+            }
+        }
+
         let mut applied = 0usize;
         if failed == 0 {
-            match registry.replace_model_configs_authoritative(configs) {
+            match registry.replace_authoritative_surface(bundles, configs) {
                 Ok(count) => {
                     applied = count;
                     registry.install_bundle_config_hashes(snapshot.bundle_config_hashes);
@@ -572,6 +607,27 @@ impl BootstrapClient {
             total,
         })
     }
+}
+
+/// Order-independent identity of a bundle read, for comparing two reads of
+/// the bundle surface when the control plane publishes no hash for it.
+fn bundle_fingerprint(bundles: &[BundleInfo]) -> String {
+    let mut lines: Vec<String> = bundles
+        .iter()
+        .map(|b| {
+            let mut adapters = b.adapters.clone();
+            adapters.sort();
+            format!(
+                "{}|{}|{}|{}",
+                b.name,
+                b.priority,
+                b.engine,
+                adapters.join(",")
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
 }
 
 fn parse_exported_model(model: &ExportedModel) -> Result<Option<ModelConfig>, String> {
@@ -955,6 +1011,154 @@ mod tests {
             registry.get_model_profile_names("test/model"),
             vec!["default".to_string()],
         );
+    }
+
+    /// A bundle redeploy landing between the bundle read and the export read
+    /// would pair one generation's bundles with another's models. The
+    /// post-read epoch check refuses the pair and installs nothing.
+    #[tokio::test]
+    async fn bootstrap_refuses_a_bundle_surface_that_moved_during_the_reads() {
+        let server = MockServer::start().await;
+        let (registry, _tmp) = make_registry();
+        mount_default_bundles(&server).await;
+        // First epoch read sees "before"; every later read sees "after".
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/epoch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "epoch": 0,
+                "bundles_hash": "before",
+                "bundle_config_hashes_hash": "bundle_config_hashes_hash",
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_default_epoch(&server, 0, "after").await;
+
+        let body = serde_json::json!({
+            "snapshot_version": 1,
+            "epoch": 7,
+            "generated_at": "2026-04-17T00:00:00Z",
+            "bundle_config_hashes": {"default": "control-plane-hash"},
+            "models": [{
+                "model_id": "kept/model",
+                "raw_yaml": "sie_id: kept/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.sentence_transformer:Adapter\n",
+                "affected_bundles": ["default"],
+            }],
+        });
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/export"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(server.uri(), None).unwrap();
+        let err = client
+            .bootstrap(registry.as_ref())
+            .await
+            .expect_err("a moved bundle surface must refuse the pair");
+        assert!(
+            matches!(err, BootstrapError::TornRead { .. }),
+            "expected TornRead, got {err:?}"
+        );
+        assert!(
+            registry.get_model_info("kept/model").is_none(),
+            "nothing may be installed from a torn read"
+        );
+    }
+
+    async fn mount_epoch_without_bundles_hash(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/epoch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "epoch": 0,
+                "bundle_config_hashes_hash": "bundle_config_hashes_hash",
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn kept_model_export() -> serde_json::Value {
+        serde_json::json!({
+            "snapshot_version": 1,
+            "epoch": 7,
+            "generated_at": "2026-04-17T00:00:00Z",
+            "bundle_config_hashes": {"default": "control-plane-hash"},
+            "models": [{
+                "model_id": "kept/model",
+                "raw_yaml": "sie_id: kept/model\nprofiles:\n  default:\n    adapter_path: sie_server.adapters.sentence_transformer:Adapter\n",
+                "affected_bundles": ["default"],
+            }],
+        })
+    }
+
+    /// Two empty hashes prove nothing: when the control plane publishes no
+    /// bundle fingerprint the bundle surface is read twice and compared, so a
+    /// change between the reads is still refused.
+    #[tokio::test]
+    async fn bootstrap_refuses_a_moved_bundle_surface_when_no_hash_is_published() {
+        let server = MockServer::start().await;
+        let (registry, _tmp) = make_registry();
+        mount_epoch_without_bundles_hash(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/bundles"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "bundles": [{"bundle_id": "default", "priority": 10, "adapter_count": 1, "source": "filesystem"}],
+            })))
+            .mount(&server)
+            .await;
+        // First bundle read carries one adapter set, every later read another.
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/bundles/default"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.sentence_transformer\n",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/bundles/default"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.pytorch_embedding\n",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/export"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(kept_model_export()))
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(server.uri(), None).unwrap();
+        let err = client
+            .bootstrap(registry.as_ref())
+            .await
+            .expect_err("a moved bundle surface must be refused even without a hash");
+        assert!(
+            matches!(err, BootstrapError::TornRead { .. }),
+            "got {err:?}"
+        );
+        assert!(registry.get_model_info("kept/model").is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_applies_when_no_hash_is_published_and_the_bundle_reads_agree() {
+        let server = MockServer::start().await;
+        let (registry, _tmp) = make_registry();
+        mount_epoch_without_bundles_hash(&server).await;
+        mount_default_bundles(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/v1/configs/export"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(kept_model_export()))
+            .mount(&server)
+            .await;
+
+        let client = BootstrapClient::new(server.uri(), None).unwrap();
+        let outcome = client
+            .bootstrap(registry.as_ref())
+            .await
+            .expect("agreeing bundle reads are a consistent pair");
+        assert_eq!(outcome.failed, 0);
+        assert!(registry.get_model_info("kept/model").is_some());
     }
 
     #[tokio::test]

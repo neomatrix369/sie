@@ -4,11 +4,13 @@ from typing import TYPE_CHECKING, Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+from sie_server.adapters.errors import InputTooLongError
 from sie_server.api.helpers import (
     InferenceErrorHandler,
     ModelStateChecker,
     RequestParser,
     ResponseBuilder,
+    ensure_finite_scores,
     oom_retry_after_from_registry,
 )
 from sie_server.api.options import resolve_runtime_options
@@ -141,12 +143,13 @@ async def _score_via_worker(
         },
         400: {"description": "Invalid request"},
         404: {"description": "Model not found"},
+        413: {"description": "Request body exceeds the configured size limit"},
         502: {
             "description": (
                 "Terminal model-load failure (MODEL_LOAD_FAILED). "
                 "Carried in the ``detail`` envelope: ``{code, message, "
                 "error_class, permanent, attempts}``. No ``Retry-After`` "
-                "header — clients MUST NOT auto-retry. See sie-test#85."
+                "header — clients MUST NOT auto-retry."
             ),
         },
         503: {"description": "Model not loaded or service unavailable"},
@@ -266,10 +269,18 @@ async def score(
             timing = worker_result.timing
         except QueueFullError as e:
             raise error_handler.handle_queue_full(e) from e
+        except InputTooLongError as e:
+            raise error_handler.handle_input_too_long(e) from e
         except ValueError as e:
             raise error_handler.handle_value_error(e) from e
         except Exception as e:
-            raise error_handler.handle_inference_error(e) from e
+            raise error_handler.handle_inference_error(e, "Scoring") from e
+
+        # Fail closed on non-finite (NaN/inf) model output before it reaches
+        # serialization: JSON would 500 un-enveloped and msgpack would silently
+        # return 200 with the NaN ranked as valid. Checked after the inference
+        # try/except so the typed 500 is not re-wrapped by handle_inference_error.
+        ensure_finite_scores(scores, model)
 
         # Build response
         query_id = query.id

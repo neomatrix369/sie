@@ -92,6 +92,7 @@ ADAPTIVE_COST_METRIC_NAME: Final = "sie.worker.scheduler.adaptive.cost"
 ADAPTIVE_P50_METRIC_NAME: Final = "sie.worker.scheduler.adaptive.p50"
 STARVATION_RESETS_METRIC_NAME: Final = "sie.worker.scheduler.starvation.resets"
 GENERATION_TTFT_METRIC_NAME: Final = "sie.worker.generation.ttft"
+GENERATION_WORKER_WAIT_METRIC_NAME: Final = "sie.worker.generation.worker_wait"
 GENERATION_TPOT_METRIC_NAME: Final = "sie.worker.generation.tpot"
 GENERATION_TOKENS_METRIC_NAME: Final = "sie.worker.generation.tokens"
 GENERATION_INFLIGHT_METRIC_NAME: Final = "sie.worker.generation.inflight"
@@ -346,6 +347,8 @@ class WorkerTelemetryFacade(Protocol):
 
     def first_token_observed(self, *, model: object, grammar: object, duration_s: object) -> None: ...
 
+    def worker_wait_observed(self, *, model: object, grammar: object, duration_s: object) -> None: ...
+
     def stream_finished(
         self,
         *,
@@ -430,6 +433,9 @@ class _NoopWorkerTelemetry:
         return
 
     def first_token_observed(self, **_: Any) -> None:
+        return
+
+    def worker_wait_observed(self, **_: Any) -> None:
         return
 
     def stream_finished(self, **_: Any) -> None:
@@ -572,6 +578,14 @@ class WorkerTelemetry:
             GENERATION_TTFT_METRIC_NAME,
             unit="s",
             description="Adapter-observed generation time to first non-empty token",
+        )
+        self._generation_worker_wait = meter.create_histogram(
+            GENERATION_WORKER_WAIT_METRIC_NAME,
+            unit="s",
+            description=(
+                "Work receipt to adapter dispatch: validation, chat-template render,"
+                " and admission/capacity wait spent worker-side before the engine"
+            ),
         )
         self._generation_tpot = meter.create_histogram(
             GENERATION_TPOT_METRIC_NAME,
@@ -893,6 +907,19 @@ class WorkerTelemetry:
         if (duration := _nonnegative_float(duration_s)) is not None:
             self._generation_ttft.record(duration, self._generation_stream_attributes(model, grammar))
 
+    def worker_wait_observed(self, *, model: object, grammar: object, duration_s: object) -> None:
+        """Record the worker-side pre-adapter phase of one generation request.
+
+        Together with the adapter-side TTFT (``first_token_observed``, which
+        covers the engine's grammar preparation + prefill) and TPOT, this
+        splits the client-observed time-to-first-token into worker wait vs
+        engine pre-first-token vs decode — the phase evidence #3136 requires
+        for the structured-output stall. The ``grammar`` label lets dashboards
+        compare grammar-constrained cohorts against the ``none`` baseline.
+        """
+        if (duration := _nonnegative_float(duration_s)) is not None:
+            self._generation_worker_wait.record(duration, self._generation_stream_attributes(model, grammar))
+
     def stream_finished(
         self,
         *,
@@ -1129,6 +1156,7 @@ def metric_views() -> list[View]:
         (INFERENCE_DURATION_METRIC_NAME, INFERENCE_DURATION_BUCKETS_S),
         (MODEL_LOAD_DURATION_METRIC_NAME, MODEL_LOAD_DURATION_BUCKETS_S),
         (GENERATION_TTFT_METRIC_NAME, TTFT_TPOT_BUCKETS_S),
+        (GENERATION_WORKER_WAIT_METRIC_NAME, TTFT_TPOT_BUCKETS_S),
         (GENERATION_TPOT_METRIC_NAME, TTFT_TPOT_BUCKETS_S),
         (GRAMMAR_COMPILE_DURATION_METRIC_NAME, TTFT_TPOT_BUCKETS_S),
     )
@@ -1168,6 +1196,7 @@ def metric_names() -> frozenset[str]:
             ADAPTIVE_P50_METRIC_NAME,
             STARVATION_RESETS_METRIC_NAME,
             GENERATION_TTFT_METRIC_NAME,
+            GENERATION_WORKER_WAIT_METRIC_NAME,
             GENERATION_TPOT_METRIC_NAME,
             GENERATION_TOKENS_METRIC_NAME,
             GENERATION_INFLIGHT_METRIC_NAME,
@@ -1187,6 +1216,7 @@ def generation_metric_names() -> frozenset[str]:
     return frozenset(
         {
             GENERATION_TTFT_METRIC_NAME,
+            GENERATION_WORKER_WAIT_METRIC_NAME,
             GENERATION_TPOT_METRIC_NAME,
             GENERATION_TOKENS_METRIC_NAME,
             GENERATION_INFLIGHT_METRIC_NAME,

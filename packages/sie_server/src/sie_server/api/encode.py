@@ -6,18 +6,21 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from sie_sdk.types import DEFAULT_OUTPUT_DTYPE, DType, OutputDType, np_to_dtype
 
+from sie_server.adapters.errors import InputTooLongError
 from sie_server.api.helpers import (
     InferenceErrorHandler,
     ModelStateChecker,
     RequestParser,
     ResponseBuilder,
     oom_retry_after_from_registry,
+    validated_total,
 )
 from sie_server.api.options import resolve_runtime_options_with_profile
 from sie_server.api.serialization import MsgPackResponse
 from sie_server.api.validation import validate_machine_profile_header
 from sie_server.config.model import ModelConfig
 from sie_server.core.encode_pipeline import EncodePipeline, resolve_encode_output_types
+from sie_server.core.timing import RequestTiming
 from sie_server.core.worker import QueueFullError
 from sie_server.observability.tracing import tracer
 from sie_server.observability.worker_telemetry import worker_telemetry, worker_telemetry_enabled
@@ -25,11 +28,35 @@ from sie_server.types.inputs import Item
 from sie_server.types.openapi import EncodeResponseModel
 from sie_server.types.outputs import DenseVector, EncodeResult, MultiVector, SparseVector
 from sie_server.types.requests import EncodeRequest
-from sie_server.types.responses import EncodeResponse, ErrorCode, TimingInfo
+from sie_server.types.responses import EncodeResponse, ErrorCode, TimingInfo, Usage
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["encode"])
+
+
+def encode_usage_from_timing(timing: RequestTiming | None, item_count: int) -> Usage | None:
+    """Return exact post-tokenization encode usage, never a character estimate.
+
+    The counterpart of ``score.score_usage_from_output``: the reported number is
+    the worker's own ``input_token_counts``, the number telemetry meters from,
+    so a caller can reconcile what they read with what they are billed.
+
+    A total of ``0`` IS reported — a video-only encode consumes exactly zero
+    text tokens, and that measured zero must not read as "unknown". Absent
+    counts yield ``None`` and the response simply carries no ``usage``, which
+    is the only honest rendering of "this path could not count".
+    """
+    if timing is None:
+        return None
+    total_tokens = validated_total(timing.input_token_counts, item_count)
+    if total_tokens is None:
+        return None
+    usage = Usage(input_tokens=total_tokens)
+    images = validated_total(timing.input_image_counts, item_count)
+    if images is not None:
+        usage["images"] = images
+    return usage
 
 
 def _format_dense(
@@ -171,12 +198,13 @@ def _build_response_items(
         },
         400: {"description": "Invalid request"},
         404: {"description": "Model not found"},
+        413: {"description": "Request body exceeds the configured size limit"},
         502: {
             "description": (
                 "Terminal model-load failure (MODEL_LOAD_FAILED). "
                 "Carried in the ``detail`` envelope: ``{code, message, "
                 "error_class, permanent, attempts}``. No ``Retry-After`` "
-                "header — clients MUST NOT auto-retry. See sie-test#85."
+                "header — clients MUST NOT auto-retry."
             ),
         },
         503: {"description": "Model not loaded or service unavailable"},
@@ -362,10 +390,12 @@ async def encode(
             )
         except QueueFullError as e:
             raise error_handler.handle_queue_full(e) from e
+        except InputTooLongError as e:
+            raise error_handler.handle_input_too_long(e) from e
         except ValueError as e:
             raise error_handler.handle_value_error(e) from e
         except Exception as e:
-            raise error_handler.handle_inference_error(e) from e
+            raise error_handler.handle_inference_error(e, "Encoding") from e
 
         # Build response (quantization already done by postprocessor)
         response_items = _build_response_items(items, results, config)
@@ -391,24 +421,28 @@ async def encode(
 
         response = EncodeResponse(model=model, items=response_items, timing=timing_info)
 
+        # What the caller is TOLD they used. Same worker counts the telemetry
+        # block below meters from, rendered without the metering-specific
+        # zero-drop: reporting is not billing, and a measured zero is a fact the
+        # caller is entitled to read.
+        usage = encode_usage_from_timing(timing, len(items))
+        if usage is not None:
+            response["usage"] = usage
+
         if worker_telemetry_enabled():
             units: dict[str, int] | None = None
-            if timing is not None and timing.input_token_counts is not None:
-                counts = timing.input_token_counts
-                if len(counts) == len(items) and all(
-                    isinstance(count, int) and not isinstance(count, bool) for count in counts
-                ):
-                    # Non-zero, exactly like the image branch below. A
-                    # video-only encode scatters `0` text tokens to its items,
-                    # and a reported zero is indistinguishable from "this
-                    # dimension does not apply to this item" — which is why the
-                    # queue seam's `_encode_units` drops it and the gateway's
-                    # `validate_dimensions` faults on one outright. Emitting it
-                    # here made the two ingresses report different dimension
-                    # sets for the same batch.
-                    total_tokens = sum(counts)
-                    if total_tokens > 0:
-                        units = {"input_tokens": total_tokens}
+            if timing is not None:
+                # Non-zero, exactly like the image branch below. A
+                # video-only encode scatters `0` text tokens to its items,
+                # and a reported zero is indistinguishable from "this
+                # dimension does not apply to this item" — which is why the
+                # queue seam's `_encode_units` drops it and the gateway's
+                # `validate_dimensions` faults on one outright. Emitting it
+                # here made the two ingresses report different dimension
+                # sets for the same batch.
+                total_tokens = validated_total(timing.input_token_counts, len(items))
+                if total_tokens:
+                    units = {"input_tokens": total_tokens}
             # §7 "$ per image": the adapter's authoritative count of images and
             # sampled video frames it actually processed. Independent of tokens
             # — a video encode reports images with no token count at all.

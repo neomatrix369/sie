@@ -1,0 +1,364 @@
+sie_id: Qwen/Qwen3.8-27B-FP8
+hf_id: Qwen/Qwen3.8-27B-FP8
+hf_revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+# Official first-party blockwise FP8 checkpoint. The pinned config declares
+# Qwen3_5ForConditionalGeneration, 64 layers in the same 48 GDN + 16 full-
+# attention layout as Qwen3.6-27B, and a native 262,144-token window. Its
+# quantization_config is dynamic FP8 with 128x128 weight blocks, so SGLang
+# detects the checkpoint quantization directly; no online --quantization flag
+# belongs in these profiles.
+inputs:
+  text: true
+  image: true
+  audio: false
+  # Qwen documents native video understanding, but video is not yet wired
+  # through the SIE generation request surface.
+  video: false
+tasks:
+  generate:
+    # Keep the bare route conservative. Native context is exposed only through
+    # exact-hardware profiles whose admission and launch shapes are smoke-tested.
+    context_length: 8192
+    max_output_tokens: 4096
+    grammar_profile: no-spec
+    capabilities:
+      grammar: ["json_schema", "regex"]
+      streaming: true
+      tools: true
+    # Qwen3.8 defaults to thinking. The initial SIE contract is answer-only;
+    # reasoning profiles can be added after their parser/output behavior is
+    # tested independently.
+    chat_template_kwargs:
+      enable_thinking: false
+    prewarm_grammars:
+      - name: yes_no
+        kind: regex
+        value: "(yes|no)"
+      - name: short_answer
+        kind: json_schema
+        value:
+          type: object
+          properties:
+            answer:
+              type: string
+          required: [answer]
+max_sequence_length: 8192
+profiles:
+  # Correctness-first bare route: official FP8 weights, BF16 KV, FP32 GDN
+  # state, no speculation, CUDA graphs disabled, and an 8K admission window.
+  default:
+    max_batch_tokens: 16384
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangCuda13Adapter
+    kv_budget_tokens: 8192
+    adapter_options:
+      loadtime:
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.8-27B-FP8
+        disable_cuda_graph: true
+        attention_backend: flashinfer
+        grammar_backend: xgrammar
+        tool_call_parser: qwen3_coder
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--kv-cache-dtype"
+          - "bfloat16"
+          - "--mamba-ssm-dtype"
+          - "float32"
+      runtime:
+        first_chunk_timeout_s: 90
+        inter_chunk_timeout_s: 15
+        overall_timeout_s: 600
+        # Official Qwen3.8 non-thinking sampling recipe.
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          top_k: 20
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+
+  no-spec:
+    extends: default
+
+  # H100-80GB: one native-window admission with in-checkpoint MTP. FA3 plus
+  # BF16 GDN state is the measured SM90 batch-one winner. Profile-scoped
+  # DeepGEMM fast warmup covers every decode M through 1024 and samples the
+  # prefill range through the explicit 32K boundary. The matching no-spec
+  # profile is the grammar-safe fallback. Every native-window pair uses the
+  # synchronous scheduler: pinned SGLang speculative V2 has a request-dependent
+  # overlap-path crash on hybrid Mamba, while these profiles admit only one
+  # running request and have no useful batch to overlap.
+  h100-256k:
+    max_output_tokens: 32768
+    max_batch_tokens: 262144
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangCuda13Adapter
+    grammar_profile: h100-256k-no-spec
+    kv_budget_tokens: 262144
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.8-27B-FP8
+        attention_backend: fa3
+        grammar_backend: xgrammar
+        tool_call_parser: qwen3_coder
+        extra_env:
+          SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "1"
+        speculative:
+          enabled: true
+          algorithm: eagle
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--kv-cache-dtype"
+          - "bfloat16"
+          - "--mamba-ssm-dtype"
+          - "bfloat16"
+          - "--mamba-radix-cache-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+          - "--page-size"
+          - "64"
+          - "--chunked-prefill-size"
+          - "32768"
+          - "--max-prefill-tokens"
+          - "32768"
+          - "--max-running-requests"
+          - "1"
+          - "--cuda-graph-max-bs-decode"
+          - "1"
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          top_k: 20
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  h100-256k-no-spec:
+    extends: h100-256k
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.8-27B-FP8
+        attention_backend: fa3
+        grammar_backend: xgrammar
+        tool_call_parser: qwen3_coder
+        extra_env:
+          SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "1"
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--kv-cache-dtype"
+          - "bfloat16"
+          - "--mamba-ssm-dtype"
+          - "bfloat16"
+          - "--mamba-radix-cache-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+          - "--page-size"
+          - "64"
+          - "--chunked-prefill-size"
+          - "32768"
+          - "--max-prefill-tokens"
+          - "32768"
+          - "--max-running-requests"
+          - "1"
+          - "--cuda-graph-max-bs-decode"
+          - "1"
+
+  # H200-141GB: deliberately retain the measured H100 SM90 recipe and
+  # one-admission launch shape; the larger card provides more memory headroom
+  # without a second tuning surface.
+  h200-256k:
+    max_output_tokens: 32768
+    max_batch_tokens: 262144
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangCuda13Adapter
+    grammar_profile: h200-256k-no-spec
+    kv_budget_tokens: 262144
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.8-27B-FP8
+        attention_backend: fa3
+        grammar_backend: xgrammar
+        tool_call_parser: qwen3_coder
+        extra_env:
+          SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "1"
+        speculative:
+          enabled: true
+          algorithm: eagle
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--kv-cache-dtype"
+          - "bfloat16"
+          - "--mamba-ssm-dtype"
+          - "bfloat16"
+          - "--mamba-radix-cache-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+          - "--page-size"
+          - "64"
+          - "--chunked-prefill-size"
+          - "32768"
+          - "--max-prefill-tokens"
+          - "32768"
+          - "--max-running-requests"
+          - "1"
+          - "--cuda-graph-max-bs-decode"
+          - "1"
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          top_k: 20
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  h200-256k-no-spec:
+    extends: h200-256k
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.8-27B-FP8
+        attention_backend: fa3
+        grammar_backend: xgrammar
+        tool_call_parser: qwen3_coder
+        extra_env:
+          SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "1"
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--kv-cache-dtype"
+          - "bfloat16"
+          - "--mamba-ssm-dtype"
+          - "bfloat16"
+          - "--mamba-radix-cache-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+          - "--page-size"
+          - "64"
+          - "--chunked-prefill-size"
+          - "32768"
+          - "--max-prefill-tokens"
+          - "32768"
+          - "--max-running-requests"
+          - "1"
+          - "--cuda-graph-max-bs-decode"
+          - "1"
+
+  # RTX PRO 6000 96GB (SM120): retain FlashInfer and 2K prefill chunks from the
+  # official Blackwell recipe while sharing the measured BF16 GDN state and
+  # profile-scoped DeepGEMM fast warmup. Both RTX profiles deliberately leave
+  # --max-prefill-tokens at SGLang's pinned default; only the chunk granularity
+  # is overridden here, and the Stage-5 full-window smoke guards that pairing.
+  rtx-pro-6000-256k:
+    max_output_tokens: 32768
+    max_batch_tokens: 262144
+    compute_precision: bfloat16
+    adapter_path: sie_server.adapters.sglang.cuda13:SGLangCuda13Adapter
+    grammar_profile: rtx-pro-6000-256k-no-spec
+    kv_budget_tokens: 262144
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.8-27B-FP8
+        attention_backend: flashinfer
+        grammar_backend: xgrammar
+        tool_call_parser: qwen3_coder
+        extra_env:
+          SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "1"
+        speculative:
+          enabled: true
+          algorithm: eagle
+          num_steps: 3
+          eagle_topk: 1
+          num_draft_tokens: 4
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--kv-cache-dtype"
+          - "bfloat16"
+          - "--mamba-ssm-dtype"
+          - "bfloat16"
+          - "--mamba-radix-cache-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+          - "--page-size"
+          - "64"
+          - "--chunked-prefill-size"
+          - "2048"
+          - "--max-running-requests"
+          - "1"
+          - "--cuda-graph-max-bs-decode"
+          - "1"
+      runtime:
+        first_chunk_timeout_s: 900
+        inter_chunk_timeout_s: 30
+        overall_timeout_s: 1800
+        default_sampling:
+          temperature: 0.7
+          top_p: 0.8
+          top_k: 20
+          presence_penalty: 1.5
+        stop_tokens:
+          - "<|im_end|>"
+  rtx-pro-6000-256k-no-spec:
+    extends: rtx-pro-6000-256k
+    adapter_options:
+      loadtime:
+        max_seq_length: 262144
+        mem_fraction_static: 0.85
+        served_model_name: Qwen/Qwen3.8-27B-FP8
+        attention_backend: flashinfer
+        grammar_backend: xgrammar
+        tool_call_parser: qwen3_coder
+        extra_env:
+          SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "1"
+        speculative:
+          enabled: false
+        extra_launch_args:
+          - "--mm-process-config"
+          - '{"image":{"min_pixels":65536,"max_pixels":1003520}}'
+          - "--kv-cache-dtype"
+          - "bfloat16"
+          - "--mamba-ssm-dtype"
+          - "bfloat16"
+          - "--mamba-radix-cache-strategy"
+          - "extra_buffer"
+          - "--disable-overlap-schedule"
+          - "--page-size"
+          - "64"
+          - "--chunked-prefill-size"
+          - "2048"
+          - "--max-running-requests"
+          - "1"
+          - "--cuda-graph-max-bs-decode"
+          - "1"

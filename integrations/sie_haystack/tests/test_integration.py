@@ -4,7 +4,7 @@ These tests require a running SIE server and serve as runnable examples.
 Run with: pytest -m integration integrations/sie_haystack/tests/
 
 Prerequisites:
-    mise run serve -d cpu -p 8080
+    mise run serve -- -d cpu -p 8080
 """
 
 from __future__ import annotations

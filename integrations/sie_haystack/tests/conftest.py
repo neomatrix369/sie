@@ -155,13 +155,18 @@ def mock_sie_client() -> MagicMock:
             for item in items
         ]
 
-    def mock_score(_model: str, query: Any, items: list[Any], **kwargs: Any) -> list[dict]:
+    def mock_score(_model: str, query: Any, items: list[Any], **kwargs: Any) -> dict[str, Any]:
+        # Mirror the real SDK: a ScoreResult envelope with ranked entries under
+        # "scores", not a bare list.
         query_text = _get_text(query)
         item_dicts = [
             {"id": i.get("id", str(idx)) if isinstance(i, dict) else str(idx), "text": _get_text(i)}
             for idx, i in enumerate(items)
         ]
-        return _create_mock_score_result(query_text, item_dicts, kwargs.get("top_k"))
+        return {
+            "model": _model,
+            "scores": _create_mock_score_result(query_text, item_dicts, kwargs.get("top_k")),
+        }
 
     def mock_extract(_model: str, items: Any, labels: list[str], **_kwargs: Any) -> list[dict]:
         # Extract always returns a list of entities for Haystack

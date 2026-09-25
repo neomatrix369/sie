@@ -114,18 +114,26 @@ async def test_concurrent_cross_model_load_under_pressure(monkeypatch: pytest.Mo
 # -- Scenario: teardown hang ------------------------------------------------------
 
 
-async def test_teardown_hang_starves_event_loop_but_leaves_no_ghost(
+async def test_teardown_hang_does_not_starve_event_loop_and_leaves_no_ghost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Characterizes the unload/teardown seam (#1600 ghost-model class,
-    registry.py:1280-1310). Pinned current contract, measured with a real
-    hung ``unload()``: ``adapter.unload()`` runs synchronously ON the event
-    loop inside ``_do_unload``, so a hung teardown starves the ENTIRE loop
-    for the hang duration — no other request, health probe, or residency op
-    can run. Pinned so a future fix (unload in a thread) flips this
-    assertion consciously. Post-conditions: the eviction completes, the
-    model is fully unregistered (no ghost accounting), and the registry
-    accepts new loads immediately.
+    registry.py:1280-1310), measured with a real hung ``unload()``.
+
+    **This is the conscious flip the previous version of this test asked
+    for.** It used to assert the opposite — that a hung teardown starves
+    the ENTIRE event loop, because ``adapter.unload()`` ran synchronously
+    on it inside ``_do_unload`` — and said so explicitly: "pinned so a
+    future fix (unload in a thread) flips this assertion consciously".
+    That fix moves teardown onto a worker thread, so the event loop remains
+    schedulable while teardown hangs.
+
+    Everything else about the contract is unchanged and still asserted:
+    the hang is really exercised (the eviction still takes the full
+    teardown duration, because the load lock is deliberately still held
+    across it), the eviction completes, the model is fully unregistered
+    with no ghost accounting, and the registry accepts new loads
+    immediately afterwards.
     """
     monkeypatch.setenv(SIE_FAKE_MEMORY_BUDGET_ENV, "1GiB")
     monkeypatch.setenv(
@@ -136,35 +144,44 @@ async def test_teardown_hang_starves_event_loop_but_leaves_no_ghost(
     await registry.load_async("sie-fake", device="cpu")
     await registry.load_async("sie-fake:small-a", device="cpu")
 
-    # Heartbeat task: measures the longest gap between loop iterations while
-    # the eviction runs. A blocked loop shows up as one giant gap.
-    max_gap = 0.0
+    # Heartbeat task: counts loop iterations completed while the eviction
+    # runs. A blocked loop simply stops counting.
+    #
+    # Counting beats rather than measuring the largest inter-wakeup gap is
+    # deliberate. The gap is a max over a noisy sample: a busy CI runner
+    # produced 0.61 s on a *healthy* loop here, which is meaningless as a
+    # signal but sits well inside any threshold tight enough to catch the
+    # 1 s block. The count is cumulative, so one scheduler hiccup barely
+    # moves it and the two populations stay decisively apart.
+    beats = 0
 
     async def _heartbeat() -> None:
-        nonlocal max_gap
-        last = time.monotonic()
+        nonlocal beats
         while True:
             await asyncio.sleep(0.01)
-            now = time.monotonic()
-            max_gap = max(max_gap, now - last)
-            last = now
+            beats += 1
 
     beat = asyncio.create_task(_heartbeat())
     await asyncio.sleep(0.05)  # let the heartbeat establish a baseline
+    beats = 0
 
     # Evicting from embed's perspective selects generate (the LRU) — whose
-    # teardown hangs 1 s, synchronously, on the loop.
+    # teardown hangs 1 s, now on a worker thread rather than on the loop.
     start = time.monotonic()
     result = await registry.evict_lru_excluding("sie-fake:small-a", timeout_s=5.0)
     elapsed = time.monotonic() - start
-    # Give the heartbeat one post-hang wakeup so the starvation gap is
-    # recorded before we cancel it (the main coroutine resumes first).
-    await asyncio.sleep(0.05)
+    # Cancelled immediately, with no settling sleep: every beat counted
+    # below was therefore serviced *during* the hang, which is the whole
+    # question. A post-eviction wakeup would credit the blocked case too.
     beat.cancel()
 
     assert result is EvictionResult.EVICTED
     assert elapsed >= 1.0, "the teardown hang must actually be exercised"
-    assert max_gap >= 0.9, "characterization: a hung sync unload starves the event loop today"
+    # The flip. On the loop, the 1 s teardown yields nothing at all and
+    # this lands at 0; off the loop the heartbeat keeps its ~10 ms cadence
+    # for the whole second and lands near 100. The threshold sits an order
+    # of magnitude from both, so a loaded runner cannot flake it.
+    assert beats >= 20, f"a hung unload must no longer starve the event loop ({beats} beats during {elapsed:.2f}s)"
 
     manager = registry.memory_manager
     # No ghost: the hung teardown still unregisters its memory accounting.

@@ -8,11 +8,11 @@
  * const client = new SIEClient("http://localhost:8080");
  *
  * // Encode text to get embeddings
- * const result = await client.encode("bge-m3", { text: "Hello world" });
+ * const result = await client.encode("BAAI/bge-m3", { text: "Hello world" });
  * console.log(result.dense); // Float32Array
  *
  * // Batch encode
- * const results = await client.encode("bge-m3", [
+ * const results = await client.encode("BAAI/bge-m3", [
  *   { text: "First document" },
  *   { text: "Second document" },
  * ]);
@@ -50,6 +50,7 @@ export type {
   JobChunk,
   JobSubmitResult,
   JobStatus,
+  JobItemErrorDetail,
   JobResultItem,
   JobResults,
 } from "./jobs.js";
@@ -79,7 +80,12 @@ export type {
   ModelCapabilities,
   ModelDims,
   ModelInfo,
+  ModelLoadError,
   ModelState,
+  PendingGeneration,
+  PendingGenerationGroup,
+  ProfileInfo,
+  WireModelInfo,
   WorkerInfo,
   CapacityInfo,
   ClusterSummary,
@@ -128,6 +134,7 @@ export type {
   StreamGenerateOptions,
   GenerateResult,
   // Streaming generate (SSE)
+  GenerationChunkError,
   GenerateChunk,
   // Chat completions (OpenAI-compatible)
   ChatMessage,
@@ -178,6 +185,14 @@ export {
   SIEStreamError,
   InputTooLongError,
   EstimateUnroutableError,
+  IncompleteBatchError,
+  JobFailedError,
+  MalformedChunkError,
+  RateLimitError,
+  InsufficientCreditsError,
+  SpendLimitError,
+  AccountInactiveError,
+  AccountStateUnavailableError,
 } from "./errors.js";
 
 // Client-side scoring (MaxSim for ColBERT-style models)

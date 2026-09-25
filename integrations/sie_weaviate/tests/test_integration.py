@@ -6,7 +6,7 @@ Run with: pytest -m integration integrations/sie_weaviate/tests/
 
 Prerequisites:
     # SIE server
-    mise run serve -d cpu -p 8080
+    mise run serve -- -d cpu -p 8080
 
     # Weaviate (Docker)
     docker run -d -p 8090:8080 -p 50051:50051 \

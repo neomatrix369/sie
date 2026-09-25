@@ -1,6 +1,6 @@
 [package]
 name = "sie-gateway"
-version = "0.7.1"
+version = "0.8.2"
 edition = "2021"
 publish = false
 
@@ -35,6 +35,7 @@ dashmap = "6"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors"] }
 bytes = "1"
+http = "1"
 
 # Phase 4: Model registry + hot reload
 arc-swap = "1"
@@ -73,6 +74,10 @@ percent-encoding = "2"
 # Cloud payload store backends (opt-in)
 object_store = { version = "0.14", optional = true, features = ["aws", "gcp", "azure"] }
 url = { version = "2", optional = true }
+reqsign-aliyun-oss = { version = "=3.1.5", optional = true }
+reqsign-core = { version = "=3.3.1", optional = true }
+reqsign-file-read-tokio = { version = "=3.0.6", optional = true }
+reqsign-http-send-reqwest = { version = "=4.0.6", optional = true }
 utoipa = "5.4.0"
 
 # W3C Trace Context propagation. The gateway extracts the
@@ -116,7 +121,14 @@ tracing-opentelemetry = "0.33"
 
 [features]
 default = []
-cloud-storage = ["dep:object_store", "dep:url"]
+cloud-storage = [
+    "dep:object_store",
+    "dep:reqsign-aliyun-oss",
+    "dep:reqsign-core",
+    "dep:reqsign-file-read-tokio",
+    "dep:reqsign-http-send-reqwest",
+    "dep:url",
+]
 # Test-target-only seam used by the managed composition's release telemetry
 # benchmark. It installs a synchronous in-memory reader, so the timed path
 # exercises the real facade without exporter network or background work.
@@ -130,7 +142,6 @@ raw-routing-logs = []
 
 [dev-dependencies]
 tempfile = "3"
-http = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 # `testing` unlocks the in-memory metric exporter used to assert the gateway's
