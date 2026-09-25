@@ -8,14 +8,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
-import msgpack
 import msgspec
 import yaml
+from sie_sdk._msgpack import packb as pack_msgpack
 
+from sie_server.adapters.errors import InputTooLongError
 from sie_server.api.ws import compute_bundle_config_hash_cached
 from sie_server.config.model import ModelConfig
 from sie_server.core.encode_pipeline import EncodePipeline, resolve_encode_output_types
-from sie_server.core.extract_cost import build_extract_prepared_items
+from sie_server.core.extract_cost import (
+    adapter_extract_item_costs,
+    build_extract_prepared_items,
+    output_schema_shape_error,
+)
 from sie_server.core.oom import is_oom_error
 from sie_server.core.prepared import AudioPayload, AudioPreparedItem
 from sie_server.core.registry import ModelRegistry
@@ -24,6 +29,7 @@ from sie_server.core.score_cost import build_score_prepared_items_timed
 from sie_server.core.timing import RequestTiming
 from sie_server.core.worker.handlers.extract import ExtractHandler
 from sie_server.core.worker.model_worker import PreformedExtractRequest, PreformedScoreRequest
+from sie_server.core.worker.types import WorkerDrainedError
 from sie_server.ipc_types import (
     ApplyModelConfigRequest,
     ApplyModelConfigResponse,
@@ -857,7 +863,7 @@ class QueueExecutor:
 
     @staticmethod
     def _options_key(options: dict[str, Any] | None) -> bytes:
-        return msgpack.packb(options, use_bin_type=True) if options else b""
+        return pack_msgpack(options, use_bin_type=True) if options else b""
 
     @staticmethod
     def _batch_profile(items: list[Any]) -> str:
@@ -926,7 +932,7 @@ class QueueExecutor:
             # rejects it just like the HTTP ingress. Only an absent value
             # receives the public dense default.
             output_types = tuple(bi.output_types) if bi.output_types is not None else ("dense",)
-            options_key = msgpack.packb(bi.options, use_bin_type=True) if bi.options else b""
+            options_key = pack_msgpack(bi.options, use_bin_type=True) if bi.options else b""
             key = (
                 output_types,
                 bi.instruction,
@@ -999,7 +1005,7 @@ class QueueExecutor:
         server_items: list[Item] = []
         for bi in group:
             try:
-                server_items.append(decode_item(bi.item))
+                server_items.append(decode_item(bi.item, f"items[{bi.item_index}]"))
             except (msgspec.ValidationError, InvalidMediaError) as decode_exc:
                 outcomes[bi.work_item_id] = _inference_exception_outcome(bi, decode_exc)
                 continue
@@ -1146,7 +1152,7 @@ class QueueExecutor:
                         item_id = server_items[idx].id
                         if item_id is not None:
                             output = {"id": item_id, **output}
-                        result_msgpack = msgpack.packb(output, use_bin_type=True)
+                        result_msgpack = pack_msgpack(output, use_bin_type=True)
                     outcomes[bi.work_item_id] = ItemOutcome(
                         work_item_id=bi.work_item_id,
                         request_id=bi.request_id,
@@ -1325,8 +1331,8 @@ class QueueExecutor:
         for bi in req.items:
             try:
                 options = merge_runtime_options(config, bi.options)
-                query_item = decode_item(bi.query_item)
-                score_items = [decode_item(it) for it in bi.score_items]
+                query_item = decode_item(bi.query_item, "query")
+                score_items = [decode_item(it, f"items[{index}]") for index, it in enumerate(bi.score_items)]
 
                 prepared_items, timing = build_score_prepared_items_timed(query_item, score_items)
 
@@ -1421,8 +1427,20 @@ class QueueExecutor:
 
         for bi in req.items:
             try:
+                # Reject before the worker walks the schema to build its
+                # batching key (same bound as the HTTP ExtractParams check).
+                if bi.output_schema is not None and (schema_error := output_schema_shape_error(bi.output_schema)):
+                    raise InvalidInputError(schema_error)
                 options = merge_runtime_options(config, bi.options)
-                server_item = decode_item(bi.item)
+                # Same precedence as the HTTP extract path: the request's own
+                # instruction, else one from the options (profile defaults
+                # included).
+                instruction = bi.instruction if bi.instruction is not None else options.get("instruction")
+                if instruction is not None and not isinstance(instruction, str):
+                    raise InvalidInputError("instruction must be a string")
+                # Also rejects an item over the text size bound (as the HTTP
+                # ExtractRequest does) before any cost estimate or adapter sees it.
+                server_item = decode_item(bi.item, f"items[{bi.item_index}]")
                 timing = RequestTiming()
                 timing.start_tokenization()
                 if bi.prepared_audio is not None:
@@ -1463,14 +1481,23 @@ class QueueExecutor:
                             model_id,
                             [server_item],
                             config,
-                            instruction=bi.instruction,
+                            instruction=instruction,
                             task=task,
                         )
                         prepared_items = prepared_batch.items
                     else:
                         # Batching proxy only; authoritative text/page billing
                         # comes from the adapter's ExtractOutput unit counts.
-                        prepared_items = build_extract_prepared_items([server_item])
+                        # The sidecar sizes queue batches (cost 1 per extract item); this cost does not.
+                        item_costs = adapter_extract_item_costs(
+                            extract_adapter,
+                            [server_item],
+                            labels=bi.labels,
+                            output_schema=bi.output_schema,
+                            instruction=instruction,
+                            options=options,
+                        )
+                        prepared_items = build_extract_prepared_items([server_item], item_costs=item_costs)
                 timing.end_tokenization()
 
                 lora = self._extract_lora(options)
@@ -1480,7 +1507,7 @@ class QueueExecutor:
                         items=[server_item],
                         labels=bi.labels,
                         output_schema=bi.output_schema,
-                        instruction=bi.instruction,
+                        instruction=instruction,
                         options=options,
                         request_id=bi.request_id,
                         timing=timing,
@@ -1943,7 +1970,7 @@ def _extract_success_outcome(
         # error instead of publishing an object the client reads as success.
         return _error_outcome(bi, _INFERENCE_ERROR_CODE, "adapter returned no extraction results")
     item_id = server_item.id if server_item.id is not None else f"item-{bi.item_index}"
-    result_msgpack = msgpack.packb({**extraction_results[0], "id": item_id}, use_bin_type=True)
+    result_msgpack = pack_msgpack({**extraction_results[0], "id": item_id}, use_bin_type=True)
 
     return ItemOutcome(
         work_item_id=bi.work_item_id,
@@ -1991,6 +2018,18 @@ def _inference_exception_outcome(
 ) -> ItemOutcome:
     if is_oom_error(exc):
         return _oom_nak_outcome(bi)
+    if isinstance(exc, WorkerDrainedError):
+        # The model was evicted before this item ran. Same answer as the
+        # "model evicted mid-batch" checks above: NAK so the work is
+        # redelivered, rather than publishing a terminal ``inference_error``
+        # for work that never started. The sidecar's preformed path does not
+        # park items in a batcher today, so this arm is a contract guard
+        # against a future caller that submits through the queueing path.
+        return _nak_outcome(bi)
+    if isinstance(exc, InputTooLongError):
+        # The input exceeds the model's window: INPUT_TOO_LONG (HTTP 400), as
+        # the HTTP path reports it, not a server-side inference failure.
+        return _error_outcome(bi, ErrorCode.INPUT_TOO_LONG.value, str(exc))
     if isinstance(exc, (InvalidInputError, msgspec.ValidationError)):
         # A typed-decode failure (decode_item) or a media contract violation;
         # both surface as INVALID_INPUT (HTTP 400), matching the HTTP path.

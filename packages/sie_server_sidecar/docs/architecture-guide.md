@@ -15,8 +15,6 @@ gateway -> NATS JetStream -> worker-sidecar -> UDS IPC -> worker backend
 
 References:
 
-- [Worker runtime](../../../product/design/worker-runtime.md)
-- [Deployment topologies](../../../product/design/deployment-topologies.md)
 - [Gateway architecture guide](../../sie_gateway/docs/architecture-guide.md)
 - [Sidecar README](../README.md)
 
@@ -231,7 +229,7 @@ The Rust and Python protocol copies define the same method names:
 - `ReplaceModelConfigs`
 - `Drain`
 
-`tools/ci/check_ipc_types_parity.py` checks the Rust protocol schema against
+`tools/check_ipc_types_parity.py` checks the Rust protocol schema against
 `packages/sie_server/src/sie_server/ipc_types.py`.
 
 Non-streaming backend responses use one physical frame while the serialized
@@ -317,6 +315,12 @@ Local filesystem payload resolution is a Linux worker capability: the sidecar
 pins the configured directory and uses `openat2` without symlink traversal.
 Non-Linux hosts, kernels older than 5.6, and sandboxes that block `openat2` fail
 closed; cloud object-store payload resolution is unaffected.
+
+Alibaba `oss://` payload references use a native region-scoped Signature V4
+client. It accepts only a safe plain key or the exact full reference below the
+configured bucket/prefix, derives the public or VPC-internal HTTPS endpoint from
+`SIE_OSS_REGION`, and authenticates with explicit environment credentials or
+ACK RRSA OIDC. ECS metadata and file/profile credential sources are absent.
 
 The backend retokenizes when prepared tokens are absent or the tokenizer hash
 does not match. Score pair construction stays backend-owned. Extract
@@ -452,6 +456,6 @@ Source: [`config_subscriber.rs`](../src/config_subscriber.rs),
 - Package summary: [README](../README.md)
 - Helm values: [`deploy/helm/sie-cluster/values.yaml`](../../../deploy/helm/sie-cluster/values.yaml)
 - Runtime config parsing: [`config.rs`](../src/config.rs) and [`main.rs`](../src/main.rs)
-- IPC schema parity check: [`tools/ci/check_ipc_types_parity.py`](../../../tools/ci/check_ipc_types_parity.py)
-- response-chunk v1 envelope/limit pin: [`tools/ci/check_response_chunk_protocol.py`](../../../tools/ci/check_response_chunk_protocol.py)
+- IPC schema parity check: [`tools/check_ipc_types_parity.py`](../../../tools/check_ipc_types_parity.py)
+- response-chunk v1 envelope/limit pin: [`tools/check_response_chunk_protocol.py`](../../../tools/check_response_chunk_protocol.py)
 - Gateway queue contract: [gateway architecture guide](../../sie_gateway/docs/architecture-guide.md)

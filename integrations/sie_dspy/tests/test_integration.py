@@ -6,7 +6,7 @@ of DSPy workflows using SIE components.
 Run with: pytest -m integration integrations/sie_dspy/tests/
 
 Prerequisites:
-    mise run serve -d cpu -p 8080
+    mise run serve -- -d cpu -p 8080
 
 DSPy Use Cases Demonstrated:
 - RAG pipelines with optimizable components

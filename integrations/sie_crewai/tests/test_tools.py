@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from sie_crewai import SIEExtractorTool, SIERerankerTool, SIESparseEmbedder
 
 
@@ -49,6 +51,72 @@ class TestSIERerankerTool:
 
         # Should return all documents
         assert result.count("[Score:") == len(research_documents)
+
+    def test_rerank_maps_scores_by_item_id(self, mock_sie_client: object) -> None:
+        """Top-ranked document is the relevant one, scores mapped by item_id."""
+        documents = ["alpha", "bravo", "charlie", "delta", "echo"]
+        # Ranked entries reference input positions via item_id (delta = index 3
+        # is most relevant), out of input order.
+        mock_sie_client.score = MagicMock(
+            return_value={
+                "model": "test-reranker",
+                "scores": [
+                    {"item_id": "3", "score": 0.9, "rank": 0},
+                    {"item_id": "1", "score": 0.7, "rank": 1},
+                    {"item_id": "4", "score": 0.5, "rank": 2},
+                    {"item_id": "0", "score": 0.3, "rank": 3},
+                    {"item_id": "2", "score": 0.1, "rank": 4},
+                ],
+            }
+        )
+        reranker = SIERerankerTool(model="test-reranker")
+        reranker._client = mock_sie_client
+
+        result = reranker._run(query="query", documents=documents)
+
+        # Ranked most-relevant first: delta, bravo, echo, alpha, charlie.
+        assert (
+            result.index("delta")
+            < result.index("bravo")
+            < result.index("echo")
+            < result.index("alpha")
+            < result.index("charlie")
+        )
+        assert "[Score: 0.9000] delta" in result
+        # All five documents are represented (no duplication or loss).
+        assert all(doc in result for doc in documents)
+
+    def test_rerank_skips_malformed_item_id(self, mock_sie_client: object) -> None:
+        """Malformed item_ids are skipped (no crash, no misassignment)."""
+        documents = ["alpha", "bravo", "charlie"]
+        # Only item_id "1" (bravo) is usable; the rest are malformed. The float
+        # 1.5 and bool True come after the valid "1": if int() accepted them
+        # (int(1.5) == 1, int(True) == 1) they would overwrite bravo's score.
+        mock_sie_client.score = MagicMock(
+            return_value={
+                "model": "test-reranker",
+                "scores": [
+                    {"item_id": "1", "score": 0.8, "rank": 0},
+                    {"item_id": "not-an-int", "score": 0.95, "rank": 1},
+                    {"item_id": "-1", "score": 0.9, "rank": 2},
+                    {"item_id": "99", "score": 0.7, "rank": 3},
+                    {"score": 0.5, "rank": 4},
+                    {"item_id": 1.5, "score": 0.99, "rank": 5},
+                    {"item_id": True, "score": 0.98, "rank": 6},
+                ],
+            }
+        )
+        reranker = SIERerankerTool(model="test-reranker")
+        reranker._client = mock_sie_client
+
+        result = reranker._run(query="query", documents=documents)
+
+        # All three documents represented, none dropped or duplicated.
+        assert result.count("[Score:") == 3
+        assert "[Score: 0.8000] bravo" in result
+        # bravo (the only scored doc) ranks first.
+        assert result.index("bravo") < result.index("alpha")
+        assert result.index("bravo") < result.index("charlie")
 
     def test_custom_model(self, mock_sie_client: object, research_documents: list[str]) -> None:
         """Test using a custom reranker model."""

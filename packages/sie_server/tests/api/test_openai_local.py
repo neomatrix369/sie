@@ -7,13 +7,17 @@ by ``mise run mac-smoke`` on Apple Silicon.
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import cv2
 import httpx
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -22,6 +26,11 @@ from sie_server.adapters.mlx.generation import MLXGenerationAdapter
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
 from sie_server.api import openai_local
 from sie_server.api.openai_local import _validate_mlx_seed, router
+from sie_server.core import video_frames
+from sie_server.core.inference_output import ScoreOutput
+from sie_server.core.timing import RequestTiming
+from sie_server.core.worker import WorkerResult
+from sie_server.types.inputs import MAX_ITEM_TEXT_BYTES
 
 _GEMMA_OPEN = "<" + "|channel" + ">" + "thought\n"
 _GEMMA_CLOSE = "<" + "channel|" + ">"
@@ -57,6 +66,7 @@ def _cuda_chat_client(
     default_sampling: dict[str, Any] | None = None,
     max_output_tokens: int = 64,
     server_url: str = "http://127.0.0.1:30400",
+    video: bool = False,
 ) -> tuple[TestClient, MagicMock]:
     adapter = SGLangGenerationAdapter(
         model_name_or_path="upstream/repo",
@@ -78,6 +88,7 @@ def _cuda_chat_client(
     config = SimpleNamespace(
         tasks=SimpleNamespace(generate=generate_task, score=None),
         resolve_profile=MagicMock(return_value=profile),
+        inputs=SimpleNamespace(video=video),
     )
     registry = MagicMock()
     registry.device = "cuda:0"
@@ -156,13 +167,13 @@ def test_chat_requires_object_body() -> None:
 def test_chat_requires_model() -> None:
     r = _client().post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "model"
+    assert r.json()["error"]["param"] == "model"
 
 
 def test_chat_requires_nonempty_messages() -> None:
     r = _client().post("/v1/chat/completions", json={"model": "m", "messages": []})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "messages"
+    assert r.json()["error"]["param"] == "messages"
 
 
 @pytest.mark.parametrize(
@@ -185,7 +196,7 @@ def test_chat_rejects_malformed_message_structure_before_model_load(
     response = client.post("/v1/chat/completions", json={"model": "Qwen/Qwen3.5-4B", "messages": messages})
 
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == param
+    assert response.json()["error"]["param"] == param
     registry.get_config.assert_not_called()
     registry.get.assert_not_called()
 
@@ -199,14 +210,39 @@ def test_chat_rejects_non_generation_model_before_load() -> None:
         "/v1/chat/completions", json={"model": "embed-model", "messages": [{"role": "user", "content": "hi"}]}
     )
     assert r.status_code == 400
-    assert "generation" in r.json()["detail"]["message"].lower()
+    assert "generation" in r.json()["error"]["message"].lower()
 
 
 def test_chat_rejects_non_bool_stream() -> None:
     msgs = [{"role": "user", "content": "hi"}]
     r = _client().post("/v1/chat/completions", json={"model": "m", "messages": msgs, "stream": "false"})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "stream"
+    assert r.json()["error"]["param"] == "stream"
+
+
+def test_chat_rejects_unsupported_streaming_before_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("unsupported streaming must not reach the child"),
+    )
+    generate_task = registry.get_config.return_value.tasks.generate
+    generate_task.capabilities = SimpleNamespace(streaming=False)
+    registry.is_loaded.return_value = False
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "Qwen/Qwen3.5-4B",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_field"
+    assert response.json()["error"]["param"] == "stream"
+    registry.start_load_async.assert_not_called()
+    registry.get.assert_not_called()
 
 
 def test_chat_rejects_invalid_max_tokens() -> None:
@@ -214,7 +250,7 @@ def test_chat_rejects_invalid_max_tokens() -> None:
     for bad in (0, -5, "100", True):
         r = _client().post("/v1/chat/completions", json={"model": "m", "messages": msgs, "max_tokens": bad})
         assert r.status_code == 400, bad
-        assert r.json()["detail"]["param"] == "max_tokens"
+        assert r.json()["error"]["param"] == "max_tokens"
 
 
 @pytest.mark.parametrize(
@@ -231,10 +267,11 @@ def test_chat_rejects_invalid_seed(bad: object, message: str) -> None:
     msgs = [{"role": "user", "content": "hi"}]
     r = _client().post("/v1/chat/completions", json={"model": "m", "messages": msgs, "seed": bad})
     assert r.status_code == 400, bad
-    assert r.json()["detail"] == {
+    assert r.json()["error"] == {
         "code": "INVALID_INPUT",
         "message": message,
         "param": "seed",
+        "type": "invalid_request_error",
     }
 
 
@@ -369,10 +406,11 @@ def test_mlx_chat_rejects_child_process_controls_before_model_load(
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == {
+    assert response.json()["error"] == {
         "code": "unsupported_field",
         "message": "field 'draft_model' is not supported",
         "param": "draft_model",
+        "type": "invalid_request_error",
     }
     registry.is_loaded.assert_not_called()
     registry.get.assert_not_called()
@@ -407,8 +445,8 @@ def test_chat_rejects_unbounded_template_kwargs_before_model_load(
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["code"] == code
-    assert response.json()["detail"]["param"] == "chat_template_kwargs"
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["param"] == "chat_template_kwargs"
     registry.is_loaded.assert_not_called()
     registry.get.assert_not_called()
 
@@ -805,10 +843,11 @@ def test_cuda_chat_rejects_engine_control_and_output_above_model_cap(
         json={"model": "Qwen/Qwen3.5-4B", "messages": messages, "routed_dp_rank": 2},
     )
     assert response.status_code == 400
-    assert response.json()["detail"] == {
+    assert response.json()["error"] == {
         "code": "unsupported_field",
         "message": "field 'routed_dp_rank' is not supported",
         "param": "routed_dp_rank",
+        "type": "invalid_request_error",
     }
 
     response = client.post(
@@ -816,7 +855,7 @@ def test_cuda_chat_rejects_engine_control_and_output_above_model_cap(
         json={"model": "Qwen/Qwen3.5-4B", "messages": messages, "max_completion_tokens": 33},
     )
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == "max_completion_tokens"
+    assert response.json()["error"]["param"] == "max_completion_tokens"
 
 
 def test_mlx_chat_rejects_output_above_model_cap(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -837,7 +876,7 @@ def test_mlx_chat_rejects_output_above_model_cap(monkeypatch: pytest.MonkeyPatch
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == "max_completion_tokens"
+    assert response.json()["error"]["param"] == "max_completion_tokens"
 
 
 def test_cuda_chat_rejects_remote_media_before_model_load(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -865,7 +904,231 @@ def test_cuda_chat_rejects_remote_media_before_model_load(monkeypatch: pytest.Mo
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"]["param"] == "messages[0].content[1].image_url"
+    assert response.json()["error"]["param"] == "messages[0].content[1].image_url"
+    registry.get.assert_not_called()
+
+
+def _video_data_uri(tmp_path: Path, *, width: int = 64, height: int = 48, frames: int = 6) -> str:
+    path = tmp_path / "clip.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (width, height))
+    for index in range(frames):
+        writer.write(np.full((height, width, 3), index * 40, dtype=np.uint8))
+    writer.release()
+    return "data:video/mp4;base64," + base64.b64encode(path.read_bytes()).decode()
+
+
+def _video_messages(video_url: Any, *, parts: int = 1) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [{"type": "text", "text": "What happens first?"}]
+    content += [{"type": "video_url", "video_url": video_url} for _ in range(parts)]
+    return [{"role": "user", "content": content}]
+
+
+def test_cuda_chat_forwards_inline_video_unchanged(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-video",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "upstream-served-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "A ball rolls."},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    client, _ = _cuda_chat_client(monkeypatch, _handler, video=True)
+    messages = _video_messages({"url": _video_data_uri(tmp_path)})
+    response = client.post("/v1/chat/completions", json={"model": "Qwen/Qwen3.5-4B", "messages": messages})
+
+    assert response.status_code == 200
+    assert seen["body"]["messages"] == messages
+
+
+def test_cuda_chat_rejects_video_for_model_without_video_input(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("video request must not reach upstream"),
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": _video_messages({"url": _video_data_uri(tmp_path)})},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_field"
+    assert response.json()["error"]["param"] == "messages"
+    registry.get.assert_not_called()
+
+
+def test_mlx_chat_rejects_video(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    client, registry = _mlx_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("video request must not reach upstream"),
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    registry.get_config.return_value.inputs = SimpleNamespace(video=True)
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": _video_messages({"url": _video_data_uri(tmp_path)})},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_field"
+    registry.get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "video_url",
+    [
+        {"url": "https://example.com/clip.mp4"},
+        {"url": "http://169.254.169.254/latest/meta-data/"},
+        "file:///etc/passwd",
+        {"url": "data:image/png;base64,iVBORw0KGgo="},
+        {"url": "data:video/mp4,AAAA"},
+        {"url": "data:video/mp4;base64"},
+        {"url": "data:video/mp4;base64,not base64!"},
+        {"url": "data:video/mp4;base64,"},
+        {"url": ""},
+        {},
+        "data:video/mp4;base64,AAAAGGZ0eXBpc29t",
+        {"url": "data:video/mp4;base64,AAAAGGZ0eXBpc29t", "max_dynamic_patch": 64},
+        {"url": "data:video/mp4;base64, AAAAGGZ0eXBpc29t"},
+        {
+            "url": "data:video/mp4;base64,"
+            + base64.b64encode(b"#EXTM3U\n#EXTINF:10,\nhttp://169.254.169.254/a.ts\n").decode()
+        },
+        {"url": "data:video/mp4;base64,AAAA"},
+        {"url": "data:video/;base64,AAAAGGZ0eXBpc29t"},
+    ],
+)
+def test_cuda_chat_rejects_invalid_video_before_model_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    video_url: Any,
+) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("invalid video must not reach upstream"),
+        video=True,
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": _video_messages(video_url)},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "messages[0].content[1].video_url"
+    registry.get_config.assert_not_called()
+    registry.get.assert_not_called()
+
+
+def test_cuda_chat_rejects_oversized_video_before_decoding(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    video = _video_data_uri(tmp_path)
+    monkeypatch.setattr(openai_local, "MAX_VIDEO_BYTES", 8)
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("oversized video must not reach upstream"),
+        video=True,
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": _video_messages({"url": video})},
+    )
+
+    assert response.status_code == 400
+    assert "video too large" in response.json()["error"]["message"]
+    registry.get.assert_not_called()
+
+
+def test_cuda_chat_rejects_second_video_part(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("second video must not reach upstream"),
+        video=True,
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": _video_messages({"url": _video_data_uri(tmp_path)}, parts=2)},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "messages[0].content[2].video_url"
+    registry.get_config.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("limit", "value", "message"),
+    [
+        ("MAX_GENERATION_VIDEO_FRAME_PIXELS", 64 * 47, "exceeds the 3008-pixel frame limit"),
+        ("MAX_VIDEO_DURATION_S", 0.1, "admission cap"),
+        ("MAX_GENERATION_VIDEO_FRAMES", 5, "frame cap"),
+        ("MAX_GENERATION_VIDEO_FPS", 5.0, "fps cap"),
+    ],
+)
+def test_cuda_chat_rejects_video_over_decode_bounds_before_model_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    limit: str,
+    value: float,
+    message: str,
+) -> None:
+    monkeypatch.setattr(video_frames, limit, value)
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("unbounded video must not reach upstream"),
+        video=True,
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": _video_messages({"url": _video_data_uri(tmp_path)})},
+    )
+
+    assert response.status_code == 400
+    assert message in response.json()["error"]["message"]
+    assert response.json()["error"]["param"] == "messages[0].content[1].video_url"
+    registry.get.assert_not_called()
+
+
+def test_cuda_chat_rejects_undecodable_video_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("undecodable video must not reach upstream"),
+        video=True,
+    )
+    garbage = base64.b64encode(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 64).decode()
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": _video_messages({"url": f"data:video/mp4;base64,{garbage}"})},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "messages[0].content[1].video_url"
+    registry.get.assert_not_called()
+
+
+def test_cuda_chat_still_rejects_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("audio must not reach upstream"),
+        video=True,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "audio_url", "audio_url": {"url": "data:audio/wav;base64,UklGRg=="}}],
+        }
+    ]
+    response = client.post("/v1/chat/completions", json={"model": "Qwen/Qwen3.5-4B", "messages": messages})
+
+    assert response.status_code == 400
     registry.get.assert_not_called()
 
 
@@ -924,13 +1187,13 @@ def test_cuda_chat_preserves_visible_logprobs_when_reasoning_is_null(
 def test_rerank_requires_model() -> None:
     r = _client().post("/v1/rerank", json={"query": "q", "documents": ["a"]})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "model"
+    assert r.json()["error"]["param"] == "model"
 
 
 def test_rerank_requires_query() -> None:
     r = _client().post("/v1/rerank", json={"model": "m", "documents": ["a"]})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "query"
+    assert r.json()["error"]["param"] == "query"
 
 
 def test_rerank_rejects_blank_model_and_query() -> None:
@@ -940,37 +1203,200 @@ def test_rerank_rejects_blank_model_and_query() -> None:
     ]:
         r = _client().post("/v1/rerank", json=body)
         assert r.status_code == 400
-        assert r.json()["detail"]["param"] == param
+        assert r.json()["error"]["param"] == param
 
 
 def test_rerank_requires_nonempty_string_documents() -> None:
     for docs in ([], "not-a-list", [1, 2], ["ok", 3], ["   "]):
         r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": docs})
         assert r.status_code == 400, docs
-        assert r.json()["detail"]["param"] == "documents"
+        assert r.json()["error"]["param"] == "documents"
 
 
 def test_rerank_top_n_must_be_positive_int() -> None:
     for bad in (0, -1, "3", True):
         r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"], "top_n": bad})
         assert r.status_code == 400, bad
-        assert r.json()["detail"]["param"] == "top_n"
+        assert r.json()["error"]["param"] == "top_n"
 
 
 def test_rerank_rejects_too_many_documents() -> None:
     docs = ["d"] * (openai_local._MAX_RERANK_DOCS + 1)
     r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": docs})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "documents"
+    assert r.json()["error"]["param"] == "documents"
+
+
+def test_rerank_rejects_texts_over_the_item_text_cap() -> None:
+    long_text = "x" * (MAX_ITEM_TEXT_BYTES + 1)
+    for body, param, field in [
+        ({"model": "m", "query": long_text, "documents": ["a"]}, "query", "query"),
+        ({"model": "m", "query": "q", "documents": ["a", long_text]}, "documents", "documents[1]"),
+    ]:
+        r = _client().post("/v1/rerank", json=body)
+        assert r.status_code == 400, field
+        error = r.json()["error"]
+        assert error["param"] == param
+        assert error["code"] == "INVALID_INPUT"
+        assert error["message"] == f"Field '{field}' must hold at most {MAX_ITEM_TEXT_BYTES} bytes of UTF-8 text"
 
 
 def test_rerank_rejects_non_bool_return_documents() -> None:
     r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"], "return_documents": "true"})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "return_documents"
+    assert r.json()["error"]["param"] == "return_documents"
 
 
 def test_rerank_rejects_unknown_fields() -> None:
     r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"], "priority": 1})
     assert r.status_code == 400
-    assert r.json()["detail"]["param"] == "priority"
+    assert r.json()["error"]["param"] == "priority"
+
+
+# -- top-level OpenAI error envelope (no {"detail": ...} wrapper) -------------
+
+
+def test_chat_unknown_model_returns_top_level_openai_error() -> None:
+    client = _client()
+    client.app.state.registry.has_model.return_value = False
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "missing-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 404
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "MODEL_NOT_FOUND"
+    assert error["type"] == "invalid_request_error"
+    assert "message" in error
+
+
+def test_chat_invalid_input_returns_top_level_openai_error() -> None:
+    r = _client().post("/v1/chat/completions", json={"model": "m", "messages": []})
+    assert r.status_code == 400
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["param"] == "messages"
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "INVALID_INPUT"
+    assert "message" in error
+
+
+def test_chat_unloading_model_returns_top_level_openai_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, registry = _cuda_chat_client(
+        monkeypatch,
+        lambda _request: pytest.fail("unloading model must not reach upstream"),
+    )
+    registry.is_unloading.return_value = True
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "Qwen/Qwen3.5-4B", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert r.status_code == 503
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "MODEL_NOT_LOADED"
+    assert error["type"] == "server_error"
+    assert "message" in error
+
+
+def _rerank_client() -> tuple[TestClient, MagicMock]:
+    """Rerank client whose registry passes all model-state checks."""
+    profile = SimpleNamespace(runtime={}, loadtime={})
+    config = SimpleNamespace(
+        tasks=SimpleNamespace(generate=None, score=SimpleNamespace()),
+        resolve_profile=MagicMock(return_value=profile),
+    )
+    registry = MagicMock()
+    registry.device = "cpu"
+    registry.has_model.return_value = True
+    registry.get_config.return_value = config
+    registry.is_failed.return_value = False
+    registry.is_unloading.return_value = False
+    registry.is_loading.return_value = False
+    registry.is_loaded.return_value = True
+    client = _client()
+    client.app.state.registry = registry
+    return client, registry
+
+
+def test_rerank_unknown_model_returns_top_level_openai_error() -> None:
+    client = _client()
+    client.app.state.registry.has_model.return_value = False
+    r = client.post("/v1/rerank", json={"model": "missing-model", "query": "q", "documents": ["a"]})
+    assert r.status_code == 404
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "MODEL_NOT_FOUND"
+    assert error["type"] == "invalid_request_error"
+    assert "message" in error
+
+
+def test_rerank_invalid_input_returns_top_level_openai_error() -> None:
+    r = _client().post("/v1/rerank", json={"model": "m", "query": "q", "documents": []})
+    assert r.status_code == 400
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["param"] == "documents"
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "INVALID_INPUT"
+    assert "message" in error
+
+
+def test_rerank_inference_error_returns_top_level_openai_500() -> None:
+    client, registry = _rerank_client()
+
+    async def _boom() -> None:
+        raise RuntimeError("sensitive reranker detail")
+
+    worker = MagicMock()
+    worker.submit_score = AsyncMock(return_value=_boom())
+    registry.start_worker = AsyncMock(return_value=worker)
+
+    r = client.post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a"]})
+    assert r.status_code == 500
+    body = r.json()
+    assert "detail" not in body
+    error = body["error"]
+    assert error["code"] == "inference_error"
+    assert error["type"] == "server_error"
+    assert error["message"] == "internal error during reranking"
+    assert "sensitive reranker detail" not in r.text
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_rerank_non_finite_scores_return_top_level_openai_500(bad: float) -> None:
+    """NaN/inf model scores fail closed as an enveloped 500 naming the model.
+
+    Regression for pass-2 audit A2: on this JSON-only surface a NaN score
+    crashed json.dumps ("Out of range float values are not JSON compliant")
+    into a bare, un-enveloped 500 with no OpenAI error object.
+    """
+    client, registry = _rerank_client()
+
+    async def _result() -> WorkerResult:
+        return WorkerResult(
+            output=ScoreOutput(scores=np.array([0.9, bad], dtype=np.float32)),
+            timing=RequestTiming(),
+        )
+
+    worker = MagicMock()
+    worker.submit_score = AsyncMock(return_value=_result())
+    registry.start_worker = AsyncMock(return_value=worker)
+
+    r = client.post("/v1/rerank", json={"model": "m", "query": "q", "documents": ["a", "b"]})
+    assert r.status_code == 500
+    body = r.json()
+    assert "detail" not in body  # enveloped OpenAI error, not FastAPI's {"detail": ...}
+    error = body["error"]
+    assert error["code"] == "INFERENCE_ERROR"
+    assert error["type"] == "server_error"
+    assert "m" in error["message"]
+    assert "non-finite" in error["message"]

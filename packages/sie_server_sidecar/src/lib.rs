@@ -23,6 +23,8 @@ pub mod local_ingest;
 pub mod log_util;
 pub mod nats_consumer;
 pub mod observability;
+#[cfg(feature = "cloud-storage")]
+pub mod oss_payload_store;
 pub mod output;
 pub mod payload_store;
 pub mod pinned_reconciler;

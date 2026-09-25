@@ -1819,7 +1819,9 @@ class TestVisionTextTokenStamp:
         # still derives its per-text counts from the shared base counter over
         # the processor tokenizer (the real metering path), returning matching
         # zero vectors; the image tower returns zero vectors.
-        adapter._encode_image_items = lambda items: np.zeros((len(items), 4), dtype=np.float32)  # type: ignore[method-assign]
+        adapter._encode_image_items = lambda items, item_indices: np.zeros(  # type: ignore[method-assign]
+            (len(items), 4), dtype=np.float32
+        )
 
         def fake_encode_texts(texts: list[str]) -> tuple[Any, list[int] | None]:
             counts = adapter._token_counts_or_none(adapter._processor.tokenizer, list(texts), expected_len=len(texts))

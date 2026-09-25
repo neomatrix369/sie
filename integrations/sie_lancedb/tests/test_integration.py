@@ -6,7 +6,7 @@ of LanceDB workflows using SIE embeddings, reranking, and extraction.
 Run with: pytest -m integration integrations/sie_lancedb/tests/
 
 Prerequisites:
-    mise run serve -d cpu -p 8080
+    mise run serve -- -d cpu -p 8080
 """
 
 from __future__ import annotations

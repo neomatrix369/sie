@@ -1,6 +1,6 @@
 # SIE Gateway (Rust)
 
-Runtime gateway for elastic GPU inference deployments. It routes the four SIE primitives: `encode`, `score`, and `extract` over NATS JetStream (queue transport, at-least-once delivery), plus OpenAI-compatible and SIE-native **generation** endpoints (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/generate/{model}`) over direct-dispatch per-worker streams with cache-aware prefix routing. The gateway also owns pool coordination and worker health. Config writes live in `sie-config`; the gateway is a pure consumer of config state, bootstrapping from `GET /v1/configs/export` and subscribing to NATS deltas.
+Runtime gateway for elastic GPU inference deployments. It routes the four SIE primitives over NATS JetStream: ordinary `encode`, `score`, and `extract` requests use pool queues (at-least-once delivery), while capped logical batch pools may target an assigned worker directly. OpenAI-compatible and SIE-native **generation** endpoints (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/generate/{model}`) use per-worker direct-dispatch subjects with cache-aware prefix routing. The gateway also owns pool coordination and worker health. Config writes live in `sie-config`; the gateway is a pure consumer of config state, bootstrapping from `GET /v1/configs/export` and subscribing to NATS deltas.
 
 Generation is treated as a supported fourth primitive.
 
@@ -8,7 +8,7 @@ See [`docs/architecture-guide.md`](docs/architecture-guide.md) for the authorita
 
 ## Features
 
-- **Two transports** — NATS JetStream for `encode`/`score`/`extract`; direct-dispatch streaming `/generate` connections for the four generation endpoints (cache-aware prefix routing, pool fallback, first-chunk timeout fallback)
+- **Two dispatch modes** — pool-subject JetStream for ordinary `encode`/`score`/`extract`; per-worker JetStream direct-dispatch for capped logical batch pools and the four generation endpoints (cache-aware prefix routing, pool fallback, first-chunk timeout fallback)
 - **Worker discovery** — static URLs or Kubernetes service endpoints
 - **Health monitoring** — WebSocket streaming or NATS heartbeats
 - **Queue transport** — JetStream work publish, reply inbox collection, backpressure handling, and DLQ republish
@@ -20,7 +20,7 @@ See [`docs/architecture-guide.md`](docs/architecture-guide.md) for the authorita
 - **Auth** — static-token auth via `SIE_AUTH_TOKEN[S]`; config write idempotency belongs to `sie-config`
 - **Demand tracking and readiness** — provisioning responses, pending-demand metrics, and worker ack checks after config changes
 - **Observability** — canonical OpenTelemetry metrics, privacy-safe logs, distributed tracing, audit middleware, and HTML/WebSocket status surfaces
-- **Optional cloud storage** — `cloud-storage` feature enables S3/GCS/Azure Blob payload backends; the Docker build enables it
+- **Optional cloud storage** — `cloud-storage` enables S3/GCS/Azure Blob and native Alibaba OSS V4 payload backends; the Docker build enables it
 
 ## Quick Start
 
@@ -49,8 +49,8 @@ SIE_NATS_URL=nats://localhost:4222 \
 
 Notes:
 
-- `encode` / `score` / `extract` are queue-only: if no usable NATS client is available, these requests return `503`.
-- Generation endpoints use direct-dispatch and do not depend on JetStream for their hot path (NATS Core is still used for worker health and config distribution). There is no direct worker HTTP fallback mode and no `SIE_CLUSTER_ROUTING` toggle.
+- `encode` / `score` / `extract` are JetStream-only: ordinary requests use pool queues, while capped logical batch pools may use worker-direct subjects. If no usable NATS client is available, these requests return `503`.
+- Generation endpoints require per-worker JetStream direct-dispatch. NATS Core remains responsible for worker health, config distribution, and result delivery. There is no direct worker HTTP fallback mode and no `SIE_CLUSTER_ROUTING` toggle.
 
 ## CLI
 
@@ -100,7 +100,9 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | `SIE_LOG_LEVEL` | `info` | Log level (`debug`, `info`, `warn`, `error`) |
 | `SIE_LOG_JSON` | `false` | Structured JSON logging (for Loki) |
 | `SIE_GATEWAY_REQUEST_TIMEOUT` | `120.0` | Non-generation queue result wait timeout in seconds |
-| `SIE_GATEWAY_MAX_STREAM_PENDING` | `50000` | Max pending stream items per JetStream work stream |
+| `SIE_GATEWAY_MAX_STREAM_PENDING` | `50000` | Max pending stream items per JetStream work stream. Pool-wide: a stream is per pool, so this number cannot tell a hot model's backlog from a cold one's |
+| `SIE_GATEWAY_MAX_LANE_IN_FLIGHT_ITEMS` | `10000` | Per-lane (`pool`/`machine_profile`/`bundle`) in-flight work-item ceiling. Always evaluated and recorded on `sie.gateway.queue.lane_admission.decisions`; only sheds when `SIE_GATEWAY_LANE_BACKPRESSURE_ENFORCE` is on |
+| `SIE_GATEWAY_LANE_BACKPRESSURE_ENFORCE` | `false` | Act on the per-lane decision. Off = shadow mode: the decision is computed and recorded, and admission is governed by `SIE_GATEWAY_MAX_STREAM_PENDING` alone. On = a saturated lane gets a targeted 503 while other lanes on the same pool keep admitting |
 | `SIE_GATEWAY_DEFAULT_MAX_TOKENS` | `1024` | Output-token cap applied to `/v1/chat/completions` requests that omit both `max_completion_tokens` and `max_tokens`. OpenAI treats the field as optional, so the gateway defaults rather than rejecting — generic clients (Open WebUI) rely on this |
 | `SIE_GATEWAY_ENABLE_POOLS` | `false` | Enable pool management |
 | `SIE_GATEWAY_HOT_RELOAD` | `false` | Enable filesystem watcher for bundle/model directories |
@@ -112,7 +114,9 @@ Each `--flag` above has a matching `SIE_*` environment variable (see next sectio
 | `SIE_GATEWAY_GPU_ALIASES` | | JSON map of request aliases to canonical machine profiles |
 | `SIE_BUNDLES_DIR` | `bundles` | Optional bundle filesystem seed. Unset in default Helm deploys: the gateway pulls bundles from `sie-config` via `GET /v1/configs/bundles{,/{id}}` at startup and the registry's filesystem reload is a no-op. Only set by the `gateway.embeddedConfigs` / `gateway.configMap` overlays which mount a ConfigMap at `/configs/bundles`. |
 | `SIE_MODELS_DIR` | `models` | Optional model filesystem seed. Same semantics as `SIE_BUNDLES_DIR`: unset in default deploys, runtime model writes always go to `sie-config` and the gateway replays them via `GET /v1/configs/export`. |
-| `SIE_PAYLOAD_STORE_URL` | unset | Shared payload offload store path. When unset, large-payload offload is disabled. Queue deployments should use `s3://`, `gs://`, `abfs://`, or `abfss://`; local filesystem paths only work when gateway and workers share the same path |
+| `SIE_PAYLOAD_STORE_URL` | unset | Shared payload offload store path. When unset, large-payload offload is disabled. Queue deployments should use `s3://`, `gs://`, `abfs://`, `abfss://`, or `oss://`; local filesystem paths only work when gateway and workers share the same path |
+| `SIE_OSS_REGION` | unset | Required explicit Alibaba region for `oss://`; OSS V4 is region-scoped |
+| `SIE_OSS_USE_INTERNAL_ENDPOINT` | `false` | Derive the Alibaba VPC-internal HTTPS endpoint for `oss://`; arbitrary endpoint overrides are not accepted |
 
 ## API Endpoints
 
@@ -194,7 +198,12 @@ Not registered on the gateway:
 
 ## Docker
 
-The gateway image is built via the monorepo Docker tooling; see `tools/mise_tasks/docker.bash` and `deploy/` for chart/values.
+Build the gateway image from the repository root; the Helm chart and values are
+under `deploy/helm/sie-cluster`.
+
+```bash
+docker build -f packages/sie_gateway/Dockerfile -t sie-gateway .
+```
 
 ## Testing
 
@@ -224,7 +233,7 @@ src/
     health.rs            Health and status endpoints
     models.rs            GET /v1/models helpers
     pools.rs             Pool CRUD
-    proxy.rs             Two transports: encode/score/extract queue routing + generation direct-dispatch (chat/completions/responses/generate)
+    proxy.rs             Two dispatch modes: ordinary encode/score/extract pool queues + capped-pool/generation worker-direct
     config_api.rs        Read-only config API (GET /v1/configs/*, including /status dispatch); POST /v1/configs/models is NOT registered (gateway returns 405)
   middleware/
     auth.rs              Token authentication

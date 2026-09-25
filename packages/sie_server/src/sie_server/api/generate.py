@@ -9,7 +9,7 @@ transport differs.
 Why ship a direct route at all? Two reasons:
 
 1. End-to-end viability checking: a developer can run
-   ``mise run serve -m Qwen/Qwen3-4B-Instruct -b sglang`` and immediately
+   ``mise run serve -- -m Qwen/Qwen3-4B-Instruct -b sglang`` and immediately
    curl ``/v1/generate/...`` against the worker to confirm the
    adapter + registry + model config plumbing works against a real GPU,
    without needing to boot the Rust gateway and NATS first.
@@ -52,7 +52,7 @@ import uuid
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -60,14 +60,25 @@ from sie_sdk.queue_types import denormalize_model_id
 
 from sie_server.adapters._generation_base import (
     GenerationAdapter,
+    GenerationCapacityError,
+    GenerationDrainingError,
+    GenerationError,
+    GenerationInputTooLongError,
+    GenerationInvalidRequestError,
+    GenerationPreflightResult,
+    GenerationUnsupportedFieldError,
     ReasoningFormat,
+    aclose_with_error_precedence,
+    client_safe_generation_error_code,
+    client_safe_generation_error_message,
+    client_safe_generation_error_param,
     collect_generation,
     reasoning_starts_in_prompt,
     resolve_reasoning_format,
     suppress_thinking_blocks,
     thinking_blocks_must_be_hidden,
 )
-from sie_server.api.helpers import ModelStateChecker
+from sie_server.api.helpers import ModelStateChecker, oom_retry_after_from_registry, read_bounded_request_body
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
 from sie_server.core.runtime_options import apply_generation_runtime_options
 from sie_server.core.tokenizer import image_first_chat_message, load_tokenizer
@@ -81,7 +92,12 @@ from sie_server.types.openapi import (
 )
 from sie_server.types.responses import ErrorCode
 
+if TYPE_CHECKING:
+    from sie_server.core.registry import ModelRegistry
+
 logger = logging.getLogger(__name__)
+
+_MAX_RETRY_AFTER_S = 60
 
 router = APIRouter(prefix="/v1", tags=["generate"])
 
@@ -649,23 +665,77 @@ def _payload_too_large(message: str, *, param: str | None = None) -> HTTPExcepti
     return HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=detail)
 
 
-async def _read_bounded_request_body(request: Request, limit: int) -> bytes:
-    """Read an ASGI request without aggregating more than ``limit`` bytes."""
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            declared_length = -1
-        if declared_length > limit:
-            raise _payload_too_large(f"request body exceeds the limit of {limit} bytes")
+def _generation_http_exception(error: GenerationError, registry: ModelRegistry | None = None) -> HTTPException:
+    """Map an expected adapter refusal without rewriting it as a 500."""
+    if isinstance(
+        error,
+        GenerationUnsupportedFieldError | GenerationInvalidRequestError | GenerationInputTooLongError,
+    ):
+        return _bad_request(
+            client_safe_generation_error_message(error.code, str(error)),
+            param=client_safe_generation_error_param(error),
+            code=client_safe_generation_error_code(error.code),
+        )
+    if isinstance(error, GenerationCapacityError):
+        retry_after = (
+            "5" if isinstance(error, GenerationDrainingError) else str(oom_retry_after_from_registry(registry))
+        )
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": client_safe_generation_error_code(error.code),
+                "message": client_safe_generation_error_message(error.code, str(error)),
+            },
+            headers={"Retry-After": retry_after},
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail={
+            "code": "inference_error",
+            "message": client_safe_generation_error_message("inference_error", str(error)),
+        },
+    )
 
-    body = bytearray()
-    async for chunk in request.stream():
-        if len(chunk) > limit - len(body):
-            raise _payload_too_large(f"request body exceeds the limit of {limit} bytes")
-        body.extend(chunk)
-    return bytes(body)
+
+def _native_adapter_generate_parameters(
+    *,
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: list[str] | None,
+    frequency_penalty: float | None,
+    presence_penalty: float | None,
+    top_k: int | None,
+    min_new_tokens: int | None,
+    grammar: GrammarSpec | None,
+    seed: int | None,
+    logit_bias: dict[str, float] | None,
+    logprobs: bool,
+    top_logprobs: int | None,
+    images: list[ImageInput] | None,
+) -> dict[str, Any]:
+    """Build the exact native adapter kwargs used for preflight and dispatch."""
+    values: dict[str, Any] = {
+        "prompt": prompt,
+        "max_new_tokens": max_new_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stop": stop,
+        "frequency_penalty": frequency_penalty,
+        "presence_penalty": presence_penalty,
+        "top_k": top_k,
+        "min_new_tokens": min_new_tokens,
+        "seed": seed,
+        "logit_bias": logit_bias,
+        "logprobs": logprobs,
+        "top_logprobs": top_logprobs,
+    }
+    if grammar is not None:
+        values["grammar"] = grammar
+    if images is not None:
+        values["images"] = images
+    return values
 
 
 async def _stream_generate_events(
@@ -689,6 +759,9 @@ async def _stream_generate_events(
     thinking_starts_in_prompt: bool = False,
     reasoning_format: ReasoningFormat = "qwen3",
     images: list[ImageInput] | None = None,
+    generation_parameters: dict[str, Any] | None = None,
+    preflight_result: GenerationPreflightResult | None = None,
+    oom_retry_after_s: int = 5,
 ) -> AsyncIterator[str]:
     """Yield SIE-native ``GenerateChunk`` SSE lines for ``SIEClient.stream_generate``.
 
@@ -708,14 +781,12 @@ async def _stream_generate_events(
     prompt_tokens = 0
     completion_tokens = 0
     saw_terminal = False
-    terminal_error: dict[str, str] | None = None
-    optional_adapter_inputs: dict[str, Any] = {}
-    if grammar is not None:
-        optional_adapter_inputs["grammar"] = grammar
-    if images is not None:
-        optional_adapter_inputs["images"] = images
+    terminal_error: dict[str, Any] | None = None
+    terminal_outcome_selected = False
+    cleanup_failed = False
+    chunks: AsyncIterator[Any] | None = None
     try:
-        chunks = adapter.generate(
+        parameters = generation_parameters or _native_adapter_generate_parameters(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -729,8 +800,19 @@ async def _stream_generate_events(
             logit_bias=logit_bias,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
-            **optional_adapter_inputs,
+            grammar=grammar,
+            images=images,
         )
+        if preflight_result is None:
+            # Keep this lower-level shaper compatible with the deliberately
+            # duck-typed generation contract used by direct callers and
+            # lifecycle tests. The real endpoint always supplies its explicit
+            # preflight result when an adapter produced one.
+            chunks = adapter.generate(**parameters)
+        else:
+            # A non-null result is request-owned evidence and must be consumed
+            # by the adapter-bound bridge; never bypass it via ``generate``.
+            chunks = adapter.generate_with_preflight(parameters, preflight_result)
         if suppress_thinking:
             chunks = suppress_thinking_blocks(
                 chunks,
@@ -744,8 +826,8 @@ async def _stream_generate_events(
                 if chunk.error_code is not None or chunk.error_message is not None or finish_reason == "error":
                     finish_reason = "error"
                     terminal_error = {
-                        "code": chunk.error_code or "inference_error",
-                        "message": chunk.error_message or "generation terminated with an upstream error",
+                        "code": client_safe_generation_error_code(chunk.error_code),
+                        "message": client_safe_generation_error_message(chunk.error_code, chunk.error_message),
                     }
                 if chunk.prompt_tokens is not None:
                     prompt_tokens = chunk.prompt_tokens
@@ -768,20 +850,48 @@ async def _stream_generate_events(
                     yield f"data: {json.dumps(event)}\n\n"
                     seq += 1
                 break
-            if chunk.text_delta or chunk.logprobs:
-                if chunk.text_delta and ttft_ms is None:
-                    ttft_ms = (time.perf_counter() - t0) * 1000.0
-                event: dict[str, Any] = {
-                    "request_id": request_id,
-                    "seq": seq,
-                    "text_delta": chunk.text_delta,
-                    "done": False,
-                }
-                if chunk.logprobs:
-                    event["logprobs"] = list(chunk.logprobs)
-                seq += 1
-                yield f"data: {json.dumps(event)}\n\n"
+            if chunk.text_delta and ttft_ms is None:
+                ttft_ms = (time.perf_counter() - t0) * 1000.0
+            event: dict[str, Any] = {
+                "request_id": request_id,
+                "seq": seq,
+                "text_delta": chunk.text_delta,
+                "done": False,
+            }
+            if chunk.logprobs:
+                event["logprobs"] = list(chunk.logprobs)
+            seq += 1
+            yield f"data: {json.dumps(event)}\n\n"
+    except GenerationError as exc:
+        terminal_outcome_selected = True
+        logger.info("stream_generate refused after preflight: %s", exc)
+        error: dict[str, Any] = {
+            "code": client_safe_generation_error_code(exc.code),
+            "message": client_safe_generation_error_message(exc.code, str(exc)),
+        }
+        if (param := client_safe_generation_error_param(exc)) is not None:
+            error["param"] = param
+        if (
+            isinstance(exc, GenerationCapacityError)
+            and not isinstance(exc, GenerationDrainingError)
+            and isinstance(oom_retry_after_s, int)
+            and not isinstance(oom_retry_after_s, bool)
+            and 1 <= oom_retry_after_s <= _MAX_RETRY_AFTER_S
+        ):
+            error["retry_after_s"] = oom_retry_after_s
+        err = {
+            "request_id": request_id,
+            "seq": seq,
+            "text_delta": "",
+            "done": True,
+            "finish_reason": "error",
+            "error": error,
+        }
+        yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
     except Exception:  # noqa: BLE001 — surface as a terminal error chunk, never 500 mid-stream
+        terminal_outcome_selected = True
         logger.warning("stream_generate failed mid-stream", exc_info=True)
         err = {
             "request_id": request_id,
@@ -796,8 +906,31 @@ async def _stream_generate_events(
         yield f"data: {json.dumps(err)}\n\n"
         yield "data: [DONE]\n\n"
         return
+    finally:
+        # Close the iterator actually driven above on every exit path. When
+        # thinking suppression is active this closes the wrapper, whose own
+        # ``finally`` closes the upstream adapter iterator; otherwise it
+        # closes the adapter iterator directly. This is deliberately tied to
+        # the effective iterator so normal terminal ``break``, adapter errors,
+        # and consumer cancellation all reach backend teardown exactly once.
+        if chunks is not None:
+            try:
+                await aclose_with_error_precedence(
+                    chunks,
+                    outcome_selected=terminal_outcome_selected or saw_terminal,
+                    context="native generate effective iterator",
+                )
+            except Exception:  # noqa: BLE001 - establish the native terminal error contract below
+                cleanup_failed = True
+                logger.warning("stream_generate iterator cleanup failed", exc_info=True)
 
-    if not saw_terminal:
+    if cleanup_failed:
+        finish_reason = "error"
+        terminal_error = {
+            "code": "inference_error",
+            "message": "internal error during generation cleanup",
+        }
+    elif not saw_terminal:
         finish_reason = "error"
         terminal_error = {
             "code": "inference_error",
@@ -816,6 +949,8 @@ async def _stream_generate_events(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+    if images and terminal_error is None and finish_reason not in {"error", "cancelled"}:
+        terminal["usage"]["images"] = len(images)
     if ttft_ms is not None:
         terminal["ttft_ms"] = ttft_ms
     if terminal_error is not None:
@@ -905,7 +1040,7 @@ async def generate(
         if x_machine_profile:
             span.set_attribute("machine_profile", x_machine_profile)
 
-        raw_body = await _read_bounded_request_body(http_request, _MAX_GENERATE_BODY_BYTES)
+        raw_body = await read_bounded_request_body(http_request, _MAX_GENERATE_BODY_BYTES)
         try:
             body = json.loads(raw_body)
         except (json.JSONDecodeError, ValueError) as exc:
@@ -1056,6 +1191,12 @@ async def generate(
         stream_raw = body.get("stream", False)
         if stream_raw is not None and not isinstance(stream_raw, bool):
             raise _bad_request("'stream' must be a boolean", param="stream")
+        if stream_raw and not gen_task.capabilities.streaming:
+            raise _bad_request(
+                f"Model '{model}' does not support streaming generation",
+                param="stream",
+                code="unsupported_field",
+            )
         for field in ("logprobs", "top_logprobs"):
             if not stream_raw and body.get(field) is not None:
                 raise _bad_request(
@@ -1086,6 +1227,39 @@ async def generate(
             reasoning_format,
         )
 
+        generation_parameters = _native_adapter_generate_parameters(
+            prompt=generation_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop=stop,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            top_k=top_k,
+            min_new_tokens=min_new_tokens,
+            grammar=grammar,
+            seed=seed,
+            logit_bias=logit_bias,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+            images=images,
+        )
+        if not stream_raw:
+            # Preserve the historical blocking-call signature: logprob
+            # controls are streaming-only and were absent, not false/null.
+            generation_parameters.pop("logprobs")
+            generation_parameters.pop("top_logprobs")
+        try:
+            preflight_result = adapter.preflight_generate(generation_parameters, stream=bool(stream_raw))
+        except GenerationError as exc:
+            raise _generation_http_exception(exc, registry) from exc
+        except Exception as exc:
+            logger.warning("generation preflight failed for %s", model, exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "inference_error", "message": "internal error during generation preflight"},
+            ) from exc
+
         if stream_raw:
             return StreamingResponse(
                 _stream_generate_events(
@@ -1108,6 +1282,9 @@ async def generate(
                     thinking_starts_in_prompt=thinking_starts_in_prompt,
                     reasoning_format=reasoning_format,
                     images=images,
+                    generation_parameters=generation_parameters,
+                    preflight_result=preflight_result,
+                    oom_retry_after_s=oom_retry_after_from_registry(registry),
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -1118,25 +1295,7 @@ async def generate(
             # local-dev route keeps the walking-skeleton's blocking response shape
             # for backwards compatibility — drain the iterator into an
             # aggregate. SDK / gateway consume the iterator directly.
-            optional_adapter_inputs: dict[str, Any] = {}
-            if grammar is not None:
-                optional_adapter_inputs["grammar"] = grammar
-            if images is not None:
-                optional_adapter_inputs["images"] = images
-            chunks = adapter.generate(
-                prompt=generation_prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                stop=stop,
-                frequency_penalty=frequency_penalty,
-                presence_penalty=presence_penalty,
-                top_k=top_k,
-                min_new_tokens=min_new_tokens,
-                seed=seed,
-                logit_bias=logit_bias,
-                **optional_adapter_inputs,
-            )
+            chunks = adapter.generate_with_preflight(generation_parameters, preflight_result)
             if suppress_thinking:
                 chunks = suppress_thinking_blocks(
                     chunks,
@@ -1144,11 +1303,13 @@ async def generate(
                     reasoning_format=reasoning_format,
                 )
             result = await collect_generation(chunks)
+        except GenerationError as exc:
+            raise _generation_http_exception(exc, registry) from exc
         except Exception as e:
             logger.warning("generate failed for %s", model, exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={"code": "inference_error", "message": str(e)},
+                detail={"code": "inference_error", "message": "internal error during generation"},
             ) from e
 
         # A stream that finished cleanly may still carry a *terminal* error /
@@ -1160,14 +1321,22 @@ async def generate(
         # answer HTTP 200 with truncated output. Map the failure terminators
         # to non-2xx, keeping the OpenAI-shaped error body the route uses
         # elsewhere. (``stop`` / ``length`` are the normal success
-        # terminators and fall through to the 200 response.)
-        if result.finish_reason == "error":
-            logger.warning("generate produced terminal finish_reason=error for %s", model)
+        # terminators and fall through to the 200 response.) A typed
+        # terminal ``error_code`` (e.g. ``empty_model_output``, which keeps
+        # a ``stop``/``length`` finish_reason) is an error too, and its
+        # code/message are surfaced verbatim — mirroring the streaming
+        # path's terminal-error semantics (#3104/#3136).
+        if result.finish_reason == "error" or result.error_code is not None:
+            logger.warning(
+                "generate produced terminal error code=%s for %s",
+                client_safe_generation_error_code(result.error_code),
+                model,
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail={
-                    "code": "inference_error",
-                    "message": "generation terminated with an upstream error",
+                    "code": client_safe_generation_error_code(result.error_code),
+                    "message": client_safe_generation_error_message(result.error_code, result.error_message),
                 },
             )
         if result.finish_reason == "cancelled":
@@ -1201,6 +1370,7 @@ async def generate(
                     "prompt_tokens": result.prompt_tokens,
                     "completion_tokens": result.completion_tokens,
                     "total_tokens": result.prompt_tokens + result.completion_tokens,
+                    **({"images": len(images)} if images else {}),
                 },
             }
         )

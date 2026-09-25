@@ -149,12 +149,11 @@ workers:
           maxReplicas: 10
 
 # ServiceAccount — Helm manages creation; Workload Identity annotation injected at deploy time.
-# NAMING CONTRACT: name must match Terraform's Workload Identity binding
-#   in deploy/terraform/gcp/infra/iam.tf (currently "sie:sie-server").
+# NAMING CONTRACT: name must match the namespace/service-account binding in
+#   your Workload Identity configuration (the default is "sie:sie-server").
 # To inject the GCP SA at deploy time:
 #   --set serviceAccount.annotations."iam\.gke\.io/gcp-service-account"=<EMAIL>
-# Or use terraform output:
-#   --set serviceAccount.annotations."iam\.gke\.io/gcp-service-account"="$(terraform -chdir=deploy/terraform/gcp/infra output -raw sie_workload_service_account)"
+# Or pass the corresponding output from your infrastructure configuration.
 serviceAccount:
   create: true
   name: "sie-server"
