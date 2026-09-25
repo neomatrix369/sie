@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 use serde::Deserialize;
@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::state::demand_tracker::PhysicalLaneCatalog;
 use crate::types::pool::PoolSpec;
 
-/// Modal platform proxy-auth credential (superlinked/sie-internal #1740).
+/// Modal platform proxy-auth credential.
 ///
 /// When a managed ingress endpoint (config service, generation-lane `/gen`
 /// WebSocket, OTLP collector) is deployed with `requires_proxy_auth=True`,
@@ -35,6 +35,54 @@ impl std::fmt::Debug for ModalProxyToken {
             .field("key", &"<redacted>")
             .field("secret", &"<redacted>")
             .finish()
+    }
+}
+
+/// JetStream storage backing for the work-queue and DLQ streams.
+///
+/// `Memory` (the default, and the only behaviour that existed before this
+/// knob) keeps queued and delivered-but-unacknowledged work **only in the
+/// broker's RAM**: a restart of the NATS pod — an OOM kill, a NATS rollout,
+/// or a node drain that evicts *that* pod — erases every queued item and the
+/// `DEAD_LETTERS` record that would have named them. Draining a node hosting
+/// only workers or gateways costs nothing here. At the default single replica
+/// any eviction of the one NATS pod loses the state; a replicated stream
+/// survives while a peer holding it stays up.
+/// `File` persists them to the broker's JetStream store so they survive a
+/// broker restart, at the cost of disk (a PVC on the NATS pods) and extra
+/// publish latency.
+///
+/// The default is deliberately unchanged: flipping a live cluster to `File`
+/// is an operator decision (disk sizing, PVCs, latency budget), not a code
+/// default. Set `SIE_STREAM_STORAGE=file` on BOTH the gateway and the worker
+/// sidecars, and enable the NATS sub-chart's `fileStore`, to opt in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamStorage {
+    #[default]
+    Memory,
+    File,
+}
+
+impl StreamStorage {
+    /// Parse the `SIE_STREAM_STORAGE` spelling. Unrecognized values fall back
+    /// to the default rather than panicking — a typo must not take the queue
+    /// edge down, and the effective value is logged at startup via `Config`'s
+    /// `Debug`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "memory" | "mem" => Some(Self::Memory),
+            "file" | "disk" => Some(Self::File),
+            _ => None,
+        }
+    }
+}
+
+impl From<StreamStorage> for async_nats::jetstream::stream::StorageType {
+    fn from(value: StreamStorage) -> Self {
+        match value {
+            StreamStorage::Memory => Self::Memory,
+            StreamStorage::File => Self::File,
+        }
     }
 }
 
@@ -95,7 +143,27 @@ pub struct Config {
     // Tuning
     pub request_timeout: f64,
     pub max_stream_pending: u64,
+    /// Per-lane in-flight work-item ceiling
+    /// (`SIE_GATEWAY_MAX_LANE_IN_FLIGHT_ITEMS`). The per-lane decision is
+    /// always computed against this; whether it sheds is
+    /// `lane_backpressure_enforce`.
+    pub max_lane_in_flight_items: u64,
+    /// Act on the per-lane backpressure decision
+    /// (`SIE_GATEWAY_LANE_BACKPRESSURE_ENFORCE`, default `false`).
+    ///
+    /// The flag gates enforcement, not computation: with it off the gateway
+    /// still evaluates and records each lane's decision, and admission is
+    /// governed by the pool-wide `max_stream_pending` check exactly as before.
+    pub lane_backpressure_enforce: bool,
     pub stream_max_age_s: u64,
+    /// Storage backing for `WORK_POOL_{pool}` and `DEAD_LETTERS`
+    /// (`SIE_STREAM_STORAGE`, default `memory`). Must match the worker
+    /// sidecars: whoever creates the stream first wins, and JetStream does
+    /// NOT allow changing an existing stream's storage type in place.
+    pub stream_storage: StreamStorage,
+    /// JetStream replica count for those streams (`SIE_STREAM_REPLICAS`,
+    /// default 1). Values above 1 require a clustered NATS deployment.
+    pub stream_num_replicas: usize,
 
     // Configured GPUs (survives scale-to-zero)
     pub configured_gpus: Vec<String>,
@@ -116,6 +184,18 @@ pub struct Config {
     // (JSON map). Mirrors the `SIE_GATEWAY_GPU_ALIASES` mechanism.
     pub model_aliases: HashMap<String, String>,
 
+    // The subset of `model_aliases` that `/v1/models` may advertise (#2843).
+    //
+    // The three compiled-in built-ins are deliberately NOT in here. They are
+    // internal routing defaults, not product names: `code`/`sql` point at
+    // Qwen3-4B-Instruct-2507, which is absent from the managed launch catalog,
+    // so publishing them would both name a model a managed customer cannot
+    // otherwise see AND turn an implementation detail into a documented
+    // contract that could not be repointed later without a breaking change.
+    // Aliases an operator or a released catalog declared on purpose ARE
+    // publishable — those are the names the epic exists to make discoverable.
+    pub published_model_aliases: HashSet<String>,
+
     // Model registry paths (filesystem seed; same volume mounted into sie-config
     // for consistency, but the gateway never writes to them).
     pub bundles_dir: String,
@@ -134,14 +214,15 @@ pub struct Config {
     pub config_service_token: Option<String>,
 
     // Optional Modal platform proxy-auth token the gateway's config client
-    // presents ALONGSIDE `config_service_token` on `GET /v1/configs/*` calls
-    // (superlinked/sie-internal #1740). `Some` only when both
+    // presents ALONGSIDE `config_service_token` on `GET /v1/configs/*` calls.
+    // `Some` only when both
     // `SIE_MODAL_PROXY_TOKEN_ID` and `SIE_MODAL_PROXY_TOKEN_SECRET` are set;
     // absent on self-host / dev (no Modal edge), so no proxy headers are sent.
     pub config_modal_proxy_token: Option<ModalProxyToken>,
 
-    // Payload store (local path, s3://bucket/prefix, gs://bucket/prefix, or
-    // abfs(s)://container@account.dfs.core.windows.net/prefix)
+    // Payload store (local path, s3://bucket/prefix, gs://bucket/prefix,
+    // abfs(s)://container@account.dfs.core.windows.net/prefix, or
+    // oss://bucket/prefix)
     pub payload_store_url: String,
 
     // The gateway's own EXTERNAL https origin (`SIE_GATEWAY_PUBLIC_URL`,
@@ -203,7 +284,11 @@ impl std::fmt::Debug for Config {
             .field("multi_router", &self.multi_router)
             .field("request_timeout", &self.request_timeout)
             .field("max_stream_pending", &self.max_stream_pending)
+            .field("max_lane_in_flight_items", &self.max_lane_in_flight_items)
+            .field("lane_backpressure_enforce", &self.lane_backpressure_enforce)
             .field("stream_max_age_s", &self.stream_max_age_s)
+            .field("stream_storage", &self.stream_storage)
+            .field("stream_num_replicas", &self.stream_num_replicas)
             .field("configured_gpus", &self.configured_gpus)
             .field("gpu_profile_map", &self.gpu_profile_map)
             .field("configured_physical_lanes", &self.configured_physical_lanes)
@@ -359,6 +444,17 @@ fn env_finite_float(key: &str, fallback: f64) -> f64 {
     value
 }
 
+/// Read `SIE_STREAM_STORAGE`. An unset, empty, or unrecognized value keeps
+/// the historical `Memory` behaviour so a typo can never silently change the
+/// durability posture of a running cluster in the *other* direction either.
+fn env_stream_storage(key: &str) -> StreamStorage {
+    env::var(key)
+        .ok()
+        .as_deref()
+        .and_then(StreamStorage::parse)
+        .unwrap_or_default()
+}
+
 fn env_u64(key: &str, fallback: u64) -> u64 {
     env::var(key)
         .ok()
@@ -486,7 +582,12 @@ fn env_static_queue_pools(key: &str) -> Vec<PoolSpec> {
 /// — e.g. map `sql` to a BF16 bundle that avoids the FP8 SQL-accuracy
 /// regression (ADR 0001). `resolve_model_spec_with_aliases` (proxy.rs) applies
 /// the bundle and preserves concrete profile variants.
-fn build_model_aliases(overrides: HashMap<String, String>) -> HashMap<String, String> {
+/// Returns the resolution map plus the subset that may be advertised on
+/// `/v1/models`. Only explicitly-declared aliases are publishable; see
+/// [`Config::published_model_aliases`].
+fn build_model_aliases(
+    overrides: HashMap<String, String>,
+) -> (HashMap<String, String>, HashSet<String>) {
     let mut map: HashMap<String, String> = HashMap::new();
     // Built-in: the code-generation job → the model with a MEASURED
     // HumanEval/MBPP pass@1 baseline that also serves reliably
@@ -507,15 +608,19 @@ fn build_model_aliases(overrides: HashMap<String, String>) -> HashMap<String, St
         "guard".to_string(),
         "ibm-granite/granite-guardian-3.0-2b".to_string(),
     );
+    let mut published: HashSet<String> = HashSet::new();
     for (alias, target) in overrides {
         let alias = alias.trim().to_lowercase();
         let target = target.trim().to_string();
         if alias.is_empty() || target.is_empty() {
             continue;
         }
+        // An override that shadows a built-in name becomes publishable: the
+        // operator chose that name, so it is theirs, not an internal default.
+        published.insert(alias.clone());
         map.insert(alias, target);
     }
-    map
+    (map, published)
 }
 
 fn build_gpu_profile_map(
@@ -560,7 +665,8 @@ impl Config {
             &configured_gpus,
             env_json_string_map("SIE_GATEWAY_GPU_ALIASES"),
         );
-        let model_aliases = build_model_aliases(env_json_string_map("SIE_GATEWAY_MODEL_ALIASES"));
+        let (model_aliases, published_model_aliases) =
+            build_model_aliases(env_json_string_map("SIE_GATEWAY_MODEL_ALIASES"));
 
         Self {
             host: "0.0.0.0".to_string(),
@@ -605,13 +711,23 @@ impl Config {
 
             request_timeout: env_finite_float("SIE_GATEWAY_REQUEST_TIMEOUT", 120.0),
             max_stream_pending: env_u64("SIE_GATEWAY_MAX_STREAM_PENDING", 50_000),
+            max_lane_in_flight_items: env_u64(
+                "SIE_GATEWAY_MAX_LANE_IN_FLIGHT_ITEMS",
+                crate::queue::lane_admission::DEFAULT_MAX_LANE_IN_FLIGHT_ITEMS,
+            ),
+            lane_backpressure_enforce: env_bool("SIE_GATEWAY_LANE_BACKPRESSURE_ENFORCE"),
             stream_max_age_s: env_u64("SIE_STREAM_MAX_AGE_S", 1_800),
+            stream_storage: env_stream_storage("SIE_STREAM_STORAGE"),
+            // `env_u64` already falls back on a parse failure; clamp 0 up to 1
+            // because JetStream treats 0 replicas as invalid.
+            stream_num_replicas: env_u64("SIE_STREAM_REPLICAS", 1).max(1) as usize,
 
             configured_gpus,
             gpu_profile_map,
             configured_physical_lanes,
             static_queue_pools: env_static_queue_pools("SIE_GATEWAY_STATIC_QUEUE_POOLS"),
             model_aliases,
+            published_model_aliases,
 
             bundles_dir: env_default("SIE_BUNDLES_DIR", "bundles"),
             models_dir: env_default("SIE_MODELS_DIR", "models"),
@@ -700,10 +816,19 @@ impl Config {
             ));
         }
 
-        if !is_enabled && (has_tokens || has_admin) {
+        // `admin_token` alone is not dead configuration: `Config::load` also
+        // presents it to `sie-config` as the bootstrap credential
+        // (`config_service_token`), so a gateway with inbound auth off still
+        // legitimately carries it. Only the inbound tokens prove intent.
+        if !is_enabled && has_tokens {
             issues.push((
                 AuditLevel::Error,
-                "SIE_AUTH_TOKEN(S) or SIE_ADMIN_TOKEN is set but SIE_AUTH_MODE is not 'static'/'token'. Auth is DISABLED; the tokens are dead configuration. Set SIE_AUTH_MODE=token to enforce auth.".to_string(),
+                "SIE_AUTH_TOKEN(S) is set but SIE_AUTH_MODE is not 'static'/'token'. Auth is DISABLED; the tokens are dead configuration. Set SIE_AUTH_MODE=token to enforce auth.".to_string(),
+            ));
+        } else if !is_enabled && has_admin {
+            issues.push((
+                AuditLevel::Warn,
+                "SIE_ADMIN_TOKEN is set but SIE_AUTH_MODE is not 'static'/'token': admin routes are not gated inbound (auth is disabled); the token is still presented to sie-config as the bootstrap credential.".to_string(),
             ));
         }
 
@@ -729,6 +854,17 @@ impl Config {
         }
 
         issues
+    }
+
+    /// The first `AuditLevel::Error` from [`Self::audit_auth`], if any.
+    ///
+    /// An auth configuration that audits as an error has no valid reading, so
+    /// the request path treats it as a refusal instead of picking a default.
+    /// Callers may resolve this once: `Config` does not change after load.
+    pub fn auth_config_error(&self) -> Option<String> {
+        self.audit_auth()
+            .into_iter()
+            .find_map(|(level, message)| matches!(level, AuditLevel::Error).then_some(message))
     }
 
     /// Report NATS config-delta producer-trust soundness. Mirrors the
@@ -1070,7 +1206,7 @@ mod tests {
 
     #[test]
     fn test_build_model_aliases_has_builtin_code_default() {
-        let result = build_model_aliases(HashMap::new());
+        let (result, published) = build_model_aliases(HashMap::new());
         assert_eq!(
             result.get("code"),
             Some(&"Qwen/Qwen3-4B-Instruct-2507".to_string())
@@ -1083,6 +1219,11 @@ mod tests {
             result.get("guard"),
             Some(&"ibm-granite/granite-guardian-3.0-2b".to_string())
         );
+        // The built-ins resolve but are NOT public API (#2843). `code`/`sql`
+        // point at a model absent from the managed launch catalog, so listing
+        // them would name something a managed caller cannot otherwise see and
+        // freeze an internal default into a contract we could not repoint.
+        assert!(published.is_empty());
     }
 
     #[test]
@@ -1092,11 +1233,17 @@ mod tests {
         overrides.insert("SQL".to_string(), "Org/SQLModel".to_string()); // extend + lowercased
         overrides.insert("blank".to_string(), "".to_string()); // skipped (empty target)
 
-        let result = build_model_aliases(overrides);
+        let (result, published) = build_model_aliases(overrides);
 
         assert_eq!(result.get("code"), Some(&"Org/Coder".to_string()));
         assert_eq!(result.get("sql"), Some(&"Org/SQLModel".to_string()));
         assert!(!result.contains_key("blank"));
+        // An operator who names an alias owns that name, so it is publishable
+        // even when it shadows a built-in. A skipped entry never becomes one.
+        assert!(published.contains("code"));
+        assert!(published.contains("sql"));
+        assert!(!published.contains("blank"));
+        assert!(!published.contains("guard"));
     }
 
     #[test]
@@ -1408,6 +1555,58 @@ mod tests {
         });
     }
 
+    /// The shipped default must stay memory-backed / single-replica: this PR
+    /// makes durability configurable, it does NOT flip the production
+    /// posture. A change here is a deliberate operator-facing decision.
+    #[test]
+    fn test_stream_storage_defaults_to_memory_single_replica() {
+        without_env(&["SIE_STREAM_STORAGE", "SIE_STREAM_REPLICAS"], || {
+            let cfg = Config::load();
+            assert_eq!(cfg.stream_storage, StreamStorage::Memory);
+            assert_eq!(cfg.stream_num_replicas, 1);
+        });
+    }
+
+    #[test]
+    fn test_stream_storage_from_env() {
+        with_env(
+            &[("SIE_STREAM_STORAGE", "file"), ("SIE_STREAM_REPLICAS", "3")],
+            || {
+                let cfg = Config::load();
+                assert_eq!(cfg.stream_storage, StreamStorage::File);
+                assert_eq!(cfg.stream_num_replicas, 3);
+            },
+        );
+    }
+
+    /// A typo must not take the queue edge down, and must not silently move
+    /// the cluster off its configured posture either — it falls back to the
+    /// shipped default and the effective value is visible in the startup
+    /// `Config` dump.
+    #[test]
+    fn test_stream_storage_rejects_garbage_and_zero_replicas() {
+        with_env(
+            &[
+                ("SIE_STREAM_STORAGE", "durable-please"),
+                ("SIE_STREAM_REPLICAS", "0"),
+            ],
+            || {
+                let cfg = Config::load();
+                assert_eq!(cfg.stream_storage, StreamStorage::Memory);
+                assert_eq!(cfg.stream_num_replicas, 1);
+            },
+        );
+    }
+
+    #[test]
+    fn test_stream_storage_parse_spellings() {
+        assert_eq!(StreamStorage::parse("Memory"), Some(StreamStorage::Memory));
+        assert_eq!(StreamStorage::parse(" FILE "), Some(StreamStorage::File));
+        assert_eq!(StreamStorage::parse("disk"), Some(StreamStorage::File));
+        assert_eq!(StreamStorage::parse(""), None);
+        assert_eq!(StreamStorage::parse("s3"), None);
+    }
+
     #[test]
     fn test_admin_token_populates_config_service_token() {
         with_env(&[("SIE_ADMIN_TOKEN", "super-secret")], || {
@@ -1575,12 +1774,17 @@ mod tests {
             multi_router: false,
             request_timeout: 0.0,
             max_stream_pending: 0,
+            max_lane_in_flight_items: 0,
+            lane_backpressure_enforce: false,
             stream_max_age_s: 0,
+            stream_storage: StreamStorage::Memory,
+            stream_num_replicas: 1,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
             configured_physical_lanes: PhysicalLaneCatalog::default(),
             static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
+            published_model_aliases: Default::default(),
             bundles_dir: String::new(),
             models_dir: String::new(),
             config_service_url: None,
@@ -1605,6 +1809,22 @@ mod tests {
             "expected error about tokens + disabled auth, got {:?}",
             issues
         );
+    }
+
+    /// The admin token doubles as the `sie-config` bootstrap credential
+    /// (`config_service_token`), so a gateway running with inbound auth off
+    /// still carries it legitimately. That must never audit as an error, or
+    /// the fail-closed middleware would refuse every request on such a deploy.
+    #[test]
+    fn test_audit_auth_none_with_only_admin_token_is_not_an_error() {
+        let cfg = cfg_with_auth("none", vec![], "admin", false);
+        let issues = cfg.audit_auth();
+        assert!(
+            issues.iter().all(|(lvl, _)| *lvl != AuditLevel::Error),
+            "admin token alone must not be an error: {:?}",
+            issues
+        );
+        assert!(cfg.auth_config_error().is_none());
     }
 
     #[test]

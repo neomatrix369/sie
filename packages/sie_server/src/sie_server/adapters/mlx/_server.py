@@ -60,6 +60,7 @@ STARTUP_TIMEOUT_ENV_VARS = (
 HEALTH_CHECK_INTERVAL_S = 2.0
 
 ERR_SERVER_STARTUP = "MLX server failed to start within timeout"
+ERR_SERVER_CRASH = "MLX server process exited during startup"
 ERR_WARMUP_FAILED = "MLX server started but the model failed to warm up (could not serve a test completion)"
 
 
@@ -122,6 +123,21 @@ def find_free_port(start_port: int = BASE_PORT) -> int:
             return port
     msg = f"Could not find free port in range {start_port}-{start_port + span - 1}"
     raise RuntimeError(msg)
+
+
+def release_port(port: int | None) -> None:
+    """Return a port handed out by :func:`find_free_port` to the pool.
+
+    Adapters call this from every teardown seam — ``unload()`` and the
+    failed-load abort paths — once the MLX child no longer owns the port.
+    Idempotent and tolerant: releasing ``None`` or a never-reserved port is
+    a no-op, so teardown paths can call it unconditionally. Mirrors
+    ``sglang/_server.py``.
+    """
+    if port is None:
+        return
+    with _RESERVED_PORTS_LOCK:
+        _RESERVED_PORTS.discard(port)
 
 
 def open_output_log(prefix: str = "mlx_") -> tempfile._TemporaryFileWrapper:

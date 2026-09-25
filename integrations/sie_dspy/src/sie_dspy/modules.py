@@ -5,10 +5,48 @@ Provides reranking and extraction modules compatible with DSPy pipelines.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import dspy
+
+
+def _scores_by_index(results: Mapping[str, Any], count: int) -> list[float]:
+    """Map ScoreResult entries back to input positions by item_id.
+
+    Parses each entry's ``item_id`` defensively: a missing, non-integer,
+    negative, or out-of-range id is skipped (that passage keeps its 0.0
+    default) so a malformed entry can neither crash the rerank nor mis-assign a
+    score to the wrong passage.
+
+    Args:
+        results: ScoreResult envelope from ``SIEClient.score()``.
+        count: Number of input passages.
+
+    Returns:
+        Scores indexed by input position (0.0 for any unscored/invalid item).
+    """
+    scores = [0.0] * count
+    for entry in results.get("scores", []):
+        item_id = entry.get("item_id", entry.get("index"))
+        # Accept only a genuine integer or an integer string. Reject bool (an int
+        # subclass, int(True) == 1), float (int(1.5) == 1), and non-integer
+        # strings, so a malformed id cannot silently overwrite the wrong position.
+        if isinstance(item_id, bool):
+            continue
+        if isinstance(item_id, int):
+            idx = item_id
+        elif isinstance(item_id, str):
+            try:
+                idx = int(item_id)
+            except ValueError:
+                continue
+        else:
+            continue
+        if 0 <= idx < count:
+            scores[idx] = float(entry.get("score", 0.0))
+    return scores
 
 
 @dataclass
@@ -134,11 +172,17 @@ class SIEReranker(dspy.Module):
 
         results = self.client.score(self._model, query_item, passage_items)
 
+        # ``results`` is a ScoreResult envelope; ranked entries are under
+        # ``results["scores"]`` (each a ScoreEntry keyed by ``item_id`` = input
+        # position, plus ``score``). Map scores back to input order by item_id
+        # rather than zipping positionally — the entries are sorted by relevance,
+        # not by input order. ``results["request"]`` (request id) and
+        # ``results["usage"]`` (token usage) are also available but intentionally
+        # not surfaced here.
+        score_by_index = _scores_by_index(results, len(passages))
+
         # Build scored passages
-        scored = []
-        for passage, result in zip(passages, results, strict=True):
-            score = result.get("score", 0.0) if isinstance(result, dict) else getattr(result, "score", 0.0)
-            scored.append((float(score), passage))
+        scored = [(score_by_index[idx], passage) for idx, passage in enumerate(passages)]
 
         # Sort by score descending
         scored.sort(key=lambda x: x[0], reverse=True)

@@ -10,6 +10,33 @@ executable.
 
 - `model_state.json` — the canonical `ModelState` values (`available`,
   `loading`, `loaded`, `unloading`, `failed`).
+- `request_usage.json` — how the response `usage` block is partitioned. The
+  gateway is the only writer of `settled_charge_fields`; everything a consumer
+  meters lives in `terminal_unit_fields`. The two sets are disjoint and their
+  union is the WHOLE block, which is what lets a consumer reject an undeclared
+  key — a silently renamed meter — without also rejecting the settled charge
+  that legitimately rides alongside it. See issue #3063 for the failure this
+  exists to prevent.
+- `model_info.json` — the field set of one `/v1/models` entry, split into
+  `typed` (an SDK `ModelInfo` MUST declare it) and `excluded` (an SDK MUST NOT
+  declare it, with the reason recorded per key).
+- `oss_payload_store.json` — the cross-language Alibaba OSS payload contract.
+  The gateway writes `prefix/plain_key`, the queue retains `plain_key`, and the
+  sidecar accepts that key or the exact `full_reference`; Python and both Rust
+  binaries load the same fixture to prevent prefix drift.
+
+### Why `model_info.json` has two buckets
+
+A "covered set" alone only catches fields an SDK forgot. It says nothing about
+fields an SDK left out *on purpose*, so the next reader cannot tell an omission
+from a decision — which is how `state`, `last_error`, `profiles` and
+`pending_generation` sat undeclared in both SDKs for several releases. Listing
+both buckets makes a new wire field fail the tests until someone consciously
+puts it in one of them.
+
+Today `excluded` holds only the OpenAI retrieve-model compat keys
+(`id`/`object`/`created`/`owned_by`) that `GET /v1/models/{model}` merges in for
+vanilla OpenAI clients.
 
 ## Adding a consumer
 
@@ -17,14 +44,27 @@ Point a test at the JSON and assert the implementation's enum/type matches the
 fixture set. Current consumers:
 
 - Python SDK — `packages/sie_sdk/tests/test_wire_contract.py` (asserts
-  `typing.get_args(ModelState)` matches the fixture).
+  `typing.get_args(ModelState)` and `ModelInfo.__annotations__` match the
+  fixtures, and that
+  `RequestUsage`/`TERMINAL_UNIT_FIELDS`/`SETTLED_CHARGE_FIELDS` match
+  `request_usage.json`).
 - TypeScript SDK — `packages/sie_ts_sdk/tests/wireContract.test.ts` (asserts the
-  runtime `MODEL_STATES` array — the single source the `ModelState` type is
-  derived from — matches the fixture).
+  runtime `MODEL_STATES` and `MODEL_INFO_WIRE_FIELDS` arrays — the single
+  sources the `ModelState` type and `WireModelInfo` interface are checked
+  against — match the fixtures).
+- Downstream gateways assert that the members they inject are exactly
+  `settled_charge_fields`, so a gateway that starts publishing a third field
+  cannot reach production before every consumer has declared it.
+
+The TS SDK carries extra tests the Python SDK does not need: its client re-maps
+the `/v1/models` response (camelCasing three top-level keys), so a field can be
+declared on the type and still never reach a caller. Those tests drive a fully
+populated wire entry through `getModel`/`listModels`.
 
 ## Scope
 
-This is the first slice (issue #1637): `ModelState` only. Extend the same
-fixture file (and the two tests) with `ModelCapabilities`, error codes, and
-status messages as they are pinned. Codegen can come later if fixtures prove
+This started as one slice (issue #1637): `ModelState` only. `request_usage.json`
+(issue #3063) is the second, `model_info.json` (issue #3126) the third. Extend
+the same directory with `ModelCapabilities` values, error codes, and status
+messages as they are pinned. Codegen can come later if fixtures prove
 insufficient.

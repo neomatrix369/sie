@@ -515,22 +515,40 @@ async fn run_server(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
                 Some(client) => {
                     let jetstream = async_nats::jetstream::new(client.clone());
                     let payload_store = create_payload_store(&config.payload_store_url).await?;
-                    let publisher = Arc::new(queue::publisher::WorkPublisher::new(
-                        jetstream,
-                        nats_manager.router_id().to_string(),
-                        payload_store,
-                        Duration::from_secs_f64(config.request_timeout),
-                        config.max_stream_pending,
-                        Duration::from_secs(config.stream_max_age_s),
-                    ));
+                    let publisher = Arc::new(
+                        queue::publisher::WorkPublisher::new(
+                            jetstream,
+                            nats_manager.router_id().to_string(),
+                            payload_store,
+                            Duration::from_secs_f64(config.request_timeout),
+                            config.max_stream_pending,
+                            queue::publisher::WorkStreamConfig {
+                                max_age: Duration::from_secs(config.stream_max_age_s),
+                                storage: config.stream_storage.into(),
+                                num_replicas: config.stream_num_replicas,
+                            },
+                        )
+                        .with_lane_admission(
+                            queue::lane_admission::LaneAdmissionControl::new(
+                                config.max_lane_in_flight_items,
+                                config.lane_backpressure_enforce,
+                                config.configured_physical_lanes.clone(),
+                            ),
+                        ),
+                    );
 
                     if let Err(e) = publisher.start_inbox_subscription(&client).await {
                         tracing::warn!(error = %e, "failed to start inbox subscription");
                     }
 
                     let dlq_jetstream = async_nats::jetstream::new(client.clone());
-                    if let Err(e) =
-                        queue::dlq::DlqListener::start(dlq_jetstream, client.clone()).await
+                    if let Err(e) = queue::dlq::DlqListener::start(
+                        dlq_jetstream,
+                        client.clone(),
+                        config.stream_storage.into(),
+                        config.stream_num_replicas,
+                    )
+                    .await
                     {
                         tracing::warn!(error = %e, "failed to start DLQ listener");
                     }

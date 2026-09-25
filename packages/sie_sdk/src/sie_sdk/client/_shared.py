@@ -13,12 +13,13 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
-from typing import Any, Protocol, cast
-from urllib.parse import urljoin, urlsplit
+from typing import Any, NoReturn, Protocol, cast
+from urllib.parse import parse_qsl, urljoin, urlsplit
 
-import msgpack
 import numpy as np
+from msgpack.exceptions import UnpackException
 
+from sie_sdk._msgpack import unpackb as unpack_msgpack
 from sie_sdk.images import convert_item_images
 
 _logger = logging.getLogger(__name__)
@@ -26,7 +27,9 @@ _logger = logging.getLogger(__name__)
 
 _HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _HTTP_MEDIA_TYPE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+/[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-_CONTENT_SAFE_MEDIA_TYPES = frozenset({"application/json", "application/problem+json", "text/html"})
+_CONTENT_SAFE_MEDIA_TYPES = frozenset(
+    {"application/json", "application/msgpack", "application/problem+json", "text/html"}
+)
 _RESERVED_BASE_URL_HEADERS = frozenset(
     {
         "accept",
@@ -49,6 +52,8 @@ _RESERVED_BASE_URL_HEADERS = frozenset(
         "x-sie-sdk-version",
     }
 )
+MODAL_CONTINUATION_MAX_HOPS = 20
+_MODAL_CONTINUATION_QUERY_PARAMETER = "__modal_attempt_token"
 
 
 def copy_base_url_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
@@ -112,6 +117,46 @@ def base_url_accepts_origin_credentials(base_url: str) -> bool:
     return origin is not None and origin[0] == "https"
 
 
+def validate_base_url(base_url: str) -> None:
+    """Reject a malformed ``base_url`` at construction.
+
+    A scheme-less URL such as ``"localhost:8080"`` would otherwise surface
+    only at request time as an opaque transport error
+    (``httpx.UnsupportedProtocol`` on the sync client), or — worse — be
+    silently retried as a "connect" failure for the whole provision budget.
+    A hostless URL such as ``"http:///v1"`` parses with a valid scheme but an
+    empty host, which cannot be connected to; reject it here too. A textual or
+    out-of-range port (``"http://host:notaport"``, ``"http://host:99999"``)
+    likewise fails here rather than at request time.
+    """
+    parts = urlsplit(base_url)
+    msg = (
+        "base_url must be an absolute http:// or https:// URL with a host "
+        f"(e.g. 'http://localhost:8080'), got {base_url!r}"
+    )
+    if parts.scheme not in {"http", "https"} or not parts.hostname:
+        raise ValueError(msg)
+    try:
+        # ``urlsplit`` validates the port lazily, on access.
+        _ = parts.port
+    except ValueError as exc:
+        raise ValueError(msg) from exc
+
+
+def url_origin_for_logging(url: str) -> str:
+    """Return only the ``scheme://host[:port]`` origin of ``url``.
+
+    Path, query, fragment, and any ``user:password@`` userinfo are dropped, so
+    a ``base_url`` carrying embedded credentials or a token query parameter
+    never reaches a log line. The value is
+    for logging only — callers still issue requests against the real URL.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    netloc = f"{host}:{parts.port}" if parts.port is not None else host
+    return f"{parts.scheme}://{netloc}" if parts.scheme else netloc
+
+
 def request_matches_base_url_origin(base_url: str, request_url: str) -> bool:
     """Whether ``request_url`` resolves to the exact HTTP origin of ``base_url``."""
     base_origin = _http_origin(base_url)
@@ -119,6 +164,40 @@ def request_matches_base_url_origin(base_url: str, request_url: str) -> bool:
         return False
     resolved = urljoin(f"{base_url.rstrip('/')}/", request_url)
     return _http_origin(resolved) == base_origin
+
+
+def modal_continuation_path(base_url: str, response: _HttpResponse) -> str | None:
+    """Return a safe edge-relative Modal result URL for an HTTP 303.
+
+    Modal turns a web request that exceeds 150 seconds into a 303 whose
+    ``Location`` identifies the *same in-flight request*. Following that
+    result URL with GET consumes the original response; it does not replay the
+    non-idempotent POST. Only the documented attempt-token shape on the exact
+    configured origin is accepted so SDK credentials can never cross an
+    origin boundary.
+    """
+    if response.status_code != 303:
+        return None
+    location = _header_value(response.headers, "Location")
+    if not isinstance(location, str) or not location or len(location) > 8192:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in location):
+        return None
+
+    resolved = urljoin(f"{base_url.rstrip('/')}/", location)
+    if not request_matches_base_url_origin(base_url, resolved):
+        return None
+    try:
+        parsed = urlsplit(resolved)
+        query = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=100)
+    except ValueError:
+        return None
+    tokens = [value for key, value in query if key == _MODAL_CONTINUATION_QUERY_PARAMETER]
+    if parsed.fragment or len(tokens) != 1 or not tokens[0]:
+        return None
+
+    path = parsed.path or "/"
+    return f"{path}?{parsed.query}" if parsed.query else path
 
 
 def websocket_matches_base_url_origin(base_url: str, websocket_url: str) -> bool:
@@ -160,14 +239,20 @@ from sie_sdk.types import (
 )
 
 from .errors import (
+    AccountInactiveError,
+    AccountStateUnavailableError,
     EstimateUnroutableError,
+    IncompleteBatchError,
     InputTooLongError,
+    InsufficientCreditsError,
     ModelLoadFailedError,
     ModelLoadingError,
     ProvisioningError,
+    RateLimitError,
     RequestError,
     ResourceExhaustedError,
     ServerError,
+    SpendLimitError,
 )
 
 # Content types
@@ -186,6 +271,12 @@ HTTP_GATEWAY_TIMEOUT = 504
 # storage outage is a distinct 503 and must never be hidden by this path.
 JOB_RESULT_NOT_FOUND_ERROR_CODE = "RESULT_NOT_FOUND"
 JOB_RESULT_REF_MAX_REFRESHES = 3
+
+# jobs.results() decodes chunk refs into per-item results. A non-terminal job
+# has no stable result set: its ref list is still growing, so decoding one would
+# return a partial subset indistinguishable from a partial-FAILURE subset. The
+# SDK refuses with this code rather than return a misleading partial.
+JOB_NOT_TERMINAL_ERROR_CODE = "job_not_terminal"
 
 
 _GENERATE_GRAMMAR_VARIANTS = frozenset({"json_schema", "regex", "ebnf"})
@@ -277,6 +368,7 @@ INPUT_TOO_LONG_ERROR_CODE = "INPUT_TOO_LONG"
 
 # ── cost-estimate dry run (POST /v1/estimate, #2435) ──────────────────────
 ESTIMATE_PATH = "/v1/estimate"
+RECOMMEND_PATH = "/v1/recommend"
 # The gateway answers an unpriced/unroutable identity with the SAME code the
 # live billing path uses for "this request cannot be priced, so it will not be
 # run". Both are mapped to ``EstimateUnroutableError``; a slab-capacity 503
@@ -334,6 +426,7 @@ def raise_if_estimate_unroutable(response: _HttpResponse) -> None:
     raise EstimateUnroutableError(
         str(message or "the active rate book cannot price this request"),
         code=code,
+        param=get_error_param(response),
         request=parse_request_metadata(response.headers),
     )
 
@@ -347,6 +440,43 @@ RESOURCE_EXHAUSTED_MAX_RETRIES = 3
 RESOURCE_EXHAUSTED_DEFAULT_DELAY_S = 5.0
 RESOURCE_EXHAUSTED_MAX_DELAY_S = 30.0
 RESOURCE_EXHAUSTED_ERROR_CODE = "RESOURCE_EXHAUSTED"
+
+# ── Pre-execution admission backpressure / billing signals (pass-2 audit) ──
+# All of these are emitted BEFORE any work is published to the queue, so
+# retrying them is idempotent even on the non-idempotent generate paths. They
+# are honored on the SDK's admission ladder (:func:`admission_retry_delay`),
+# bounded by the caller's ``provision_timeout_s`` budget and the server's
+# ``Retry-After``. Kept deliberately separate from the 402/403 credit/account
+# errors below, which are TERMINAL and must NEVER be retried.
+#
+# B1 — 429 rate limit (rate_limit.rs): per-key/per-account, default-on. The
+# gateway always supplies a ``Retry-After``; the SDK honors it and gives up as
+# a typed :class:`RateLimitError` when the budget is spent.
+HTTP_TOO_MANY_REQUESTS = 429
+RATE_LIMIT_ERROR_CODE = "RATE_LIMIT"
+RATE_LIMIT_DEFAULT_DELAY_S = 1.0  # Fallback when the server omits Retry-After
+
+# B2 — 503 BILLING_CAPACITY_UNAVAILABLE (slab_ledger.rs): a gateway-local
+# family cap on billing admission, NOT customer credit exhaustion. Server sends
+# Retry-After: 1. B7 — 503 QUEUE_FULL (self-hosted server, #3180): transient
+# queue backpressure, Retry-After: 1. Both are retryable 503s the pre-existing
+# ladder did not match, so they fell through and failed hard.
+BILLING_CAPACITY_UNAVAILABLE_ERROR_CODE = "BILLING_CAPACITY_UNAVAILABLE"
+QUEUE_FULL_ERROR_CODE = "QUEUE_FULL"
+BACKPRESSURE_503_ERROR_CODES = frozenset({BILLING_CAPACITY_UNAVAILABLE_ERROR_CODE, QUEUE_FULL_ERROR_CODE})
+BACKPRESSURE_503_DEFAULT_DELAY_S = 1.0  # Fallback when the server omits Retry-After
+
+# ── Terminal credit / account errors (pass-2 audit B3) — NEVER retried ──
+# 402/403 credit/account failures are mapped to typed exceptions in
+# ``handle_error`` and, having no arm on any retry ladder, surface on the first
+# response (single attempt). Retrying a credit/account failure would be wrong.
+HTTP_PAYMENT_REQUIRED = 402
+HTTP_FORBIDDEN = 403
+INSUFFICIENT_CREDITS_ERROR_CODE = "INSUFFICIENT_CREDITS"
+KEY_SPEND_LIMIT_EXCEEDED_ERROR_CODE = "KEY_SPEND_LIMIT_EXCEEDED"
+ACCOUNT_SUSPENDED_ERROR_CODE = "ACCOUNT_SUSPENDED"
+ACCOUNT_PENDING_REVIEW_ERROR_CODE = "ACCOUNT_PENDING_REVIEW"
+ACCOUNT_STATE_UNAVAILABLE_ERROR_CODE = "ACCOUNT_STATE_UNAVAILABLE"
 
 # Retry jitter. Fixed / pure-exponential backoff makes every client that
 # lost a worker at the same instant (cluster cold start, rolling restart)
@@ -403,6 +533,7 @@ SDK_VERSION_HEADER = "X-SIE-SDK-Version"
 SERVER_VERSION_HEADER = "X-SIE-Server-Version"
 MODEL_REVISION_HEADER = "X-SIE-Model-Revision"
 EXECUTION_IDENTITY_SHA256_HEADER = "X-SIE-Execution-Identity-SHA256"
+EXECUTION_BINDING_SHA256_HEADER = "X-SIE-Execution-Binding-SHA256"
 REQUEST_ID_HEADER = "X-SIE-Request-ID"
 CREDITS_DEBITED_HEADER = "X-SIE-Credits-Debited"
 REQUEST_USAGE_HEADERS = {
@@ -520,6 +651,8 @@ def compute_retry_delay(
     error_label: str,
     error: BaseException,
     rng: random.Random | None = None,
+    attempt: int | None = None,
+    target: str | None = None,
 ) -> float | None:
     """Sleep duration for the next transport-error retry, or ``None`` if
     the provision-timeout budget is exhausted (caller must re-raise).
@@ -529,15 +662,26 @@ def compute_retry_delay(
     lockstep. The jittered value never exceeds ``timeout - elapsed``, so
     the provision-timeout budget is still respected. ``rng`` is exposed
     for deterministic tests.
+
+    When ``attempt`` is 0 the retry is logged at WARNING — matching the
+    OOM-retry convention — so a user at the default log level can see
+    "the SDK is retrying you" (naming the unreachable ``target`` and the
+    total wait budget) instead of silently blocking for the whole
+    provision timeout. Subsequent retries stay at INFO to avoid log spam.
     """
     elapsed = time.monotonic() - start_time
     if elapsed >= timeout:
         return None
     actual_delay = apply_jitter(min(MODEL_LOADING_DEFAULT_DELAY_S, timeout - elapsed), rng=rng)
-    _logger.info(
-        "%s (%s), retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs): %s",
+    log_fn = _logger.warning if attempt == 0 else _logger.info
+    # Log only the origin: drops path/query/fragment and any embedded
+    # credentials before the URL reaches the log.
+    safe_target = url_origin_for_logging(target) if target else None
+    log_fn(
+        "%s (%s)%s, retrying in %.1fs (elapsed: %.1fs, timeout: %.1fs): %s",
         error_label,
         type(error).__name__,
+        f" contacting {safe_target}" if safe_target else "",
         actual_delay,
         elapsed,
         timeout,
@@ -707,6 +851,26 @@ def _settled_charge_from_body(body: Any) -> tuple[int, str] | None:
     return settled_charge_from_usage(body.get("usage"))
 
 
+def valid_stream_request_id(value: Any) -> str | None:
+    """Return ``value`` when it is a well-formed request id, else ``None``.
+
+    Same rules as ``parse_request_metadata`` (non-empty visible ASCII without
+    surrounding whitespace, bounded length). Stream error chunks carry the id
+    in-band; a malformed value must be dropped BEFORE it is placed on a
+    synthetic HTTP header, where non-ASCII would raise ``UnicodeEncodeError``
+    inside HTTPX and bypass the retry path (#3136).
+    """
+    if (
+        isinstance(value, str)
+        and 0 < len(value) <= _MAX_REQUEST_ID_LENGTH
+        and value == value.strip()
+        and value.isascii()
+        and value.isprintable()
+    ):
+        return value
+    return None
+
+
 def parse_request_metadata(headers: Any, body: Any = None) -> RequestMetadata | None:
     """Parse optional metadata from one terminal response.
 
@@ -776,6 +940,14 @@ def parse_request_metadata(headers: Any, body: Any = None) -> RequestMetadata | 
     ):
         metadata["execution_identity_sha256"] = execution_identity_sha256
 
+    execution_binding_sha256 = _header_value(headers, EXECUTION_BINDING_SHA256_HEADER)
+    if (
+        isinstance(execution_binding_sha256, str)
+        and len(execution_binding_sha256) == 64
+        and all(char in "0123456789abcdef" for char in execution_binding_sha256)
+    ):
+        metadata["execution_binding_sha256"] = execution_binding_sha256
+
     return metadata or None
 
 
@@ -812,6 +984,33 @@ def parse_terminal_json_object(response: _HttpResponse, *, owner: str) -> dict[s
         data = None
     if malformed:
         msg = f"Malformed {owner} JSON response ({diagnostic})"
+        raise RequestError(msg, status_code=response.status_code, request=request)
+    if not isinstance(data, dict):
+        msg = f"Unexpected {owner} response shape: {type(data).__name__} ({diagnostic})"
+        raise RequestError(msg, status_code=response.status_code, request=request)
+    return data
+
+
+def parse_terminal_msgpack_object(response: _HttpResponse, *, owner: str) -> dict[str, Any]:
+    """Parse one successful terminal MessagePack object with content-safe diagnostics."""
+    request = parse_request_metadata(response.headers)
+    diagnostic = _terminal_response_diagnostic(response)
+
+    if not 200 <= response.status_code < 300:
+        msg = f"Unexpected {owner} HTTP response ({diagnostic})"
+        raise RequestError(msg, status_code=response.status_code, request=request)
+
+    malformed = False
+    try:
+        data = unpack_msgpack(response.content, numeric_arrays=True)
+    except (TypeError, ValueError, UnpackException):
+        # Raise only after the parser exception context has been cleared.
+        # MessagePack exceptions can retain decoded or trailing body content,
+        # which must never escape through exception chaining.
+        malformed = True
+        data = None
+    if malformed:
+        msg = f"Malformed {owner} MessagePack response ({diagnostic})"
         raise RequestError(msg, status_code=response.status_code, request=request)
     if not isinstance(data, dict):
         msg = f"Unexpected {owner} response shape: {type(data).__name__} ({diagnostic})"
@@ -874,7 +1073,7 @@ def get_error_detail(response: _HttpResponse) -> dict[str, Any] | None:
     """
     try:
         if MSGPACK_CONTENT_TYPE in response.headers.get("content-type", ""):
-            data = msgpack.unpackb(response.content, raw=False)
+            data = unpack_msgpack(response.content, numeric_arrays=False)
         else:
             data = response.json()
 
@@ -887,10 +1086,19 @@ def get_error_detail(response: _HttpResponse) -> dict[str, Any] | None:
             detail = data["detail"]
             if isinstance(detail, dict):
                 return detail
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, UnpackException):
         # Malformed error body — caller treats as "no detail" and falls back.
         pass
     return None
+
+
+def get_error_param(response: _HttpResponse) -> str | None:
+    """Return the exact field name from a typed error envelope, if present."""
+    detail = get_error_detail(response)
+    if detail is None:
+        return None
+    param = detail.get("param")
+    return param if isinstance(param, str) else None
 
 
 def raise_if_model_load_failed(response: _HttpResponse, model: str | None = None) -> None:
@@ -940,6 +1148,7 @@ def raise_if_model_load_failed(response: _HttpResponse, model: str | None = None
         error_class=str(error_class) if error_class is not None else None,
         permanent=permanent,
         attempts=attempts,
+        param=get_error_param(response),
         request=parse_request_metadata(response.headers),
     )
 
@@ -968,23 +1177,40 @@ def raise_if_input_too_long(response: _HttpResponse, model: str | None = None) -
     if detail.get("code") != INPUT_TOO_LONG_ERROR_CODE:
         return
     message = str(detail.get("message") or "Input exceeds the model's maximum token capacity")
-    raise InputTooLongError(message, model=model, request=parse_request_metadata(response.headers))
+    raise InputTooLongError(
+        message,
+        model=model,
+        param=get_error_param(response),
+        request=parse_request_metadata(response.headers),
+    )
 
 
-def handle_error(response: _HttpResponse) -> None:
+def handle_error(response: _HttpResponse) -> NoReturn:
     """Handle error response from server.
 
+    Always raises — every path terminates in a typed exception. Declared
+    ``NoReturn`` so callers (and the type checker) know a call terminates
+    control flow, e.g. the admission-ladder give-up paths.
+
     Raises:
-        RequestError: For 4xx responses.
-        ServerError: For 5xx responses.
+        RateLimitError: For 429 responses (retry budget already spent by the
+            caller, or a direct terminal path).
+        InsufficientCreditsError / SpendLimitError: For 402 credit/spend
+            failures (terminal — never retried).
+        AccountInactiveError: For 403 account suspended / pending review
+            (terminal — never retried).
+        AccountStateUnavailableError: For 503 ACCOUNT_STATE_UNAVAILABLE.
+        RequestError: For other 4xx responses.
+        ServerError: For other 5xx responses.
     """
     code = None
+    param = None
     message = f"HTTP {response.status_code}"
 
     try:
         # Try msgpack first
         if MSGPACK_CONTENT_TYPE in response.headers.get("content-type", ""):
-            data = msgpack.unpackb(response.content, raw=False)
+            data = unpack_msgpack(response.content, numeric_arrays=False)
         else:
             data = response.json()
 
@@ -993,6 +1219,8 @@ def handle_error(response: _HttpResponse) -> None:
             if isinstance(error, dict):
                 code = error.get("code")
                 message = error.get("message", message)
+                error_param = error.get("param")
+                param = error_param if isinstance(error_param, str) else None
             else:
                 # error is a string, use it as the message
                 message = str(error)
@@ -1001,9 +1229,11 @@ def handle_error(response: _HttpResponse) -> None:
             if isinstance(detail, dict):
                 code = detail.get("code")
                 message = detail.get("message", str(detail))
+                detail_param = detail.get("param")
+                param = detail_param if isinstance(detail_param, str) else None
             else:
                 message = str(detail)
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, UnpackException):
         # Fall back to raw text
         message = response.text or message
 
@@ -1018,12 +1248,33 @@ def handle_error(response: _HttpResponse) -> None:
     # Fallback dispatch — ``model`` is only attached by the helper-style
     # short-circuit (``raise_if_input_too_long``) on the extract path.
     if response.status_code == HTTP_SERVICE_UNAVAILABLE and code == PROVISIONING_ERROR_CODE:
-        raise ProvisioningError(message, retry_after=get_retry_after(response))
+        raise ProvisioningError(message, retry_after=get_retry_after(response), param=param)
     if response.status_code == HTTP_CLIENT_ERROR and code == INPUT_TOO_LONG_ERROR_CODE:
-        raise InputTooLongError(message, request=request)
+        raise InputTooLongError(message, param=param, request=request)
+    # Rate limit (pass-2 audit B1). Retried on the admission ladder in the
+    # buffered loops; a give-up there raises RateLimitError directly. This arm
+    # covers the terminal paths (streaming, list_models, estimate, …) so a 429
+    # is always a typed RateLimitError rather than a generic RequestError.
+    if response.status_code == HTTP_TOO_MANY_REQUESTS:
+        raise RateLimitError(message, code=code, retry_after=get_retry_after(response), param=param, request=request)
+    # Terminal credit / account failures (pass-2 audit B3). 402/403 are NEVER
+    # retried — they have no arm on any retry ladder, so they surface here on
+    # the first response. Unrecognised 402/403 codes stay generic RequestError.
+    if response.status_code == HTTP_PAYMENT_REQUIRED:
+        if code == INSUFFICIENT_CREDITS_ERROR_CODE:
+            raise InsufficientCreditsError(message, param=param, request=request)
+        if code == KEY_SPEND_LIMIT_EXCEEDED_ERROR_CODE:
+            raise SpendLimitError(message, param=param, request=request)
+    if response.status_code == HTTP_FORBIDDEN and code in (
+        ACCOUNT_SUSPENDED_ERROR_CODE,
+        ACCOUNT_PENDING_REVIEW_ERROR_CODE,
+    ):
+        raise AccountInactiveError(message, code=code, param=param, request=request)
+    if response.status_code == HTTP_SERVICE_UNAVAILABLE and code == ACCOUNT_STATE_UNAVAILABLE_ERROR_CODE:
+        raise AccountStateUnavailableError(message, param=param, request=request)
     if response.status_code >= HTTP_SERVER_ERROR:
-        raise ServerError(message, code=code, status_code=response.status_code, request=request)
-    raise RequestError(message, code=code, status_code=response.status_code, request=request)
+        raise ServerError(message, code=code, status_code=response.status_code, param=param, request=request)
+    raise RequestError(message, code=code, status_code=response.status_code, param=param, request=request)
 
 
 def provisioning_retry_delay(
@@ -1036,17 +1287,86 @@ def provisioning_retry_delay(
 ) -> float:
     """Return a retry delay for ``503 PROVISIONING`` or raise ``ProvisioningError``."""
     retry_after = get_retry_after(response)
+    param = get_error_param(response)
     if not wait_for_capacity:
         msg = f"No capacity available for GPU '{gpu}'. Server is provisioning."
-        raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
+        raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after, param=param)
     elapsed = time.monotonic() - start_time
     if elapsed >= timeout:
         msg = f"Provisioning timeout after {elapsed:.1f}s waiting for GPU '{gpu}'"
-        raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after)
+        raise ProvisioningError(msg, gpu=gpu, retry_after=retry_after, param=param)
     remaining = timeout - elapsed
     if retry_after is not None:
         return min(retry_after, remaining)
     return apply_jitter(min(DEFAULT_RETRY_DELAY_S, remaining))
+
+
+def admission_retry_delay(
+    response: _HttpResponse,
+    *,
+    start_time: float,
+    timeout: float,
+) -> float | None:
+    """Delay before retrying a pre-execution admission rejection, or ``None``
+    when the response is not a retryable admission signal (the caller then
+    falls through to its existing terminal handling).
+
+    Handles the pass-2 audit backpressure/billing signals that are safe to
+    retry because NO work has been published to the queue yet — they are
+    admission decisions the gateway/self-hosted server makes *before*
+    dispatch, so retrying is idempotent even on the non-idempotent generate
+    paths:
+
+    * ``429 TOO_MANY_REQUESTS`` (code ``RATE_LIMIT``, B1) — per-key/per-account
+      rate limiting. On give-up (``provision_timeout_s`` budget spent) raises a
+      typed :class:`RateLimitError` carrying the last ``Retry-After``.
+    * ``503 BILLING_CAPACITY_UNAVAILABLE`` (B2 — a gateway-local billing-family
+      cap, NOT customer credit exhaustion) and ``503 QUEUE_FULL`` (B7 —
+      self-hosted queue backpressure, #3180). On give-up raises the server's
+      terminal 503 verbatim via :func:`handle_error` (a :class:`ServerError`
+      preserving the code).
+
+    Retry timing mirrors :func:`provisioning_retry_delay`: the server-supplied
+    ``Retry-After`` is honored verbatim, and only the SDK's own fallback default
+    is jittered. Give-up mirrors :func:`_handle_oom_retry`: when the budget is
+    spent OR the next wait would consume the rest of it (leaving no room for the
+    retried request to run), the typed root cause is surfaced NOW instead of
+    sleeping the budget away and letting the outer loop's ``remaining <= 0``
+    guard mask it as a ``ProvisioningError``.
+
+    IMPORTANT: 402/403 credit/account failures are deliberately NOT handled
+    here. They are terminal and must never be retried; :func:`handle_error`
+    maps them to typed exceptions on the first response.
+    """
+    status = response.status_code
+    if status == HTTP_TOO_MANY_REQUESTS:
+        retry_after = get_retry_after(response)
+        elapsed = time.monotonic() - start_time
+        remaining = timeout - elapsed
+        delay = retry_after if retry_after is not None else apply_jitter(min(RATE_LIMIT_DEFAULT_DELAY_S, remaining))
+        if remaining <= 0 or delay >= remaining:
+            msg = f"Rate limited (429); retry budget ({timeout:.1f}s) exhausted after {elapsed:.1f}s"
+            raise RateLimitError(
+                msg,
+                retry_after=retry_after,
+                param=get_error_param(response),
+                request=parse_request_metadata(response.headers),
+            )
+        return delay
+    if status == HTTP_SERVICE_UNAVAILABLE and get_error_code(response) in BACKPRESSURE_503_ERROR_CODES:
+        retry_after = get_retry_after(response)
+        elapsed = time.monotonic() - start_time
+        remaining = timeout - elapsed
+        delay = (
+            retry_after if retry_after is not None else apply_jitter(min(BACKPRESSURE_503_DEFAULT_DELAY_S, remaining))
+        )
+        if remaining <= 0 or delay >= remaining:
+            # Budget spent (or the next wait would consume it): surface the
+            # server's terminal 503 (ServerError, code preserved) now.
+            # ``handle_error`` is NoReturn.
+            handle_error(response)
+        return delay
+    return None
 
 
 def next_stream_retry_delay(
@@ -1108,7 +1428,9 @@ def next_stream_retry_delay(
                     msg,
                     model=model,
                     retries=oom_retries,
+                    param=get_error_param(response),
                     request=parse_request_metadata(response.headers),
+                    retry_after=get_retry_after(response),
                 )
             delay = compute_oom_backoff(get_retry_after(response), oom_retries)
             return min(delay, timeout - elapsed), oom_retries + 1
@@ -1123,6 +1445,7 @@ def next_stream_retry_delay(
             msg,
             code=get_error_code(response),
             status_code=status,
+            param=get_error_param(response),
             request=parse_request_metadata(response.headers),
         )
 
@@ -1144,6 +1467,7 @@ def next_stream_retry_delay(
         msg,
         code=get_error_code(response),
         status_code=status,
+        param=get_error_param(response),
         request=parse_request_metadata(response.headers),
     )
 
@@ -1269,16 +1593,35 @@ def sse_headers(resolved_gpu: str | None, pool_name: str | None) -> dict[str, st
     return headers
 
 
-def sse_chunk_error(chunk: dict[str, Any]) -> tuple[str, str] | None:
-    """Return ``(code, message)`` if an SSE chunk carries a mid-stream error.
+def sse_chunk_error(chunk: dict[str, Any]) -> tuple[str, str, str | None, int | None] | None:
+    """Return ``(code, message, param, retry_after_s)`` for a typed SSE error.
 
     Both the chat and SIE-native generate surfaces put the error object at the
     top level of the chunk (see ``send_error_chunk`` in
-    ``packages/sie_gateway/src/handlers/sse.rs``).
+    ``packages/sie_gateway/src/handlers/sse.rs``). The additive retry hint is
+    trusted only for ``RESOURCE_EXHAUSTED`` and only in the engine config's
+    integer ``1..=60`` domain; booleans are integers in Python, so exclude
+    them explicitly.
     """
     err = chunk.get("error")
     if isinstance(err, dict):
-        return str(err.get("code") or "error"), str(err.get("message") or "stream error")
+        code = str(err.get("code") or "error")
+        param = err.get("param")
+        retry_after_s = err.get("retry_after_s")
+        validated_retry_after_s = (
+            retry_after_s
+            if code == RESOURCE_EXHAUSTED_ERROR_CODE
+            and isinstance(retry_after_s, int)
+            and not isinstance(retry_after_s, bool)
+            and 1 <= retry_after_s <= 60
+            else None
+        )
+        return (
+            code,
+            str(err.get("message") or "stream error"),
+            param if isinstance(param, str) else None,
+            validated_retry_after_s,
+        )
     return None
 
 
@@ -1352,47 +1695,103 @@ def parse_encode_results(items: list[dict[str, Any]]) -> list[EncodeResult]:
     return results
 
 
-def validate_encode_result_count(
-    results: list[EncodeResult],
-    expected: int,
+def _missing_result_ids(
+    results: Sequence[Mapping[str, Any]],
+    submitted: Sequence[Any],
+) -> list[str] | None:
+    """Best-effort ids of submitted items absent from a shortened response.
+
+    Only computed when ids identify every position on both sides: every
+    submitted item carries a string ``id`` and every returned item echoes
+    one. Otherwise the set difference could mislabel a present-but-unnamed
+    item as missing, so the diagnostic degrades to ``None`` (positional
+    counts only).
+
+    This runs only while building an exception, so it degrades rather than
+    raises: a non-mapping item must not replace the actionable count error
+    with an ``AttributeError`` from the diagnostic itself.
+    """
+    if not all(isinstance(item, Mapping) for item in submitted):
+        return None
+    submitted_ids = [item.get("id") for item in submitted]
+    if not all(isinstance(item_id, str) for item_id in submitted_ids):
+        return None
+    returned_ids: set[str] = set()
+    for result in results:
+        result_id = result.get("id")
+        if not isinstance(result_id, str):
+            return None
+        returned_ids.add(result_id)
+    missing = [item_id for item_id in submitted_ids if isinstance(item_id, str) and item_id not in returned_ids]
+    return missing or None
+
+
+def validate_batch_result_count(
+    results: Sequence[Mapping[str, Any]],
+    # `Sequence[Any]`, not `Sequence[Mapping[...]]`: callers pass the
+    # single-or-list item argument, whose `Item | list[Item]` union survives
+    # the isinstance ternary, and only `len()` is actually required here. The
+    # id diagnostic guards element shape at runtime instead.
+    submitted: Sequence[Any],
     model: str,
     *,
+    operation: str,
     request: RequestMetadata | None = None,
 ) -> None:
-    """Guard the encode contract: exactly one result per input item.
+    """Guard the positional batch contract: exactly one result per input item.
 
-    Encode is positional — callers rely on a 1:1 input↔output correspondence:
-    ``encode()`` returns ``results[0]`` for a single-item request, and batch
-    callers (e.g. the eval harness ``SIEEncoderWrapper``) reassemble embeddings
-    by index. The contract can break with an HTTP 200 whose ``items`` list is
-    *shorter* than the request: the gateway returns mixed-success batches as
-    ``200`` carrying only the successful items (a per-item server-side failure —
-    e.g. an input exceeding the model's ``max_sequence_length`` — is dropped from
-    the body, not surfaced as an error envelope). Without this check, that short
-    list flows into a positional access and raises a context-free
-    ``IndexError: list index out of range`` deep in a caller (issue #1526).
+    Encode and extract are positional — callers rely on a 1:1 input↔output
+    correspondence: both return ``results[0]`` for a single-item request, and
+    batch callers reassemble results by index. The contract can break with an
+    HTTP 200 whose ``items`` list is *shorter* than the request: the gateway
+    returns mixed-success
+    batches as ``200`` carrying only the successful items (a per-item
+    server-side failure — e.g. an input exceeding the model's
+    ``max_sequence_length`` — is dropped from the body, not surfaced as an
+    error envelope). Without this check, that short list flows into positional
+    access: either a context-free ``IndexError`` (issue #1526) or — worse —
+    a silently misaligned zip that stores results against the wrong inputs.
 
-    Raising a typed, actionable :class:`ServerError` here keeps the failure
-    legible — it names the model and the expected vs. returned counts instead of
-    a bare ``IndexError``. A common trigger is an input that exceeds the model's
-    ``max_sequence_length``.
+    Raising a typed, actionable :class:`IncompleteBatchError` keeps the
+    failure legible: it names the model, the expected vs. returned counts,
+    the gateway request id, and — when the submitted items carried ids — the
+    ids the response dropped.
 
     Args:
-        results: Parsed encode results from the server response.
-        expected: Number of input items in the request.
+        results: Parsed results from the server response.
+        submitted: The input items submitted in this HTTP request.
         model: Model name, for the error message.
+        operation: ``"encode"`` or ``"extract"`` — selects the error code
+            and wording.
+        request: Request metadata parsed from the terminal response headers.
 
     Raises:
-        ServerError: If ``len(results) != expected``.
+        IncompleteBatchError: If ``len(results) != len(submitted)``.
     """
-    if len(results) != expected:
-        msg = (
-            f"Encode response desync for model {model!r}: server returned "
-            f"{len(results)} embedding(s) for {expected} input item(s); expected "
-            f"exactly one per input. An input may have failed server-side "
-            f"(e.g. exceeding the model's max_sequence_length) and been dropped from the batch."
-        )
-        raise ServerError(msg, code="ENCODE_RESULT_COUNT_MISMATCH", request=request)
+    if len(results) == len(submitted):
+        return
+    if operation == "encode":
+        label, noun, code = "Encode", "embedding(s)", "ENCODE_RESULT_COUNT_MISMATCH"
+    else:
+        label, noun, code = "Extract", "extraction result(s)", "EXTRACT_RESULT_COUNT_MISMATCH"
+    missing_ids = _missing_result_ids(results, submitted)
+    msg = (
+        f"{label} response desync for model {model!r}: server returned "
+        f"{len(results)} {noun} for {len(submitted)} input item(s); expected "
+        f"exactly one per input. An input may have failed server-side "
+        f"(e.g. exceeding the model's max_sequence_length) and been dropped from the batch."
+    )
+    if missing_ids is not None:
+        msg += f" Missing item id(s): {', '.join(missing_ids)}."
+    raise IncompleteBatchError(
+        msg,
+        code=code,
+        expected=len(submitted),
+        received=len(results),
+        model=model,
+        missing_ids=missing_ids,
+        request=request,
+    )
 
 
 def parse_score_result(data: dict[str, Any]) -> ScoreResult:

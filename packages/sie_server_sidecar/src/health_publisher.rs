@@ -8,8 +8,8 @@
 //! `202 provisioning` for every request.
 //!
 //! See `packages/sie_gateway/src/discovery/nats_health.rs` for the
-//! consumer side and `docs/queue-based-routing.md` for the routing
-//! contract.
+//! consumer side and `packages/sie_gateway/docs/architecture-guide.md`
+//! for the routing contract.
 //!
 //! # What the gateway actually reads
 //!
@@ -33,8 +33,8 @@
 //! signal. Backends that need explicit residency, such as Candle, must only
 //! publish models here after their readiness handshake has made them serveable.
 //!
-//! [`WorkerStatusMessage`]: https://github.com/search?q=WorkerStatusMessage+repo%3Asie-internal
-//! [`resolve_queue_route`]: https://github.com/search?q=resolve_queue_route+repo%3Asie-internal
+//! [`WorkerStatusMessage`]: https://github.com/superlinked/sie/blob/main/packages/sie_gateway/src/types/worker.rs
+//! [`resolve_queue_route`]: https://github.com/superlinked/sie/blob/main/packages/sie_gateway/src/state/worker_registry.rs
 
 use std::sync::Arc;
 use std::sync::RwLock;

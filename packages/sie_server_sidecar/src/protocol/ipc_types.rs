@@ -9,9 +9,9 @@
 //! shared Python/Rust package: adapters are standalone deliverables, and
 //! we want adapter authors to vendor the protocol like any other API client.
 //! General sidecar/Python schema parity is checked by
-//! `tools/ci/check_ipc_types_parity.py`; the response-chunk v1 subset and its
-//! limits are pinned across all three peers by
-//! `tools/ci/check_response_chunk_protocol.py`.
+//! `tools/check_ipc_types_parity.py`; the response-chunk v1 subset and its
+//! limits are pinned across the public IPC and NATS peers by
+//! `tools/check_response_chunk_protocol.py`.
 //!
 //! Wire format: `[4-byte BE length][msgpack body]`, where `body` is a
 //! msgpack **map** encoding `RequestEnvelope` / `ResponseEnvelope`.
@@ -204,9 +204,8 @@ pub enum ReadinessState {
     /// Terminal, non-retryable load failure. The Python executor
     /// reports this when the registry holds a PERMANENT `LoadFailure`
     /// (`cooldown=permanent`: `GATED` / `NOT_FOUND` / `DEPENDENCY` /
-    /// `UNKNOWN`) — the same classification the direct-HTTP
-    /// `check_not_failed` gate and the Modal lane's
-    /// `worker_runtime._terminal_load_failure` use for #1786. It exists
+    /// `UNKNOWN`) — the same classification used by the gateway
+    /// readiness gate. It exists
     /// so the sidecar can DISTINGUISH "still loading" (retry) from
     /// "dead on arrival" (dead-letter): on `Failed` the dispatcher stops
     /// re-driving `EnsureModelReady` and publishes a typed

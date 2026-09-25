@@ -140,6 +140,8 @@ export interface RequestMetadata {
   id?: string;
   /** Worker-origin immutable release/runtime identity digest. */
   executionIdentitySha256?: string;
+  /** Stable release/deployment binding shared by placement variants. */
+  executionBindingSha256?: string;
   usage?: RequestUsage;
   /**
    * Exact committed debit — the authoritative charge for this request.
@@ -202,6 +204,8 @@ export interface ModelDims {
  * under FP8; route SQL-critical traffic to a BF16 bundle via the `sql` alias).
  */
 export interface ModelCapabilities {
+  /** Whether the model supports incremental public generation output */
+  streaming?: boolean | null;
   /** Supported grammar kinds: ["json_schema", "regex", "ebnf"] */
   grammar?: string[];
   /** Whether the model supports tool / function calling */
@@ -219,24 +223,166 @@ export interface ModelCapabilities {
 }
 
 /**
+ * One entry of `ModelInfo.profiles`.
+ *
+ * Mirrors the server's `ProfileInfo` and the gateway's `ProfileInfoWire`.
+ * `is_default` marks the profile served when a request names the bare model
+ * id rather than `model@profile`.
+ */
+export interface ProfileInfo {
+  /** Whether this profile is served for a bare (un-suffixed) model id */
+  is_default?: boolean;
+}
+
+/**
+ * Diagnostic detail for a recorded model load failure.
+ *
+ * Present as `ModelInfo.lastError` when the registry holds a sticky failure
+ * (normally alongside `state === "failed"`), `null` otherwise.
+ *
+ * `permanent` is the field to branch on: `true` means the load will not
+ * auto-retry and an operator must intervene, so a client should surface the
+ * failure rather than poll.
+ */
+export interface ModelLoadError {
+  /** Stable enum value ("GATED", "OOM", ...) for client routing */
+  code: string;
+  /** Human-readable summary, including the underlying exception */
+  message: string;
+  /** How many load attempts have failed so far */
+  attempts: number;
+  /** True when the failure will not auto-retry */
+  permanent: boolean;
+}
+
+/** Queue-depth breakdown for one (model, pool) pair. */
+export interface PendingGenerationGroup {
+  model: string;
+  display_model: string;
+  pool: string;
+  count: number;
+  waiting_first_chunk: number;
+  active_streams: number;
+  republished: number;
+  oldest_request_age_ms: number;
+}
+
+/**
+ * In-flight generation work the gateway holds for a model.
+ *
+ * Gateway-only: a single `sie_server` has no queue and omits the field. This
+ * is a point-in-time telemetry snapshot, not model metadata — for continuous
+ * monitoring prefer `watch()` over polling `/v1/models`.
+ */
+export interface PendingGeneration {
+  total: number;
+  groups: PendingGenerationGroup[];
+}
+
+/**
  * Information about a model returned by listModels().
+ *
+ * Top-level keys are camelCased from the wire (see `WireModelInfo`); nested
+ * objects keep their wire shape. The declared set is pinned by
+ * `packages/wire-fixtures/model_info.json` and enforced in
+ * `tests/wireContract.test.ts`. The OpenAI-compat keys id/object/created/
+ * owned_by that `GET /v1/models/{model}` merges in are deliberately excluded
+ * — see that fixture for why.
  */
 export interface ModelInfo {
   /** Model name/identifier */
   name: string;
-  /** Whether the model is currently loaded in memory */
+  /** Whether the model is currently loaded in memory. Prefer `state`. */
   loaded: boolean;
+  /**
+   * Lifecycle state, including the terminal "failed" branch.
+   *
+   * `loaded` cannot distinguish "available" from "loading" from "failed" —
+   * all three report false.
+   */
+  state?: ModelState;
+  /** Recorded load failure (when `state === "failed"`), else null */
+  lastError?: ModelLoadError | null;
   /** Supported input types: ["text"], ["text", "image"], ["text", "document"], etc. */
   inputs: string[];
   /** Supported output types: ["dense"], ["dense", "sparse"], etc. */
   outputs: string[];
   /** Embedding dimensions for each output type */
   dims?: ModelDims;
-  /** Maximum sequence length the model supports */
-  maxSequenceLength?: number;
-  /** Advertised model capabilities (grammar, tools, code/sql/guard, LoRA adapters) */
-  capabilities?: ModelCapabilities;
+  /** Maximum sequence length the model supports; null when the config pins none */
+  maxSequenceLength?: number | null;
+  /** Pinned HF commit SHA for the weights; null for unpinned/package-backed models */
+  revision?: string | null;
+  /** Servable profiles keyed by name; address one as "model@profile" */
+  profiles?: Record<string, ProfileInfo>;
+  /** Advertised model capabilities; null for models with no `generate` task */
+  capabilities?: ModelCapabilities | null;
+  /** Gateway-only queue snapshot; absent when talking to a single server */
+  pendingGeneration?: PendingGeneration;
+  /**
+   * Short task-tier names that resolve to this model, e.g. ["rerank-fast"].
+   * Send one anywhere a model id is accepted. The gateway's internal routing
+   * defaults are never listed.
+   *
+   * Required, and empty when the model has none: `toModelInfo` normalizes a
+   * missing wire value to `[]`. A single SIE server emits no aliases at all,
+   * and making callers null-check for that would throw away the whole point
+   * of the gateway always sending an explicit empty list.
+   */
+  aliases: string[];
 }
+
+/**
+ * A `/v1/models` entry exactly as the gateway emits it, before the client
+ * camelCases the three renamed top-level keys.
+ *
+ * Declared once here (rather than inline per call site) so `listModels` and
+ * `getModel` cannot drift apart, and so the emitted key set has a single
+ * runtime witness for the golden-fixture test.
+ */
+export interface WireModelInfo {
+  name: string;
+  loaded: boolean;
+  state?: ModelState;
+  last_error?: ModelLoadError | null;
+  inputs: string[];
+  outputs: string[];
+  dims?: ModelDims;
+  max_sequence_length?: number | null;
+  revision?: string | null;
+  profiles?: Record<string, ProfileInfo>;
+  capabilities?: ModelCapabilities | null;
+  pending_generation?: PendingGeneration;
+  aliases?: string[];
+}
+
+/**
+ * Exhaustive by construction: `Record<keyof WireModelInfo, true>` rejects the
+ * object literal if a wire key is missing, and excess-property checking
+ * rejects a key that is not on `WireModelInfo`. So this stays in lockstep with
+ * the interface, and `MODEL_INFO_WIRE_FIELDS` gives the wire-contract test a
+ * runtime value to compare against the golden fixture.
+ */
+const MODEL_INFO_WIRE_FIELD_SET: Record<keyof WireModelInfo, true> = {
+  aliases: true,
+  capabilities: true,
+  dims: true,
+  inputs: true,
+  last_error: true,
+  loaded: true,
+  max_sequence_length: true,
+  name: true,
+  outputs: true,
+  pending_generation: true,
+  profiles: true,
+  revision: true,
+  state: true,
+};
+
+/** Wire-side key names of a `/v1/models` entry the SDK declares. */
+export const MODEL_INFO_WIRE_FIELDS = Object.keys(
+  MODEL_INFO_WIRE_FIELD_SET,
+) as (keyof WireModelInfo)[];
 
 /**
  * A single score entry from reranking.
@@ -597,21 +743,54 @@ export type StatusMessage = WorkerStatusMessage | ClusterStatusMessage;
  * Options for SIEClient constructor.
  */
 export interface SIEClientOptions {
-  /** Request timeout in milliseconds (default: 30000) */
+  /**
+   * Per-request timeout in MILLISECONDS (default: 30000).
+   *
+   * Note the unit: the Python SDK's equivalent knob (`timeout_s`) is in
+   * SECONDS, so a value ported verbatim is off by 1000x. Prefer the
+   * unit-encoded `timeoutMs`, which reads identically but names the unit.
+   */
+  timeoutMs?: number;
+  /**
+   * @deprecated Use `timeoutMs` — same unit (MILLISECONDS), clearer name.
+   * Kept as a back-compatible alias. If both are set, `timeoutMs` wins.
+   */
   timeout?: number;
   /** Default GPU type for all requests (e.g., "l4", "a100-80gb") */
   gpu?: string;
   /** API key for authentication (sent as Bearer token) */
   apiKey?: string;
   /**
-   * Whether to auto-retry retryable capacity signals (503 PROVISIONING,
-   * idempotent 504 gateway timeouts, transient connect errors).
+   * Default for whether the SDK waits out transient "no capacity yet"
+   * signals (each retry capped by `provisionTimeout`) or fails fast. The
+   * signals this flag controls differ by operation, because generation
+   * is non-idempotent while the encode/score/extract queue paths are
+   * idempotent:
+   *
+   * - `503 PROVISIONING` — controlled by this flag on EVERY operation:
+   *   `true` retries until `provisionTimeout` elapses; `false` throws
+   *   `ProvisioningError` on the first signal.
+   * - `504` gateway-result timeout and connect-time `SIEConnectionError`
+   *   (`kind === "connect"`) — controlled by this flag on the idempotent
+   *   encode/score/extract paths ONLY: retried when `true`, thrown when
+   *   `false`. On the non-idempotent generate/chat paths a `504` and any
+   *   fetch-level connection failure are NEVER retried under any flag
+   *   value — the request may already be executing, so a retry could
+   *   double-bill a generation.
+   * - `503 MODEL_LOADING` and `503 RESOURCE_EXHAUSTED` — retried on ALL
+   *   operations regardless of this flag (each retry bounded by
+   *   `provisionTimeout`; `RESOURCE_EXHAUSTED` additionally bounded by a
+   *   fixed retry count): the worker has already accepted the request.
+   *
+   * A read/pool `SIEConnectionError` (`kind === "timeout"`) is never
+   * retried on any path.
+   *
    * Default: `true`, matching the Python SDK's `wait_for_capacity=True`.
    * BREAKING (0.7): the default was previously `false` — pass `false`
    * explicitly to fail fast.
    */
   waitForCapacity?: boolean;
-  /** Maximum time to wait for provisioning in milliseconds (default: 300000) */
+  /** Maximum time to wait for provisioning in milliseconds (default: 900000, matching the Python SDK) */
   provisionTimeout?: number;
   /**
    * Control-plane base URL for the `connections` namespace (connector
@@ -783,6 +962,7 @@ export interface GenerationUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  images?: number;
   creditsCharged?: number;
   rateBookVersion?: string;
 }
@@ -930,13 +1110,16 @@ export interface ChatMessage {
  * One content part inside a multimodal `messages[*].content` array. Text parts
  * (`text` / `input_text`) are concatenated; image parts (`image_url` /
  * `input_image`) carry a base64 `data:` URI and are accepted for vision-capable
- * generation models.
+ * generation models. One `video_url` part per request (a base64
+ * `data:video/<subtype>;base64,...` MP4/MOV, WebM/Matroska, or AVI container)
+ * is accepted for models that declare video input.
  */
 export type ChatContentPart =
   | { type: "text"; text: string }
   | { type: "input_text"; text: string }
   | { type: "image_url"; image_url: { url: string } }
-  | { type: "input_image"; image_url: string | { url: string } };
+  | { type: "input_image"; image_url: string | { url: string } }
+  | { type: "video_url"; video_url: { url: string } };
 
 /** A tool call emitted by the model. */
 export interface ToolCall {
@@ -1098,6 +1281,7 @@ export interface ChatUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  images?: number;
   credits_charged?: number;
   rate_book_version?: string;
 }
@@ -1147,6 +1331,16 @@ export interface ChatChunkChoice {
   logprobs: null;
 }
 
+/** Typed terminal error carried by a generation SSE chunk. */
+export interface GenerationChunkError {
+  code: string;
+  message: string;
+  type?: string;
+  param?: string | null;
+  /** Authoritative retry hint for RESOURCE_EXHAUSTED, in seconds. */
+  retry_after_s?: number | null;
+}
+
 /**
  * One SSE event from `streamChatCompletions`.
  *
@@ -1161,6 +1355,10 @@ export interface ChatCompletionChunk {
   system_fingerprint: string | null;
   choices: ChatChunkChoice[];
   usage?: ChatUsage;
+  /** Gateway correlation id carried in-band on terminal errors. */
+  request_id?: string;
+  /** Populated when the worker / gateway errored mid-stream. */
+  error?: GenerationChunkError;
 }
 
 /**
@@ -1174,18 +1372,28 @@ export interface ChatCompletionChunk {
  */
 export interface ChatCompletionOptions {
   /**
-   * When `true`, retry the SAFE pre-execution capacity signals
-   * (`503 PROVISIONING`, `503 MODEL_LOADING`, `503 RESOURCE_EXHAUSTED`)
-   * until `provisionTimeoutMs` elapses. When `false`, the first
-   * provisioning signal throws (`ProvisioningError` / `ModelLoadingError`
-   * / `ServerError`). Defaults to the client's `waitForCapacity`
-   * (true unless the constructor opted out).
+   * Controls `503 PROVISIONING` only: when `true`, retry it until
+   * `provisionTimeoutMs` elapses; when `false`, the first `PROVISIONING`
+   * signal throws `ProvisioningError`. Chat runs the non-idempotent
+   * generate path, so the remaining outcomes do NOT depend on this flag:
+   *
+   * - `503 MODEL_LOADING` and `503 RESOURCE_EXHAUSTED` are ALWAYS retried
+   *   (each retry bounded by `provisionTimeoutMs`; `RESOURCE_EXHAUSTED`
+   *   additionally bounded by a fixed retry count): the worker already
+   *   accepted the request.
+   * - `504` gateway timeouts and every fetch-level connection failure are
+   *   ALWAYS terminal — never retried under any flag value — because the
+   *   request may already be executing and a retry could double-bill a
+   *   generation.
+   *
+   * Defaults to the client's `waitForCapacity` (true unless the
+   * constructor opted out).
    */
   waitForCapacity?: boolean;
   /**
    * Total cumulative wall-clock budget (ms) for provisioning retries.
    * Independent of the per-attempt `timeout`. Defaults to the client's
-   * `provisionTimeout` (typically 5 minutes).
+   * `provisionTimeout` (typically 15 minutes).
    */
   provisionTimeoutMs?: number;
 }
@@ -1213,8 +1421,16 @@ export interface GenerateChunk {
   usage?: ChatUsage;
   /** Time-to-first-token, milliseconds. Terminal chunk only. */
   ttft_ms?: number;
+  /**
+   * Worker-origin execution identity, only on a successful terminal chunk.
+   * Optional complete pair with execution_binding_sha256; both are lowercase
+   * 64-hex SHA-256 digests. Older or self-hosted deployments may omit both.
+   */
+  execution_identity_sha256?: string;
+  /** Worker-origin execution binding, with the same terminal complete-pair contract. */
+  execution_binding_sha256?: string;
   /** Populated when the worker / gateway errored mid-stream. */
-  error?: { code: string; message: string };
+  error?: GenerationChunkError;
 }
 
 /**

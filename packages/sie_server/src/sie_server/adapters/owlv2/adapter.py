@@ -29,12 +29,10 @@ See: https://huggingface.co/docs/transformers/model_doc/owlv2
 from __future__ import annotations
 
 import logging
-from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
-from PIL import Image as PILImage
 
 from sie_server.adapters._base_adapter import BaseAdapter
 from sie_server.adapters._spec import AdapterSpec
@@ -42,7 +40,7 @@ from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision
 from sie_server.core.inference_output import EncodeOutput, ExtractOutput
 from sie_server.core.preprocessor import DetectionPreprocessor
 from sie_server.core.preprocessor.vision import collect_detection_prepared_items
-from sie_server.types.inputs import media_bytes
+from sie_server.types.inputs import decode_image
 from sie_server.types.responses import DetectedObject
 
 if TYPE_CHECKING:
@@ -228,7 +226,7 @@ class Owlv2Adapter(BaseAdapter):
             image_indices: list[int] = []
 
             for idx, item in enumerate(items):
-                img = self._extract_image(item)
+                img = self._extract_image(item, item_index=idx)
                 if img is not None:
                     images.append(img)
                     image_indices.append(idx)
@@ -391,7 +389,7 @@ class Owlv2Adapter(BaseAdapter):
 
         return objects
 
-    def _extract_image(self, item: Item) -> Image | None:
+    def _extract_image(self, item: Item, *, item_index: int | None = None) -> Image | None:
         """Extract PIL Image from item.
 
         Expects ImageInput format (SDK wire format with .data bytes).
@@ -406,10 +404,9 @@ class Owlv2Adapter(BaseAdapter):
         if not isinstance(img, dict) or "data" not in img:
             return None
 
-        pil_img = PILImage.open(BytesIO(media_bytes(img, kind="image")))
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-        return pil_img
+        # decode_image raises InvalidMediaError (-> 400 INVALID_INPUT) on
+        # non-bytes or undecodable payloads, and converts to RGB.
+        return decode_image(img, item_index=item_index, image_index=0)
 
     def get_preprocessor(self) -> Any | None:
         """Return preprocessor for CPU/GPU overlap.

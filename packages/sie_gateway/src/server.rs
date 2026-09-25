@@ -417,8 +417,26 @@ fn active_lease_values(
     })
 }
 
+/// Where the customer-facing `event="api_request"` audit record is emitted for
+/// one composition.
+///
+/// The record's `status` is read as the status the client received, so the
+/// [`AuditLayer`] has to sit outside everything that can replace a response.
+/// See the `middleware::audit` module docs for the full contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditPlacement {
+    /// Emit inside this route stack. Correct wherever nothing outside the core
+    /// rewrites a handler response — the OSS composition.
+    Core,
+    /// Omit the layer here. The caller installs [`AuditLayer`] itself, outside
+    /// every response-rewriting layer it adds, so the record carries the final
+    /// status when managed billing rewrites an inner 503 to 402.
+    #[allow(dead_code)] // Managed composition API; unused by the standalone gateway binary.
+    Composition,
+}
+
 pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
-    apply_request_telemetry(create_router_core(state, config))
+    apply_request_telemetry(create_router_core(state, config, AuditPlacement::Core))
 }
 
 /// Build the reusable gateway route stack without the outer request telemetry
@@ -427,10 +445,16 @@ pub fn create_router(state: Arc<AppState>, config: Arc<Config>) -> Router {
 /// Managed compositions add admission middleware and cloud-owned routes around
 /// this core, then call [`apply_request_telemetry`] after the final merge so
 /// early 401/402/403 responses are observed whenever a request signal is live.
-/// Standalone callers should use [`create_router`], which preserves the OSS
-/// composition and conditionally adds that layer.
-pub fn create_router_core(state: Arc<AppState>, config: Arc<Config>) -> Router {
-    Router::new()
+/// They also pass [`AuditPlacement::Composition`] and install the audit layer
+/// outside their own response-rewriting gates. Standalone callers should use
+/// [`create_router`], which preserves the OSS composition and conditionally
+/// adds that layer.
+pub fn create_router_core(
+    state: Arc<AppState>,
+    config: Arc<Config>,
+    audit: AuditPlacement,
+) -> Router {
+    let router = Router::new()
         // Status page
         .route("/", get(health::status_page))
         // Health endpoints
@@ -494,10 +518,14 @@ pub fn create_router_core(state: Arc<AppState>, config: Arc<Config>) -> Router {
         .route("/v1/encode/{*model}", post(proxy::proxy_encode))
         .route("/v1/score/{*model}", post(proxy::proxy_score))
         .route("/v1/extract/{*model}", post(proxy::proxy_extract))
-        .route("/v1/generate/{*model}", post(proxy::proxy_generate))
-        .layer(AuditLayer::new())
-        .layer(AuthLayer::new(config))
-        .with_state(state)
+        .route("/v1/generate/{*model}", post(proxy::proxy_generate));
+
+    let router = match audit {
+        AuditPlacement::Core => router.layer(AuditLayer::new()),
+        AuditPlacement::Composition => router,
+    };
+
+    router.layer(AuthLayer::new(config)).with_state(state)
 }
 
 #[cfg(test)]
@@ -885,19 +913,19 @@ mod capacity_snapshot_tests {
 
 #[cfg(test)]
 mod flat_404_tests {
-    //! Flat-404 wire contract for managed-service routes (#1757).
+    //! Flat-404 wire contract for unregistered compatibility routes.
     //!
     //! The Files, Batches, batch-cancel, and file-upload surfaces
     //! (`/v1/files*`, `/v1/batches*`, `/v1/batches/{id}/cancel`,
-    //! `POST /v1/files`) are OpenAI-compatible routes the *managed
-    //! service* fronts (see `sie_tools`/`sie_sdk` `.files`/`.batches`);
-    //! the inference-edge gateway does NOT back them. Because they are
-    //! not registered in [`create_router`] and there is no custom
-    //! `.fallback()`, axum's default fallback answers them with a
-    //! **flat 404**: status `404 Not Found` and an **empty body**.
+    //! `POST /v1/files`) are OpenAI-compatible routes that compatible
+    //! `.files`/`.batches` clients may call. The inference gateway does
+    //! not implement them. Because they are not registered in
+    //! [`create_router`] and there is no custom `.fallback()`, axum's
+    //! default fallback answers them with a **flat 404**: status
+    //! `404 Not Found` and an **empty body**.
     //!
-    //! That is the contract these tests pin: an unbacked managed-service
-    //! route returns a clean 404 with no body — never a leaky/verbose
+    //! That is the contract these tests pin: an unregistered compatibility
+    //! route returns a clean 404 with no body — never a leaky or verbose
     //! error envelope and never a 500. Contrast `config_api`'s
     //! `test_post_model_config_returns_405_method_not_allowed`, which
     //! covers a *registered* path hit with an unbacked method (405); an
@@ -947,12 +975,18 @@ mod flat_404_tests {
             multi_router: false,
             request_timeout: 30.0,
             max_stream_pending: 50_000,
+            max_lane_in_flight_items:
+                crate::queue::lane_admission::DEFAULT_MAX_LANE_IN_FLIGHT_ITEMS,
+            lane_backpressure_enforce: false,
             stream_max_age_s: 1_800,
+            stream_storage: crate::config::StreamStorage::Memory,
+            stream_num_replicas: 1,
             configured_gpus: Vec::new(),
             gpu_profile_map: HashMap::new(),
             configured_physical_lanes: Default::default(),
             static_queue_pools: Vec::new(),
             model_aliases: HashMap::new(),
+            published_model_aliases: Default::default(),
             bundles_dir: bundles_dir.to_string(),
             models_dir: models_dir.to_string(),
             payload_store_url: String::new(),
@@ -1010,7 +1044,7 @@ mod flat_404_tests {
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
-            "{method} {uri} must return a flat 404 (unbacked managed-service route), got {status}",
+            "{method} {uri} must return a flat 404 (unregistered compatibility route), got {status}",
         );
         // Explicitly guard against a 5xx masquerading — the route must be
         // rejected by the fallback, never reach a handler that could 500.

@@ -323,6 +323,55 @@ Gateway service name (used for worker discovery)
 {{- end }}
 
 {{/*
+Gateway preStop sleep (seconds), read once so the Deployment's lifecycle hook
+and the derived grace period below can never disagree.
+Consume with: include "sie-cluster.gateway.preStopSleepSeconds" .
+*/}}
+{{- define "sie-cluster.gateway.preStopSleepSeconds" -}}
+{{- $drain := default (dict) (default (dict) .Values.gateway).drain -}}
+{{- $preStopS := int (dig "preStopSleepSeconds" 10 $drain) -}}
+{{- if lt $preStopS 0 -}}
+{{- fail (printf "gateway.drain.preStopSleepSeconds must be >= 0, got %d: a negative sleep renders an invalid preStop hook and shortens the derived terminationGracePeriodSeconds" $preStopS) -}}
+{{- end -}}
+{{- $preStopS -}}
+{{- end -}}
+
+{{/*
+Gateway terminationGracePeriodSeconds, DERIVED from the gateway drain budget so
+the two numbers cannot drift apart.
+
+Shutting a gateway pod down is three serial phases, and the grace period is the
+single clock covering all of them (kubelet starts it when the pod goes
+Terminating, i.e. before preStop runs):
+
+  1. gateway.drain.preStopSleepSeconds — preStop sleep. The pod is already out
+     of the EndpointSlice, but kube-proxy/ingress dataplane updates are
+     eventually consistent, so it keeps serving newly-arriving requests. No
+     SIGTERM is delivered during this window.
+  2. gateway.drain.inFlightSeconds — axum graceful shutdown after SIGTERM. It is
+     unbounded in the binary (packages/sie_gateway/src/main.rs), so this value
+     is the real bound: the longest response the gateway may still be carrying,
+     including SSE generation streams and queued-result waits.
+  3. QUEUE_DRAIN_S — the fixed post-serve `drain_pending(5s)` in the same file,
+     which lets already-published work items land their NATS `_INBOX` replies
+     instead of dying with the subscription.
+
+Whatever is still running when the grace period expires is SIGKILLed, which is
+exactly the mid-response connection cut this budget exists to prevent.
+Consume with: include "sie-cluster.gateway.terminationGracePeriodSeconds" .
+*/}}
+{{- define "sie-cluster.gateway.terminationGracePeriodSeconds" -}}
+{{- $drain := default (dict) (default (dict) .Values.gateway).drain -}}
+{{- $preStopS := int (include "sie-cluster.gateway.preStopSleepSeconds" .) -}}
+{{- $inFlightS := int (dig "inFlightSeconds" 120 $drain) -}}
+{{- if lt $inFlightS 0 -}}
+{{- fail (printf "gateway.drain.inFlightSeconds must be >= 0, got %d: a negative budget shortens the grace period below the gateway's own fixed queue drain, so in-flight work is SIGKILLed" $inFlightS) -}}
+{{- end -}}
+{{- $queueDrainS := 5 -}}
+{{- add $preStopS $inFlightS $queueDrainS -}}
+{{- end -}}
+
+{{/*
 In-cluster URL used by workers to ask the gateway whether they are admitted
 to pull from their configured queue pool.
 */}}
@@ -410,6 +459,30 @@ Consume with: include "sie-cluster.ingress.hosts" . | fromJsonArray
 {{- end -}}
 {{- end -}}
 {{- $hosts | toJson -}}
+{{- end -}}
+
+{{/*
+nginx proxy read/send timeout (seconds) for every SIE ingress, derived from
+`workers.common.modelReadyTimeoutSec` so the edge budget cannot drift below the
+cold-load budget it fronts.
+
+The first request against an unloaded model produces no response bytes until
+the worker finishes loading it (up to modelReadyTimeoutSec), and nginx's
+proxy-read-timeout applies to exactly that no-first-byte window. An edge
+timeout below the load budget turns a healthy cold start into a 504 plus a
+client retry that can re-enter the same wait. Already-streaming responses are
+unaffected — the read timeout resets on each chunk.
+
++60s covers serving the request itself once the model is ready; the 600s floor
+preserves the chart's historical minimum when modelReadyTimeoutSec is lowered
+(note that `ingress.annotations` cannot lower it either — sprig `merge` keeps
+the destination's value, so the chart's nginx defaults win over user keys).
+Consume with: include "sie-cluster.ingress.proxyTimeoutSeconds" .
+*/}}
+{{- define "sie-cluster.ingress.proxyTimeoutSeconds" -}}
+{{- $workersCommon := default (dict) (default (dict) .Values.workers).common -}}
+{{- $modelReadyTimeoutS := int (dig "modelReadyTimeoutSec" 900 $workersCommon) -}}
+{{- max (add $modelReadyTimeoutS 60) 600 -}}
 {{- end -}}
 
 {{/*
@@ -554,6 +627,10 @@ Args (dict): base, suffix.
 alpine/k8s:1.29.10@sha256:a1f03afdc59b1acde5e740ed855079c7361505d6fed9d9c6069c8c3307264348
 {{- end }}
 
+{{- define "sie-cluster.hooks.resources" -}}
+{{- toYaml .Values.hooks.resources -}}
+{{- end }}
+
 {{/* Explicit kubectl credentials for hook containers. */}}
 {{- define "sie-cluster.kubernetes.inClusterKubeconfig" -}}
 KUBE_SERVICE_ACCOUNT_DIR=/var/run/secrets/kubernetes.io/serviceaccount
@@ -642,20 +719,24 @@ Resolution order:
      exposes the cache URL as "<scheme>://<bucket-or-container>/models" by
      convention, so the auto-derivation strips a trailing "/models" segment
      before appending "/payloads". The resulting layout is:
-       <bucket-or-container>/models/...    weights (managed by sie-admin cache)
+       <bucket-or-container>/models/...    weights (populated separately)
        <bucket-or-container>/payloads/...  large work-item refs (managed by gateway)
-     These siblings live at the bucket/container root, which is what the
-     workload IAM grants are scoped to in all three (AWS, GCP, Azure)
-     terraform modules.
+     Managed-storage payload object access is scoped to payloads/: AWS grants
+     object actions on payloads/* and conditions bucket-level ListBucket on
+     that prefix; GCP conditions payload get/create/delete on payloads/ but
+     grants storage.objects.list separately bucket-wide; and Azure conditions
+     blob data actions on payloads/ while exempting Blob.List from the path
+     condition; and Alibaba grants payload object actions on payloads/* while
+     conditioning bucket-level ListObjects on models/* and payloads/*. The
+     legacy GCP BYO-bucket path grants objectViewer bucket-wide; operators own
+     IAM scoping for other explicitly configured BYO storage.
   3. Otherwise -> empty string (payload store is off, no env vars rendered).
 
 Supported URL schemes: s3:// (AWS), gs:// (GCP), abfs:// + abfss:// (Azure
-Data Lake Storage Gen2 / Blob with hierarchical namespace enabled). The
-Azure scheme variant is treated identically to the AWS/GCP variants for
-the derivation step — the trailing "/models" → "/payloads" swap works
-the same way because Azure URLs follow the same
-"<scheme>://<container>@<account>.dfs.core.windows.net/<prefix>"
-convention exposed by the deploy/terraform/azure module.
+Data Lake Storage Gen2 / Blob with hierarchical namespace enabled), and
+oss:// (Alibaba Cloud). The trailing "/models" -> "/payloads" derivation
+works for every supported URL shape, including the ADLS Gen2
+"<scheme>://<container>@<account>.dfs.core.windows.net/<prefix>" form.
 
 Templates that consume this should treat a non-empty result as "payload
 store enabled" and an empty result as "off".
@@ -1264,10 +1345,11 @@ port; pods without a named child port are simply not endpoints for that port.
 {{- range $poolName, $pool := $root.Values.workers.pools -}}
 {{- if $pool.enabled -}}
 {{- $gpuCount := int $pool.gpu.count -}}
+{{- $deviceGroup := dig "deviceGroup" false (default dict $pool.gpu) -}}
 {{- $poolSidecar := default dict $pool.sidecar -}}
 {{- $emulatedChildCount := int (dig "emulatedChildCount" 0 $poolSidecar) -}}
 {{- $count := 1 -}}
-{{- if gt $gpuCount 1 -}}
+{{- if and (gt $gpuCount 1) (not $deviceGroup) -}}
 {{- $count = $gpuCount -}}
 {{- else if gt $emulatedChildCount 1 -}}
 {{- $count = $emulatedChildCount -}}

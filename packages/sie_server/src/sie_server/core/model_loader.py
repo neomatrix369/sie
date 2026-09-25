@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,10 @@ from typing import TYPE_CHECKING, Any
 
 from sie_server.adapters.base import ModelAdapter
 from sie_server.config.model import ModelConfig, ProfileAdaptiveBatching, lora_entry_ref
+from sie_server.config.serving_artifacts import (
+    VerifiedServingArtifact,
+    verify_and_materialize_serving_artifact,
+)
 from sie_server.core.inference import AttentionBackend, ComputePrecision
 from sie_server.core.load_errors import ModelLoadTimeoutError
 from sie_server.core.loader import load_adapter
@@ -136,6 +141,7 @@ class ModelLoader:
         max_batch_wait_ms: float | None = None,
         coalesce_ms: float | None = None,
         coalesce_ratio: float | None = None,
+        idle_coalesce_ms: float | None = None,
         max_queue_size: int | None = None,
         instrumentation: bool = False,
         max_loras_per_model: int = DEFAULT_MAX_LORAS,
@@ -162,6 +168,7 @@ class ModelLoader:
         self._max_batch_wait_ms = max_batch_wait_ms
         self._coalesce_ms = coalesce_ms
         self._coalesce_ratio = coalesce_ratio
+        self._idle_coalesce_ms = idle_coalesce_ms
         self._max_queue_size = max_queue_size
         self._instrumentation = instrumentation
         self._max_loras_per_model = max_loras_per_model
@@ -172,6 +179,15 @@ class ModelLoader:
         self._oom_recovery = oom_recovery or OomRecoveryConfig()
         self._registry_callbacks = registry_callbacks
         self._load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-load")
+        # Weight downloads run apart from instantiation so a slow fetch of one
+        # model never queues another model's instantiate behind it. The disk
+        # cache manager is not thread-safe, so its accounting calls are
+        # serialized here while the downloads themselves proceed concurrently.
+        self._download_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="model-download")
+        self._disk_cache_lock = threading.Lock()
+        # Loader-owned admission results. Catalog data can identify a derived
+        # artifact but can never inject a filesystem root into an adapter.
+        self._verified_serving_artifacts: dict[str, VerifiedServingArtifact] = {}
         # Post-download budget (instantiate + adapter.load + warmup). 0.0
         # disables the outer ``wait_for``. Download is bounded separately
         # by ``HF_HUB_DOWNLOAD_TIMEOUT``.
@@ -223,6 +239,7 @@ class ModelLoader:
             device=device,
             default_compute_precision=self._default_compute_precision,
             attention_backend=self._attention_backend,
+            verified_serving_artifact=self._verified_serving_artifacts.get(config.sie_id),
         )
 
     def ensure_weights_cached(self, config: ModelConfig) -> None:
@@ -247,12 +264,51 @@ class ModelLoader:
 
         model_id = config.hf_id
         cache_config = get_cache_config()
+        serving_artifact = config.serving_artifact_declaration()
+
+        # Never let an earlier successful admission survive a failed restage or
+        # a hot-reloaded declaration. The verified root is registered only
+        # after the exact derived snapshot and every manifest entry pass.
+        self._verified_serving_artifacts.pop(config.sie_id, None)
 
         # Base-model caching applies only to HF models, while an external
         # speculative assistant still needs staging for local weights_path.
-        if model_id is not None:
+        if serving_artifact is not None:
+            if model_id is None or config.hf_revision is None:
+                raise ValueError("derived serving artifacts require an immutable HF source identity")
+            derived_id = serving_artifact.repo_id
             if self._disk_cache is not None:
-                evicted = self._disk_cache.ensure_space_before_download(model_id)
+                evicted = self._ensure_disk_space_locked(derived_id)
+                if evicted:
+                    logger.info(
+                        "Pre-download disk eviction: freed %d model(s): %s",
+                        len(evicted),
+                        evicted,
+                    )
+            cached_repo_root = ensure_model_cached(
+                derived_id,
+                cache_config,
+                revision=serving_artifact.revision,
+            )
+            verified = verify_and_materialize_serving_artifact(
+                serving_artifact,
+                source_hf_id=model_id,
+                source_hf_revision=config.hf_revision,
+                cached_repo_root=cached_repo_root,
+                materialized_cache_root=cache_config.local_cache / "sie-serving-artifacts-v1",
+            )
+            self._verified_serving_artifacts[config.sie_id] = verified
+            if self._disk_cache is not None:
+                self._touch_disk_locked(derived_id)
+            logger.debug(
+                "Derived serving artifact %s@%s materialized at %s",
+                derived_id,
+                serving_artifact.revision,
+                verified.root,
+            )
+        elif model_id is not None:
+            if self._disk_cache is not None:
+                evicted = self._ensure_disk_space_locked(model_id)
                 if evicted:
                     logger.info(
                         "Pre-download disk eviction: freed %d model(s): %s",
@@ -262,7 +318,7 @@ class ModelLoader:
 
             cached_path = ensure_model_cached(model_id, cache_config, revision=config.hf_revision)
             if self._disk_cache is not None:
-                self._disk_cache.touch(model_id)
+                self._touch_disk_locked(model_id)
             logger.debug("Model %s available at %s", model_id, cached_path)
 
         # External speculative assistants are separate checkpoints. Stage each
@@ -270,7 +326,7 @@ class ModelLoader:
         # engine-owned, moving-branch download during launch.
         for draft_model, revision in config.speculative_draft_revisions().items():
             if self._disk_cache is not None:
-                evicted = self._disk_cache.ensure_space_before_download(draft_model)
+                evicted = self._ensure_disk_space_locked(draft_model)
                 if evicted:
                     logger.info(
                         "Pre-download disk eviction for speculative draft: freed %d model(s): %s",
@@ -279,7 +335,7 @@ class ModelLoader:
                     )
             draft_path = ensure_model_cached(draft_model, cache_config, revision=revision)
             if self._disk_cache is not None:
-                self._disk_cache.touch(draft_model)
+                self._touch_disk_locked(draft_model)
             logger.debug(
                 "Speculative draft %s@%s available at %s",
                 draft_model,
@@ -287,11 +343,22 @@ class ModelLoader:
                 draft_path,
             )
 
+    def _ensure_disk_space_locked(self, model_id: str) -> list[str]:
+        assert self._disk_cache is not None
+        with self._disk_cache_lock:
+            return self._disk_cache.ensure_space_before_download(model_id)
+
+    def _touch_disk_locked(self, model_id: str) -> None:
+        assert self._disk_cache is not None
+        with self._disk_cache_lock:
+            self._disk_cache.touch(model_id)
+
     async def ensure_weights_cached_async(self, name: str, config: ModelConfig) -> None:
         """Async version of :meth:`ensure_weights_cached`.
 
-        Runs the (potentially long) download on the load executor so it
-        doesn't block the event loop. Intentionally NOT wrapped in
+        Runs the (potentially long) download on the download executor, apart
+        from the single-threaded load executor, so it blocks neither the event
+        loop nor another model's instantiation. Intentionally NOT wrapped in
         ``asyncio.wait_for`` — slow networks are allowed; stalls are
         detected by ``HF_HUB_DOWNLOAD_TIMEOUT`` inside ``huggingface_hub``.
 
@@ -301,7 +368,7 @@ class ModelLoader:
         """
         logger.debug("Ensuring weights cached for '%s'", name)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._load_executor, self.ensure_weights_cached, config)
+        await loop.run_in_executor(self._download_executor, self.ensure_weights_cached, config)
 
     async def instantiate_adapter_async(
         self,
@@ -610,6 +677,9 @@ class ModelLoader:
             max_batch_requests=self._max_batch_requests or WorkerConfig().max_batch_requests,
             max_batch_wait_ms=self._max_batch_wait_ms or WorkerConfig().max_batch_wait_ms,
             coalesce_ms=self._coalesce_ms if self._coalesce_ms is not None else WorkerConfig().coalesce_ms,
+            idle_coalesce_ms=(
+                self._idle_coalesce_ms if self._idle_coalesce_ms is not None else WorkerConfig().idle_coalesce_ms
+            ),
             coalesce_ratio=self._coalesce_ratio if self._coalesce_ratio is not None else WorkerConfig().coalesce_ratio,
             max_queue_size=self._max_queue_size or WorkerConfig().max_queue_size,
             instrumentation=self._instrumentation,
@@ -794,11 +864,16 @@ class ModelLoader:
         # Unregister postprocessors
         self._postprocessor_registry.unregister(name)
 
+        # Keep the immutable content-addressed tree on disk for reuse, but do
+        # not retain loader admission state across unload/hot-reload.
+        self._verified_serving_artifacts.pop(name, None)
+
         logger.debug("Unregistered pre/postprocessors for model '%s'", name)
 
     def shutdown(self) -> None:
         """Shutdown the loader's thread pool."""
         self._load_executor.shutdown(wait=False)
+        self._download_executor.shutdown(wait=False)
 
 
 def _run_load_with_markers(name: str, device: str, adapter: ModelAdapter) -> None:
@@ -830,6 +905,13 @@ def _raise_if_adapter_startup_timeout(name: str, started: float, exc: RuntimeErr
     from its subprocess health poll. Pattern-match on the message; narrow enough
     to not bucket genuine runtime failures as timeouts. Other adapters that grow
     their own startup timeouts should follow the same convention.
+
+    A child process that CRASHED during startup deliberately does not match:
+    the adapters raise the distinct "... process exited during startup" message
+    for that case, which stays a plain load failure. On the genuine-timeout
+    path ``timeout_s=elapsed`` below is an approximation that only holds
+    because the health poll ran the budget out (run 32945082497 showed the
+    old crash-as-timeout labeling reporting a 16.5s crash as configured=16s).
     """
     msg = str(exc).lower()
     if "failed to start within timeout" not in msg and "startup timeout" not in msg:

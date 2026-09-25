@@ -38,5 +38,10 @@ authentication protocol. The listener restricts its socket node, validates a
 domain-separated request digest and route identity, caps frame/media/request
 sizes, and rejects unresolved payload references.
 
+With the `cloud-storage` feature, payload reads support S3, GCS, Azure Blob,
+and native `oss://` Alibaba OSS Signature V4. OSS requires `SIE_OSS_REGION` and
+uses explicit environment credentials or ACK RRSA OIDC only; node metadata,
+profiles, and credential-file fallbacks are excluded.
+
 See [`docs/architecture-guide.md`](docs/architecture-guide.md) for the runtime
 contract and deployment caveats.
