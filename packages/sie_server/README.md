@@ -26,10 +26,15 @@ pip install sie-server
   pip install sie-server "transformers<5"
   ```
 
-- **OCR-VLM bundle** (LightOnOCR, GLM-OCR) — requires `transformers` 5.x, and is served with `-b transformers5`:
+- **Transformers 5 bundle** (LightOnOCR, GLM-OCR, GLiGuard, and the GLiNER2.5-Decide models) — requires
+  `transformers` 5.x, and is served with `-b transformers5`. The GLiNER2.5-Decide models also need `gliner2`
+  2.x. `sie-server` itself asks for `gliner2<2`, which the default bundle's GLiNER2 models need, so pip
+  reports that conflict when the second command below installs 2.x; the transformers5 bundle's GLiNER2
+  models are verified on 2.0.0:
 
   ```bash
   pip install sie-server "transformers>=5,<6"
+  pip install "gliner2==2.0.0"  # only for the GLiNER2.5-Decide models
   sie-server serve -b transformers5
   ```
 
@@ -168,6 +173,38 @@ graphs can exceed it by one recording: up to about 330 MB, one graph of the
 largest shape on `gliclass-large-v1.0`. On a GPU shared with other models,
 leave memory headroom, or enable graphs only where the model has the GPU to
 itself. Usage and billing do not change.
+
+### GLiNER2.5-Decide usage and limits
+
+The GLiNER2.5-Decide models (`fastino/GLiNER2.5-Decide`, `GLiNER2.5-multi-Decide`,
+`GLiNER2.5-Decide-1B`) run on `gliner2` 2.x, which the transformers5 bundle
+pins (the `transformers5` image, or a native install as described above). Each
+item is one encoder row: every question's (or label group's) name,
+instruction, and labels, then the document. One forward pass answers them all,
+so the questions of a request are not independent: adding or changing one can
+change another's probabilities and score. `usage.input_tokens` counts the
+document tokens the model reads plus the tokens of the instructions and label
+descriptions (criteria) sent with the item, as Laya and GLiClass count
+instructions and criteria. Question ids, group names, and label names are not
+counted, and an item that returns an error counts nothing.
+
+A request takes at most 64 questions or label groups, 64 options per question,
+and 1,024 options in total. Question ids and group names may have 128
+characters, labels 256, and each instruction or description 2,048, with 65,536
+characters in all. Strings that contain one of the model's prompt markers
+(`[L]`, `[P]`, `[DESCRIPTION]`, ...) are refused. The questions may take at most
+512 tokens, or half the model's window when that is less: 256 of
+`GLiNER2.5-Decide`'s 512 tokens, 512 of the others' 2,048. This bounds the
+uncounted question and label tokens read with each item; a request needing more
+fails with `INPUT_TOO_LONG`. The
+document is read up to the whole words that fit in the rest of the window; a
+word longer than 4,096 characters, text past 64 characters per token of the
+window, or 4 words per token of the window also ends what is read. Words are
+split as gliner2 splits them, in linear time. A conversation (a list state) is
+read from its newest turn back; a run of more than 4,096 characters without a
+space is read only in its last 4,096 characters, and reading stops there. An item none of whose words fits, or that does
+not fit whole with `options={"overflow_policy": "error"}`, returns a per-item
+`INPUT_TOO_LONG` error while the other items succeed.
 
 ## Configuration
 

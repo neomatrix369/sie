@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Literal
@@ -16,6 +17,7 @@ import torch
 import yaml
 from pydantic import BaseModel
 from sie_server.adapters.gliformer import adapter as adapter_module
+from sie_server.adapters.gliformer import span_decoding
 from sie_server.adapters.gliformer.adapter import GLiFormerAdapter
 from sie_server.adapters.gliformer.output_schema import compile_output_schema, shape_structured_output
 from sie_server.core.inference_output import ExtractItemError
@@ -815,6 +817,47 @@ def test_inference_is_split_into_padded_token_chunks() -> None:
     assert output.input_token_counts == [5, 5, 5]
 
 
+def test_each_document_decodes_within_its_own_allowance() -> None:
+    texts = ["Alice works here", "a much longer text about Bob who works there", "Carol stays home"]
+    adapter, model = _adapter({})
+    seen = []
+
+    def inference(batch: list[str], **_: Any) -> dict[str, Any]:
+        allowances = span_decoding._ALLOWANCES.get()
+        seen.append([allowance.remaining for allowance in allowances])
+        # A hostile first document spends its whole allowance; the others
+        # are unaffected.
+        span_decoding.row_allowance(0).spend(10**9)
+        return {"ner": [[_ner(text, text.split()[0], "person")] for text in batch]}
+
+    model.inference.side_effect = inference
+    output = adapter.extract([Item(text=text) for text in texts], labels=["person"])
+
+    counts = output.input_token_counts
+    floor, rate = adapter_module._DECODE_FLOOR, adapter_module._DECODE_UNITS_PER_TOKEN
+    assert seen == [[floor + rate * count for count in counts]]
+    assert output.errors is None
+    assert [[entity["text"] for entity in entities] for entities in output.entities] == [["Alice"], ["a"], ["Carol"]]
+    assert span_decoding._ALLOWANCES.get() is None
+
+
+def test_a_documents_allowance_does_not_depend_on_its_batch() -> None:
+    adapter, model = _adapter({}, inference_batch_tokens=16)
+    seen: dict[str, int] = {}
+
+    def inference(batch: list[str], **_: Any) -> dict[str, Any]:
+        for text, allowance in zip(batch, span_decoding._ALLOWANCES.get(), strict=True):
+            seen.setdefault(text, allowance.remaining)
+            assert seen[text] == allowance.remaining
+        return {"ner": [[] for _ in batch]}
+
+    model.inference.side_effect = inference
+    adapter.extract([Item(text="Alice works here")], labels=["person"])
+    adapter.extract([Item(text="Bob works there"), Item(text="Alice works here")], labels=["person"])
+    adapter.extract([Item(text=t) for t in ["one two three", "Alice works here", "x y z"]], labels=["person"])
+    assert len(seen) == 4
+
+
 def test_documents_are_billed_up_to_the_window_left_by_the_prompt() -> None:
     adapter, _ = _adapter({"ner": [[], []]}, max_len=10)
 
@@ -869,17 +912,44 @@ def test_outputs_are_decoded_from_host_memory() -> None:
     assert result["batch_size"] == 1
 
 
+def _relation_head(**kwargs: Any) -> SimpleNamespace:
+    def decode(ner_scores: Any, *_: Any, **__: Any) -> Any:
+        mask = torch.tensor([[True, True, False]])
+        return torch.zeros(1, 3, 2, dtype=torch.long), mask, torch.zeros(1, 3, dtype=torch.long)
+
+    return SimpleNamespace(**kwargs, _decode_relation_entity_spans=decode)
+
+
 @pytest.mark.parametrize(("current", "expected"), [(None, 100), (40, 40), (500, 100)])
 def test_relation_candidates_are_limited_at_load(current: int | None, expected: int) -> None:
-    head = SimpleNamespace(max_relation_entities=current)
+    head = _relation_head(max_relation_entities=current)
     adapter_module._limit_relation_entities(SimpleNamespace(heads={"joint_relex": head, "ner": object()}))
     assert head.max_relation_entities == expected
+
+
+def test_relation_candidates_cost_proposal_units() -> None:
+    head = _relation_head(max_relation_entities=None)
+    units = []
+
+    def decode(ner_scores: Any, *_: Any, **__: Any) -> Any:
+        units.append(span_decoding._CANDIDATE_UNITS.get())
+        return None
+
+    head._decode_relation_entity_spans = decode
+    adapter_module._limit_relation_entities(SimpleNamespace(heads={"joint_relex": head, "ner": object()}))
+    head._decode_relation_entity_spans(torch.zeros(1))
+    assert units == [span_decoding.PROPOSAL_UNITS]
+    assert span_decoding._CANDIDATE_UNITS.get() == 1
 
 
 def test_relation_limit_fails_closed_without_a_relation_head() -> None:
     for model in (SimpleNamespace(heads={"ner": object()}), SimpleNamespace()):
         with pytest.raises(RuntimeError, match="no joint relation head"):
             adapter_module._limit_relation_entities(model)
+    with pytest.raises(RuntimeError, match="no longer decodes entity candidates"):
+        adapter_module._limit_relation_entities(
+            SimpleNamespace(heads={"joint_relex": SimpleNamespace(max_relation_entities=None)})
+        )
 
 
 def test_supplied_entity_label_order_does_not_create_groups() -> None:
@@ -965,6 +1035,69 @@ def test_every_task_group_is_measured_before_inference_runs() -> None:
     with pytest.raises(InvalidInputError, match="task prompt needs 4 tokens"):
         adapter.extract(items, labels=["met"])
     model.inference.assert_not_called()
+
+
+def _prompt_measurements(model: MagicMock) -> int:
+    return sum(sequences == [["P", "P", "P"]] for sequences in model.data_processor.transformer_tokenizer.calls)
+
+
+def test_a_repeated_task_prompt_is_measured_once() -> None:
+    adapter, model = _adapter({"ner": [[]]})
+
+    for text in ("Alice works here", "Bob works there", "Alice works here"):
+        adapter.extract([Item(text=text)], labels=["person", "place"])
+
+    assert _prompt_measurements(model) == 1
+    assert model.inference.call_count == 3
+
+
+def test_task_prompts_are_cached_by_their_exact_task_arguments() -> None:
+    adapter, model = _adapter({"ner": [[]]})
+    requests: list[dict[str, Any]] = [
+        {"labels": ["person", "place"]},
+        {"labels": ["place", "person"]},
+        {"labels": ["person"], "options": {"relation_labels": ["works at"]}},
+        {"options": {"label_groups": {"a": ["x", "y"]}, "threshold": 0.0}},
+        {"options": {"label_groups": {"a": ["y", "x"]}, "threshold": 0.0}},
+        {"options": {"label_groups": {"b": ["x", "y"]}, "threshold": 0.0}},
+    ]
+
+    for request in requests:
+        adapter.extract([Item(text="Alice works here")], **request)
+    assert _prompt_measurements(model) == len(requests)
+
+    for request in requests:
+        adapter.extract([Item(text="Alice works here")], **request)
+    assert _prompt_measurements(model) == len(requests)
+
+
+def test_prompt_limits_are_checked_on_every_request() -> None:
+    adapter, model = _adapter({"ner": [[]]}, max_prompt_tokens=2)
+
+    for _ in range(2):
+        with pytest.raises(InvalidInputError, match="task prompt needs 3 tokens"):
+            adapter.extract([Item(text="Alice works here")], labels=["person"])
+
+    assert _prompt_measurements(model) == 1
+    model.inference.assert_not_called()
+
+
+def test_prompt_cache_keeps_the_most_recently_used_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(adapter_module, "_PROMPT_CACHE_SIZE", 2)
+    adapter, model = _adapter({"ner": [[]]})
+
+    def request(label: str) -> None:
+        adapter.extract([Item(text="Alice works here")], labels=[label])
+
+    for label in ("a", "b", "a", "c"):
+        request(label)
+    assert len(adapter._prompt_counts) == 2
+    assert _prompt_measurements(model) == 3
+
+    request("a")
+    assert _prompt_measurements(model) == 3
+    request("b")
+    assert _prompt_measurements(model) == 4
 
 
 def test_prompt_build_failure_is_an_internal_error() -> None:
@@ -1099,6 +1232,12 @@ def test_encode_rejects_non_dense_outputs() -> None:
 # -- Loading ---------------------------------------------------------------------------
 
 
+def _fake_heads() -> dict[str, Any]:
+    ner_head = MagicMock()
+    relation_head = _relation_head(max_relation_entities=None, _owns_ner_head=False, _reused_ner_head=ner_head)
+    return {"ner": ner_head, "joint_relex": relation_head}
+
+
 def _fake_gliformer_module(model: MagicMock) -> ModuleType:
     module = ModuleType("gliformer")
     module.GLiFormer = MagicMock()  # type: ignore[attr-defined]
@@ -1122,8 +1261,10 @@ def _fake_gliformer_module(model: MagicMock) -> ModuleType:
 def test_load_pins_snapshot_and_places_model(device: str, precision: str | None, dtype: torch.dtype) -> None:
     model = MagicMock()
     model.config = SimpleNamespace(max_len=2048, embedding_config=SimpleNamespace(projection_dim=768))
-    relation_head = SimpleNamespace(max_relation_entities=None)
-    model.model.heads = {"joint_relex": relation_head}
+    ner_head = MagicMock()
+    relation_head = _relation_head(max_relation_entities=None, _owns_ner_head=False, _reused_ner_head=ner_head)
+    model.model.heads = {"joint_relex": relation_head, "ner": ner_head}
+    set_eval_mode = model.eval
     tokenizer = model.data_processor.transformer_tokenizer
     precision_kwargs = {} if precision is None else {"compute_precision": precision}
     adapter = GLiFormerAdapter(
@@ -1137,6 +1278,9 @@ def test_load_pins_snapshot_and_places_model(device: str, precision: str | None,
 
     with (
         patch.dict(sys.modules, {"gliformer": module}),
+        patch.object(adapter_module, "_bound_span_decoding") as bound_span_decoding,
+        patch.object(adapter_module, "_assert_bounded_decoding") as assert_bounded,
+        patch.object(adapter_module, "_verify_bounded_decoding") as verify_bounded,
         patch.object(adapter_module, "snapshot_download", return_value="/staged/gliformer") as download,
     ):
         adapter.load(device)
@@ -1153,8 +1297,17 @@ def test_load_pins_snapshot_and_places_model(device: str, precision: str | None,
         max_length=2048,
     )
     model.to.assert_called_once_with(device=device, dtype=dtype)
-    model.eval.assert_called_once_with()
+    set_eval_mode.assert_called_once_with()
     model.model.register_forward_hook.assert_called_once_with(adapter_module._upcast_score_outputs)
+    ner_head.register_forward_hook.assert_called_once_with(adapter_module._mask_padded_ner_logits)
+    bound_span_decoding.assert_called_once_with()
+    assert_bounded.assert_called_once_with()
+    verify_bounded.assert_called_once_with(model)
+    # One small extraction at load, through every head the hooks check.
+    probe = model.inference.call_args
+    assert probe.args[0] == adapter_module._PROBE_TEXTS
+    assert probe.kwargs["joint_relations"] is not None
+    assert probe.kwargs["structures"] is not None
     assert relation_head.max_relation_entities == 100
     assert tokenizer.model_max_length == 2048
     assert adapter._tokenizer is tokenizer
@@ -1166,13 +1319,77 @@ def test_load_pins_snapshot_and_places_model(device: str, precision: str | None,
     assert adapter._tokenizer is None
 
 
+def test_per_request_eval_walks_the_model_only_when_it_is_training() -> None:
+    model = MagicMock()
+    model.config = SimpleNamespace(max_len=2048, embedding_config=SimpleNamespace(projection_dim=768))
+    model.model.heads = _fake_heads()
+    set_eval_mode = model.eval
+    set_eval_mode.side_effect = lambda: setattr(model, "training", False) or model
+    model.train.side_effect = lambda mode: setattr(model, "training", mode) or model
+    model.training = True
+    adapter = GLiFormerAdapter("/local/checkpoint")
+    with (
+        patch.dict(sys.modules, {"gliformer": _fake_gliformer_module(model)}),
+        patch.object(adapter_module, "_bound_span_decoding"),
+        patch.object(adapter_module, "_assert_bounded_decoding"),
+        patch.object(adapter_module, "_verify_bounded_decoding"),
+        patch.object(adapter_module.Path, "is_dir", return_value=True),
+    ):
+        adapter.load("cpu")
+    set_eval_mode.assert_called_once_with()
+
+    # GLiFormer.inference calls eval() on every request.
+    assert model.eval() is model
+    assert model.eval() is model
+    model.train.assert_not_called()
+
+    model.training = True
+    assert model.eval() is model
+    model.train.assert_called_once_with(False)
+    assert model.training is False
+
+
+def test_per_request_eval_shortcut_does_not_keep_the_model_alive() -> None:
+    class _Model:
+        training = False
+
+    model = _Model()
+    adapter_module._skip_redundant_eval(model)
+    released = weakref.ref(model)
+
+    del model
+
+    assert released() is None
+
+
+def test_load_fails_when_the_probe_forward_is_rejected() -> None:
+    model = MagicMock()
+    model.config = SimpleNamespace(max_len=2048, embedding_config=SimpleNamespace(projection_dim=768))
+    model.model.heads = _fake_heads()
+    model.inference.side_effect = RuntimeError("GLiFormer NER logits came without a matching word mask")
+    adapter = GLiFormerAdapter("/local/checkpoint")
+    with (
+        patch.dict(sys.modules, {"gliformer": _fake_gliformer_module(model)}),
+        patch.object(adapter_module, "_bound_span_decoding"),
+        patch.object(adapter_module, "_assert_bounded_decoding"),
+        patch.object(adapter_module, "_verify_bounded_decoding"),
+        patch.object(adapter_module.Path, "is_dir", return_value=True),
+        pytest.raises(RuntimeError, match="word mask"),
+    ):
+        adapter.load("cpu")
+    assert adapter._model is None
+
+
 def test_load_rejects_embedding_dimension_mismatch() -> None:
     model = MagicMock()
     model.config = SimpleNamespace(max_len=2048, embedding_config=SimpleNamespace(projection_dim=768))
-    model.model.heads = {"joint_relex": SimpleNamespace(max_relation_entities=None)}
+    model.model.heads = _fake_heads()
     adapter = GLiFormerAdapter("/local/checkpoint", dense_dim=1024)
     with (
         patch.dict(sys.modules, {"gliformer": _fake_gliformer_module(model)}),
+        patch.object(adapter_module, "_bound_span_decoding"),
+        patch.object(adapter_module, "_assert_bounded_decoding"),
+        patch.object(adapter_module, "_verify_bounded_decoding"),
         patch.object(adapter_module.Path, "is_dir", return_value=True),
         pytest.raises(ValueError, match="dimension mismatch"),
     ):
@@ -1239,6 +1456,14 @@ def test_importing_gliformer_through_the_adapter_keeps_transformers_auto_models(
         "from gliformer.backbones import LayoutDebertaConfig, LayoutDebertaModel\n"
         "assert MODEL_MAPPING[Qwen3Config] is Qwen3Model, MODEL_MAPPING[Qwen3Config]\n"
         "assert MODEL_MAPPING[LayoutDebertaConfig] is LayoutDebertaModel\n"
+        "from gliformer.tasks.span_decoder import SpanDecoder\n"
+        "assert SpanDecoder._calculate_span_score._sie_bounded is True\n"
+        "import importlib\n"
+        "from sie_server.adapters.gliformer import adapter\n"
+        "for name in adapter._PROPOSAL_MODULES:\n"
+        "    module = importlib.import_module(name)\n"
+        "    assert module.extract_spans_from_tokens._sie_bounded is True, name\n"
+        "adapter._assert_bounded_decoding()\n"
     )
     result = subprocess.run(  # noqa: S603 — fixed interpreter and script
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=600, check=False

@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import importlib
+import inspect
 import logging
 import math
+import operator
+import sys
 import threading
 import warnings
+import weakref
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, ClassVar
 
 import torch
@@ -31,6 +38,17 @@ from sie_server.adapters.gliformer.output_schema import (
     compile_output_schema,
     shape_structured_output,
 )
+from sie_server.adapters.gliformer.relation_decoding import make_relation_decode
+from sie_server.adapters.gliformer.span_decoding import (
+    PROPOSAL_UNITS,
+    candidate_units,
+    decoding_row,
+    document_allowances,
+    pair_spans,
+    propose_spans,
+    select_spans,
+)
+from sie_server.adapters.gliformer.structuring_decoding import make_structuring_decode
 from sie_server.core.extract_cost import MAX_EXTRACT_LABELS
 from sie_server.core.inference_output import EncodeOutput, ExtractItemError, ExtractOutput
 from sie_server.types.inputs import InvalidInputError, Item
@@ -49,12 +67,12 @@ _ERR_RELATIONS_OPTION = "GLiFormer takes relation types as options.relation_labe
 _SNAPSHOT_IGNORE_PATTERNS = ["*.gif"]
 
 # Lowest threshold for requests that decode spans (entities, relations,
-# output_schema fields). GLiFormer's span decoder pairs every start above the
-# threshold with every end above it in Python, so a near-zero threshold turns
-# decoding quadratic in words x labels (seconds at a few hundred words); the
-# relation head decodes its entities the same way. Classification decoding is
-# a sigmoid and a filter per label, so classification-only requests accept any
-# threshold.
+# output_schema fields). Span decoding keeps at most MAX_SPAN_CANDIDATES
+# (span_decoding) candidates per document, but candidates multiply as the
+# threshold falls (an entity-dense 2048-word document with 64 labels has 691
+# at 0.5 and 1334 at 0.1), and the floor keeps ordinary documents well inside
+# that bound. Classification decoding is a sigmoid and a filter per label, so
+# classification-only requests accept any threshold.
 _MIN_SPAN_THRESHOLD = 0.1
 # GLiFormer's classification decoder reads a threshold of 0 as "unset" and
 # falls back to 0.5, so 0 is passed on as the smallest positive threshold.
@@ -93,6 +111,24 @@ _MAX_TYPE_GROUPS = 64
 
 # Marks an item whose model output could not be used.
 _ITEM_ERROR = "__gliformer_item_error__"
+# Span decoding work each document may do, in span_decoding's allowance units
+# (at most about 7 microseconds of host work each on an L4 host, 1.3 at the
+# median): a floor plus an allowance per billed token of that document. A
+# document that needs more keeps the best-first prefix of each stage it can
+# afford (see span_decoding).
+# Measured with both checkpoints on 4,416 documents (short records, 2048-word
+# entity-dense text, prose, a list of names, repeated text, and 64-word
+# windows of them) and 12 tasks up to 64 labels, 20 relation types, and
+# records schemas with 16 fields or two record types: at threshold 0.5 every
+# document used at most 21% of its allowance; at 0.1 the heaviest, 64 words
+# of names with two record types, used 29,739 of 29,952 units.
+_DECODE_FLOOR = 4096
+_DECODE_UNITS_PER_TOKEN = 256
+
+# Distinct task prompts whose token counts are kept. A prompt depends only on
+# the request's task arguments, so a repeated task skips rebuilding and
+# re-tokenizing it.
+_PROMPT_CACHE_SIZE = 256
 
 _IMPORT_LOCK = threading.Lock()
 
@@ -111,6 +147,7 @@ def _import_gliformer() -> ModuleType:
         import gliformer  # ty:ignore[unresolved-import]
 
         _drop_builtin_auto_model_overrides()
+        _bound_span_decoding()
     return gliformer
 
 
@@ -148,6 +185,330 @@ def _drop_builtin_auto_model_overrides() -> None:
     for config_class in overridden:
         if getattr(mapping[config_class], "__module__", "").startswith("gliformer."):
             raise RuntimeError(f"AutoModel for {config_class.__name__} still resolves to a gliformer class")
+
+
+def _bound_span_decoding() -> None:
+    """Replace GLiFormer's span decoding hot spots with bounded, equivalent code, or fail.
+
+    Every BIO span decoder in the package (entities, the relation head's
+    entity candidates, structuring fields) pairs starts with ends in
+    ``SpanDecoder._calculate_span_score``, one document row at a time from
+    ``SpanDecoder.decode_bio_spans_batch``, and removes overlaps in
+    ``SpanDecoder.greedy_search``; the structuring head proposes spans with
+    GLiNER's ``extract_spans_from_tokens`` and turns them into records in
+    ``StructuringDecoder.decode``, and the relation decoder reads its scores
+    cell by cell in ``JointRelexDecoder.decode``. All of these work pair by
+    pair in Python. The
+    replacements return the same spans in the same order with the same
+    scores, and bound how many candidates a document row can produce (see
+    ``span_decoding`` and ``structuring_decoding``). The relation head builds
+    a new span decoder for every forward pass, so methods are replaced on the
+    classes.
+
+    Raises:
+        RuntimeError: A replaced function is missing, or no longer has the
+            parameters (and, in the exactly pinned gliformer package, the
+            source) that its replacement was verified against.
+    """
+    span_decoder = importlib.import_module("gliformer.tasks.span_decoder")
+    structuring_model = importlib.import_module("gliformer.tasks.structuring.model")
+    structuring_decoder = importlib.import_module("gliformer.tasks.structuring.decoder")
+    span_class = span_decoder.Span
+
+    def calculate_span_score(
+        self: Any,
+        start_idx: Any,
+        end_idx: Any,
+        scores_inside: torch.Tensor,
+        scores_start: torch.Tensor,
+        scores_end: torch.Tensor,
+        id_to_classes: Mapping[int, Any],
+        threshold: float,
+        max_width: int | None = None,
+    ) -> list[Any]:
+        _ = self
+        return pair_spans(
+            start_idx,
+            end_idx,
+            scores_inside,
+            scores_start,
+            scores_end,
+            id_to_classes,
+            threshold,
+            make_span=span_class,
+            max_width=max_width,
+        )
+
+    def greedy_search(self: Any, spans: list[Any], flat_ner: bool = True, multi_label: bool = False) -> list[Any]:
+        _ = self
+        return select_spans(spans, flat_ner, multi_label)
+
+    def decode_bio_spans_batch(
+        self: Any,
+        logits: torch.Tensor,
+        id_to_classes: Any,
+        batch_size: int,
+        threshold: float,
+        flat_ner: bool = True,
+        multi_label: bool = False,
+    ) -> list[list[Any]]:
+        # The package's loop, with each row marked so that its pairing draws
+        # on that document's allowance.
+        all_spans = []
+        for i in range(batch_size):
+            id_to_class_i = self._get_id_to_class(id_to_classes, i)
+            with decoding_row(i):
+                spans = self.decode_bio_spans(logits[i], id_to_class_i, threshold, flat_ner, multi_label)
+            all_spans.append(spans)
+        return all_spans
+
+    _replace_package_function(
+        span_decoder.SpanDecoder,
+        "_calculate_span_score",
+        calculate_span_score,
+        source_sha256="5e05a885577dbedbf52f3d98ad391e7cb37b7762d518b12d82a338cd2976f546",
+    )
+    _replace_package_function(
+        span_decoder.SpanDecoder,
+        "greedy_search",
+        greedy_search,
+        source_sha256="8a08975bc767870ef5e3ed9bc9ec1d2284c19c0604a9eed48480b922dbc099ad",
+    )
+    _replace_package_function(
+        span_decoder.SpanDecoder,
+        "decode_bio_spans_batch",
+        decode_bio_spans_batch,
+        source_sha256="fc2eab7aa5798d5ce07763ac451528b64fd9f4b670f684b9fd7a4813969ceba6",
+    )
+    _replace_package_function(
+        structuring_decoder.StructuringDecoder,
+        "decode",
+        make_structuring_decode(span_class, structuring_decoder.unflatten_by_batch_origin),
+        source_sha256="079bfd5f322bc10981c4150b708da41fbba6cb3742ae5e0daa4e9a4e3f31859c",
+    )
+    joint_relex_decoder = importlib.import_module("gliformer.tasks.joint_relex.decoder")
+    ner_decoder = importlib.import_module("gliformer.tasks.ner.decoder")
+    _replace_package_function(
+        joint_relex_decoder.JointRelexDecoder,
+        "decode",
+        make_relation_decode(ner_decoder.NERDecoder.decode, joint_relex_decoder.unflatten_by_batch_origin),
+        source_sha256="37d5f8ca90c546ef639e58ede17778565c233c87e1576ed9c65e2f4891c69948",
+    )
+    original_proposals = getattr(structuring_model, "extract_spans_from_tokens", None)
+    if getattr(original_proposals, "_sie_bounded", False):
+        original_proposals = original_proposals._sie_original  # ty:ignore[unresolved-attribute]
+    if not callable(original_proposals):
+        raise RuntimeError("GLiFormer's structuring head has no span proposal function to bound")
+
+    def extract_spans_from_tokens(
+        scores: torch.Tensor, labels: torch.Tensor | None = None, threshold: float = 0.5
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return propose_spans(scores, labels, threshold, original=original_proposals)
+
+    # Every gliformer module that imported GLiNER's proposal function gets the
+    # bounded one; only the structuring head calls it in gliformer 0.1.2.
+    # gliner is pinned by range, and images resolve it from the index, so its
+    # source is not hashed: loading checks the replacement's behaviour
+    # against it instead (see _verify_bounded_decoding).
+    for module_name in _PROPOSAL_MODULES:
+        module = importlib.import_module(module_name)
+        if getattr(module, "extract_spans_from_tokens", None) is not None:
+            _replace_package_function(module, "extract_spans_from_tokens", extract_spans_from_tokens)
+    _assert_bounded_decoding()
+
+
+# gliformer modules that bind GLiNER's span proposal function at import.
+_PROPOSAL_MODULES = (
+    "gliformer.tasks.structuring.model",
+    "gliformer.tasks.joint_relex.model",
+    "gliformer.tasks.anchored_extraction",
+    "gliformer.tasks.open_relex.model",
+)
+# gliformer's task decoders, imported so that their classes can be checked.
+_DECODER_MODULES = (
+    "gliformer.tasks.ner.decoder",
+    "gliformer.tasks.joint_relex.decoder",
+    "gliformer.tasks.open_relex.decoder",
+    "gliformer.tasks.structuring.decoder",
+)
+
+
+def _assert_bounded_decoding() -> None:
+    """Fail unless nothing in gliformer can still reach the unbounded functions.
+
+    Raises:
+        RuntimeError: A span decoder subclass overrides a replaced method, a
+            structuring decoder subclass overrides ``decode``, or a gliformer
+            module still binds GLiNER's own proposal function.
+    """
+    span_decoder = importlib.import_module("gliformer.tasks.span_decoder")
+    structuring_decoder = importlib.import_module("gliformer.tasks.structuring.decoder")
+    joint_relex_decoder = importlib.import_module("gliformer.tasks.joint_relex.decoder")
+    for module_name in _DECODER_MODULES:
+        importlib.import_module(module_name)
+    for base, names in (
+        (span_decoder.SpanDecoder, ("_calculate_span_score", "greedy_search", "decode_bio_spans_batch")),
+        (structuring_decoder.StructuringDecoder, ("decode",)),
+        (joint_relex_decoder.JointRelexDecoder, ("decode",)),
+    ):
+        for subclass in _subclasses(base):
+            overridden = [name for name in names if name in vars(subclass)]
+            if overridden:
+                raise RuntimeError(
+                    f"GLiFormer's {subclass.__module__}.{subclass.__qualname__} overrides {overridden}, "
+                    "which the adapter bounds"
+                )
+    proposals: Any = importlib.import_module("gliformer.tasks.structuring.model").extract_spans_from_tokens
+    original = getattr(proposals, "_sie_original", None)
+    for module_name, module in list(sys.modules.items()):
+        if module is None or not (module_name == "gliformer" or module_name.startswith("gliformer.")):
+            continue
+        if any(value is original for value in vars(module).values()):
+            raise RuntimeError(f"GLiFormer's {module_name} still binds GLiNER's unbounded span proposal function")
+
+
+def _verify_bounded_decoding(model: Any) -> None:
+    """Fail unless each replacement matches the function it replaces on a fixed input.
+
+    The input is small, so no bound applies, and it has ties, padding, nested
+    and overlapping spans, and scores exactly at the threshold. This is what
+    keeps a gliner release that changes proposal semantics from loading, since
+    gliner is pinned by range and not hashed.
+
+    Raises:
+        RuntimeError: A replacement's output differs from the original's.
+    """
+    span_decoder = importlib.import_module("gliformer.tasks.span_decoder")
+    structuring_model = importlib.import_module("gliformer.tasks.structuring.model")
+    structuring_decoder = importlib.import_module("gliformer.tasks.structuring.decoder")
+    _ = model
+    # The replaced code reads no configuration, so a blank one keeps the check
+    # independent of the checkpoint.
+    decoder = span_decoder.SpanDecoder(SimpleNamespace())
+    generator = torch.Generator().manual_seed(0)
+    logits = torch.randn(2, 24, 3, 3, generator=generator) * 3
+    logits[:, 2:6, 0, :] = 4.0  # a run of saturated, tied scores
+    logits[:, 4, 1, 2] = torch.tensor(0.3).logit()  # inside exactly at the threshold
+    logits[1, 18:] = float("-inf")  # padding
+
+    def check(name: str, original: Any, replacement: Any, same: Callable[[Any, Any], bool] = operator.eq) -> None:
+        if not same(original, replacement):
+            raise RuntimeError(f"GLiFormer's {name} no longer matches its bounded replacement")
+
+    names = {0: "a", 1: "b", 2: "c"}
+    for threshold in (0.3, 0.5):
+        start, end, inside = logits[0].permute(2, 0, 1)
+        args = (
+            decoder._get_indices_above_threshold(start, threshold),
+            decoder._get_indices_above_threshold(end, threshold),
+            torch.sigmoid(inside),
+            torch.sigmoid(start),
+            torch.sigmoid(end),
+            names,
+            threshold,
+        )
+        pairing = vars(span_decoder.SpanDecoder)["_calculate_span_score"]
+        spans = pairing(decoder, *args)
+        check("span pairing", pairing._sie_original(decoder, *args), spans)
+        greedy = vars(span_decoder.SpanDecoder)["greedy_search"]
+        for flat_ner in (True, False):
+            for multi_label in (True, False):
+                check(
+                    "overlap removal",
+                    greedy._sie_original(decoder, list(spans), flat_ner, multi_label),
+                    greedy(decoder, list(spans), flat_ner, multi_label),
+                )
+        batch = vars(span_decoder.SpanDecoder)["decode_bio_spans_batch"]
+        for flat_ner in (True, False):
+            check(
+                "batch span decoding",
+                batch._sie_original(decoder, logits, names, 2, threshold, flat_ner, False),
+                batch(decoder, logits, names, 2, threshold, flat_ner, False),
+            )
+        proposals = vars(structuring_model)["extract_spans_from_tokens"]
+        check(
+            "span proposal",
+            proposals._sie_original(logits, None, threshold),
+            proposals(logits, None, threshold),
+            lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b, strict=True)),
+        )
+    records = SimpleNamespace(
+        structuring_logits=torch.randn(1, 4, 6, generator=generator) * 2,
+        structuring_field_logits=torch.randn(1, 6, 3, generator=generator) * 2,
+        structuring_span_idx=torch.tensor([[[0, 1], [0, 3], [2, 2], [2, 5], [4, 4], [0, 1]]]),
+        structuring_span_mask=torch.tensor([[True, True, True, True, True, False]]),
+        structuring_anchor_mask=torch.tensor([[True, True, False, True]]),
+        structuring_batch_origin=torch.arange(1),
+        batch_size=1,
+    )
+    joint_relex_decoder = importlib.import_module("gliformer.tasks.joint_relex.decoder")
+    relation_decoder = joint_relex_decoder.JointRelexDecoder(SimpleNamespace())
+    relations = SimpleNamespace(
+        ner_logits=logits,
+        ner_batch_origin=torch.arange(2),
+        span_logits=None,
+        span_idx=None,
+        span_mask=None,
+        joint_rel_logits=torch.randn(2, 6, 3, generator=generator) * 2,
+        joint_rel_idx=torch.tensor([[[0, 1], [1, 0], [0, 2], [2, 1], [1, 2], [5, 0]]] * 2),
+        joint_rel_mask=torch.tensor([[True, True, True, True, True, False], [True, False, True, True, True, True]]),
+        joint_rel_batch_origin=torch.arange(2),
+        batch_size=2,
+    )
+    relation_decode = vars(joint_relex_decoder.JointRelexDecoder)["decode"]
+    words = [[f"w{i}" for i in range(24)]] * 2
+    for threshold in (0.3, 0.5):
+        kwargs = {"threshold": threshold, "texts": words}
+        check(
+            "relation decoding",
+            relation_decode._sie_original(relation_decoder, relations, **kwargs),
+            relation_decode(relation_decoder, relations, **kwargs),
+        )
+    record_decoder = structuring_decoder.StructuringDecoder(SimpleNamespace())
+    decode = vars(structuring_decoder.StructuringDecoder)["decode"]
+    for flat_ner in (True, False):
+        kwargs = {"threshold": 0.3, "flat_ner": flat_ner, "texts": [[f"w{i}" for i in range(8)]]}
+        check(
+            "record decoding",
+            decode._sie_original(record_decoder, records, **kwargs),
+            decode(record_decoder, records, **kwargs),
+        )
+
+
+def _subclasses(cls: type) -> list[type]:
+    found = []
+    for subclass in cls.__subclasses__():
+        found.append(subclass)
+        found.extend(_subclasses(subclass))
+    return found
+
+
+def _replace_package_function(
+    owner: Any, name: str, replacement: Callable[..., Any], *, source_sha256: str | None = None
+) -> None:
+    """Set ``owner.name`` to ``replacement`` once, if the original still matches.
+
+    Raises:
+        RuntimeError: ``owner.name`` is missing, takes other parameters than
+            ``replacement``, or its source no longer hashes to ``source_sha256``.
+    """
+    original: Any = getattr(owner, name, None)
+    label = f"{getattr(owner, '__name__', owner)}.{name}"
+    if not callable(original):
+        raise RuntimeError(f"GLiFormer's {label} is missing")
+    if getattr(original, "_sie_bounded", False):
+        return
+    if tuple(inspect.signature(original).parameters) != tuple(inspect.signature(replacement).parameters):
+        raise RuntimeError(f"GLiFormer's {label} changed its parameters")
+    if source_sha256 is not None:
+        try:
+            source = inspect.getsource(original)
+        except (OSError, TypeError) as exc:
+            raise RuntimeError(f"GLiFormer's {label} source cannot be verified") from exc
+        if hashlib.sha256(source.encode()).hexdigest() != source_sha256:
+            raise RuntimeError(f"GLiFormer's {label} changed; its bounded replacement must be verified again")
+    vars(replacement).update(_sie_bounded=True, _sie_original=original)
+    setattr(owner, name, replacement)
 
 
 class _NonFiniteScoresError(RuntimeError):
@@ -211,11 +572,31 @@ class GLiFormerAdapter(BaseAdapter):
 
     ``options["threshold"]`` (default 0.5) applies to every task in the
     request. Requests that extract entities, relations, or span-valued
-    ``output_schema`` fields need at least 0.1: below that, GLiFormer's span
-    decoding grows quadratically with the document and label count.
-    Classification-only requests (``classification_task``, ``label_groups``,
-    or an ``output_schema`` of root enums only) accept any threshold from 0,
-    where every question gets its best answer.
+    ``output_schema`` fields need at least 0.1. Classification-only requests
+    (``classification_task``, ``label_groups``, or an ``output_schema`` of
+    root enums only) accept any threshold from 0, where every question gets
+    its best answer.
+
+    Span decoding is bounded per document: at most 4096 candidate spans for
+    entities and relation endpoints, 2048 structuring proposals, 65,536
+    record field spans across all record slots, and 65,536 relations whose
+    heads and tails span at most 262,144 words. Beyond that a document keeps
+    the candidates overlap removal would take first (best score first, and
+    among equal scores in GLiFormer's own order), so it loses only results
+    that rank below every kept one; nothing in the output marks such a
+    document. The measured documents stay below every bound, so their results
+    are unchanged. Each document of a batch decodes as it would alone: the
+    padding of shorter documents never forms spans or lowers scores.
+
+    Each document's span decoding also draws on its own allowance: 4,096
+    work units plus 256 per billed token of that document. A unit is at most
+    about 7 microseconds of host work: one candidate span or record field
+    span, two per relation, 64 per structuring proposal or relation entity
+    candidate, and a fraction of a unit per score cell of the document that
+    a stage reads (a whole unit when it searches for a cut). A stage that
+    cannot afford everything keeps the best-first prefix it can afford, as
+    at the fixed bounds; the document still succeeds and bills normally, and
+    other documents are unaffected.
 
     ``options["relation_threshold"]`` raises the minimum score for relations
     only. GLiFormer decodes entities and relations with one threshold, so it
@@ -315,6 +696,7 @@ class GLiFormerAdapter(BaseAdapter):
         self._tokenizer: Any = None
         self._normalize_structures: Callable[[Any], Any] | None = None
         self._build_formatter: Callable[[Any], Any] | None = None
+        self._prompt_counts: OrderedDict[bytes, int] = OrderedDict()
         self._device: str | None = None
 
     def load(self, device: str) -> None:
@@ -345,7 +727,9 @@ class GLiFormerAdapter(BaseAdapter):
         dtype = torch.float32 if device == "cpu" else self._resolve_dtype()
         model.to(device=device, dtype=dtype)
         model.eval()
+        _skip_redundant_eval(model)
         model.model.register_forward_hook(_upcast_score_outputs)
+        _mask_padded_words(model.model)
         _limit_relation_entities(model.model)
 
         embedding_config = getattr(model.config, "embedding_config", None)
@@ -361,10 +745,16 @@ class GLiFormerAdapter(BaseAdapter):
         # tokenizer leaves unbounded; share the extraction budget instead.
         tokenizer.model_max_length = int(model.config.max_len)
 
+        # Loading the checkpoint imports the task decoders; check them too.
+        _assert_bounded_decoding()
+        _verify_bounded_decoding(model)
+        _probe_forward(model)
+
         self._model = model
         self._tokenizer = tokenizer
         self._normalize_structures = gliformer.processing.schema.normalize_structuring_schemas
         self._build_formatter = gliformer.processing.schema.build_structuring_output_formatter
+        self._prompt_counts = OrderedDict()
         self._device = device
 
     def extract(
@@ -463,6 +853,7 @@ class GLiFormerAdapter(BaseAdapter):
                 [texts[index] for index in indices],
                 task_kwargs[types],
                 [lengths[index] for index in indices],
+                [_DECODE_FLOOR + _DECODE_UNITS_PER_TOKEN * counts[index] for index in indices],
                 structures=structures,
                 threshold=threshold,
                 flat_ner=flat_ner,
@@ -516,6 +907,7 @@ class GLiFormerAdapter(BaseAdapter):
         texts: list[str],
         task_kwargs: dict[str, Any],
         lengths: list[int],
+        allowances: list[int],
         *,
         structures: dict[str, Any] | None,
         threshold: float,
@@ -523,7 +915,10 @@ class GLiFormerAdapter(BaseAdapter):
         multi_label: bool,
         max_items: int | None,
     ) -> list[dict[str, Any]]:
-        """Run ``GLiFormer.inference`` in bounded chunks; one raw result per text."""
+        """Run ``GLiFormer.inference`` in bounded chunks; one raw result per text.
+
+        ``allowances`` holds each text's span decoding allowance, in units.
+        """
         formatter = self._build_formatter(structures) if structures and self._build_formatter else None
         rows: list[dict[str, Any]] = [{} for _ in texts]
         with self._tokenizer_guard():
@@ -532,6 +927,7 @@ class GLiFormerAdapter(BaseAdapter):
                     texts,
                     chunk,
                     task_kwargs,
+                    allowances,
                     threshold=threshold,
                     flat_ner=flat_ner,
                     multi_label=multi_label,
@@ -545,6 +941,7 @@ class GLiFormerAdapter(BaseAdapter):
         texts: list[str],
         chunk: list[int],
         task_kwargs: dict[str, Any],
+        allowances: list[int],
         **inference_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Run ``chunk``, isolating documents whose scores are non-finite.
@@ -557,7 +954,7 @@ class GLiFormerAdapter(BaseAdapter):
         """
 
         def attempt(part: list[int]) -> list[dict[str, Any]] | None:
-            return self._forward(texts, part, task_kwargs, **inference_kwargs)
+            return self._forward(texts, part, task_kwargs, allowances, **inference_kwargs)
 
         def isolate(part: list[int]) -> list[dict[str, Any]]:
             if len(part) == 1:
@@ -577,11 +974,16 @@ class GLiFormerAdapter(BaseAdapter):
         texts: list[str],
         chunk: list[int],
         task_kwargs: dict[str, Any],
+        allowances: list[int],
         **inference_kwargs: Any,
     ) -> list[dict[str, Any]] | None:
-        """One forward pass; ``None`` when it produced non-finite scores."""
+        """One forward pass; ``None`` when it produced non-finite scores.
+
+        Each document starts the pass with its full allowance, so what it
+        keeps depends only on the document itself.
+        """
         try:
-            with torch.inference_mode():
+            with torch.inference_mode(), document_allowances([allowances[index] for index in chunk]):
                 results = self._model.inference(
                     [texts[index] for index in chunk],
                     **task_kwargs,
@@ -602,15 +1004,44 @@ class GLiFormerAdapter(BaseAdapter):
         return rows
 
     def _prompt_tokens(self, task_kwargs: dict[str, Any]) -> int:
-        """Build one task prompt with the package's processor and count its tokens.
+        """Count the tokens of one task prompt, measuring each distinct prompt once.
 
         GLiFormer prepends the same prompt to every document of a task group
         and truncates the combined sequence to ``max_len``, so the prompt is
-        measured once per group, not per document.
+        measured once per group, not per document. The task arguments hold
+        only strings, lists, dicts and ``None``, so their ``repr`` identifies
+        the prompt, in order. The limits are checked on every request.
 
         Raises:
             InvalidInputError: The prompt exceeds ``max_prompt_tokens`` or
                 leaves no room for a document.
+            RuntimeError: The package's processor could not build the prompt.
+        """
+        cache = self._prompt_counts
+        key = hashlib.sha256(repr(task_kwargs).encode()).digest()
+        count = cache.get(key)
+        if count is None:
+            count = self._measure_prompt(task_kwargs)
+            cache[key] = count
+            if len(cache) > _PROMPT_CACHE_SIZE:
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        if count > self._max_prompt_tokens:
+            raise InvalidInputError(
+                f"GLiFormer task prompt needs {count} tokens; labels, relation types, class labels, and "
+                f"schema fields may take at most {self._max_prompt_tokens}"
+            )
+        model = self._model
+        specials = int(model.data_processor.transformer_tokenizer.num_special_tokens_to_add(pair=False))
+        if count + specials >= int(model.config.max_len):
+            raise InvalidInputError(_ERR_PROMPT_EXHAUSTS_DOCUMENT)
+        return count
+
+    def _measure_prompt(self, task_kwargs: dict[str, Any]) -> int:
+        """Build one task prompt with the package's processor and count its tokens.
+
+        Raises:
             RuntimeError: The package's processor could not build the prompt.
         """
         model = self._model
@@ -628,18 +1059,9 @@ class GLiFormerAdapter(BaseAdapter):
             encoded = processor.transformer_tokenizer(
                 [prompt_words], is_split_into_words=True, add_special_tokens=False
             )
-            count = len(encoded["input_ids"][0])
+            return len(encoded["input_ids"][0])
         except Exception as exc:
             raise RuntimeError("GLiFormer could not build the task prompt") from exc
-        if count > self._max_prompt_tokens:
-            raise InvalidInputError(
-                f"GLiFormer task prompt needs {count} tokens; labels, relation types, class labels, and "
-                f"schema fields may take at most {self._max_prompt_tokens}"
-            )
-        specials = int(processor.transformer_tokenizer.num_special_tokens_to_add(pair=False))
-        if count + specials >= int(model.config.max_len):
-            raise InvalidInputError(_ERR_PROMPT_EXHAUSTS_DOCUMENT)
-        return count
 
     def _document_tokens(self, texts: list[str]) -> list[int]:
         """Document subwords per text before the prompt's share of the window.
@@ -680,12 +1102,136 @@ class GLiFormerAdapter(BaseAdapter):
         ]
 
 
-def _limit_relation_entities(model: Any) -> None:
-    """Keep only the most confident entities as relation candidates.
+def _skip_redundant_eval(model: Any) -> None:
+    """Make ``model.eval()`` return at once while the model is in eval mode.
 
-    The package ranks the decoded entities and slices the kept ones into
-    compact tensors before it builds entity pairs, so the pair tensors never
-    grow past this many entities per document.
+    ``GLiFormer.inference`` and ``embed_text`` call ``eval()`` on every
+    request, which walks all of the model's ~600 modules to clear training
+    flags that are already clear. The adapter never switches the model to
+    training, so only a model left in training mode still needs the walk,
+    which is what ``torch.nn.Module.eval`` does: ``train(False)``. The model
+    is held weakly, so the method stored on it adds no reference cycle.
+    """
+    model_ref = weakref.ref(model)
+
+    def eval_if_training() -> Any:
+        current = model_ref()
+        if current is not None and current.training:
+            current.train(False)
+        return current
+
+    model.eval = eval_if_training
+
+
+# Heads that run an NER pass for their own entity candidates, and the method
+# that returns it.
+_NER_CONSUMERS = {"joint_relex": "_forward_ner", "structuring": "_forward_entity_ner"}
+
+
+# A short batch that runs every head whose output the hooks check: entities
+# and relations through the relation head's NER pass, and a structuring field
+# through the structuring head's. Two lengths, so the padding mask runs too.
+_PROBE_TEXTS = ["Ada Lovelace worked with Charles Babbage in London.", "Ada lived in London."]
+_PROBE_TASKS = {
+    "entities": None,
+    "classes": None,
+    "joint_relations": {None: {"entities": ["person", "city"], "relations": ["lives in"]}},
+    "structures": {"$root": {"name": "str"}},
+}
+
+
+def _probe_forward(model: Any) -> None:
+    """Run one small extraction so a checkpoint the hooks cannot handle fails at load.
+
+    Raises:
+        RuntimeError: A hook rejected the checkpoint's outputs, for example
+            NER logits of an unexpected shape.
+    """
+    with torch.inference_mode():
+        model.inference(list(_PROBE_TEXTS), **_PROBE_TASKS, threshold=0.5, batch_size=len(_PROBE_TEXTS))
+
+
+def _mask_padded_words(model: Any) -> None:
+    """Keep the padding of shorter documents out of span decoding.
+
+    A forward pass pads every document to the longest one in its chunk, and
+    the NER head scores padded word positions with logit 0: probability 0.5
+    for start, end, and inside. Below a 0.5 threshold the span decoder then
+    pairs every padded position with every other, quadratic in the padding
+    (about 100 s for 40 short records at threshold 0.3), only for the mapping
+    step to drop those spans. At any threshold, a span that ends a shorter
+    document took the padding's 0.5 as its right neighbour and was reported
+    with score 0.5. Padded positions get logit -inf instead, so each document
+    decodes as it would alone.
+
+    The relation and structuring heads run an NER pass for their own entity
+    candidates. When they reuse the standalone NER head, its hook covers
+    them; a head with an NER head of its own gets its NER pass masked too.
+
+    Raises:
+        RuntimeError: The checkpoint has no NER head, or a relation or
+            structuring head runs an NER pass this cannot mask.
+    """
+    heads = getattr(model, "heads", None)
+    if heads is None or "ner" not in heads:
+        raise RuntimeError("GLiFormer checkpoint has no NER head to mask")
+    ner_head = heads["ner"]
+    ner_head.register_forward_hook(_mask_padded_ner_logits)
+    for name, method in _NER_CONSUMERS.items():
+        if name not in heads:
+            continue
+        head = heads[name]
+        if getattr(head, "_owns_ner_head", None) is False and vars(head).get("_reused_ner_head") is ner_head:
+            continue
+        ner_pass = getattr(head, method, None)
+        if getattr(head, "_owns_ner_head", None) is not True or not callable(ner_pass):
+            raise RuntimeError(f"GLiFormer {name} head runs an NER pass the adapter cannot mask")
+        vars(head)[method] = _masked_ner_pass(ner_pass)
+
+
+def _masked_ner_pass(ner_pass: Callable[..., Any]) -> Callable[..., Any]:
+    """``ner_pass`` with its output's padded positions masked."""
+
+    def masked(*args: Any, **kwargs: Any) -> Any:
+        return _mask_padded_ner_logits(None, args, ner_pass(*args, **kwargs))
+
+    return masked
+
+
+def _mask_padded_ner_logits(_module: Any, _args: Any, output: Any) -> Any:
+    """Forward hook: set the NER logits of padded word positions to -inf.
+
+    Raises:
+        RuntimeError: The head returned logits without a word mask of the
+            same batch and length.
+    """
+    logits = getattr(output, "logits", None)
+    if not isinstance(logits, torch.Tensor):
+        return output
+    extra = getattr(output, "extra", None)
+    mask = extra.get("mask") if isinstance(extra, Mapping) else None
+    if not isinstance(mask, torch.Tensor) or logits.dim() != 4 or tuple(mask.shape) != tuple(logits.shape[:2]):
+        raise RuntimeError("GLiFormer NER logits came without a matching word mask")
+    padded = ~mask.bool()
+    if bool(padded.any()):
+        output.logits = logits.masked_fill(padded[:, :, None, None], float("-inf"))
+    return output
+
+
+def _limit_relation_entities(model: Any) -> None:
+    """Bound the relation head's entity candidates, and budget their cost.
+
+    - Only the most confident entities are relation candidates. The package
+      ranks the decoded entities and slices the kept ones into compact
+      tensors before it builds entity pairs, so the pair tensors never grow
+      past this many entities per document.
+    - The head ranks each decoded entity with a few small tensor operations
+      in Python before it applies these bounds, so each candidate span it
+      pairs costs ``PROPOSAL_UNITS`` of its document's allowance.
+
+    Raises:
+        RuntimeError: The checkpoint has no joint relation head, or it no
+            longer decodes its entity candidates in the method this charges.
     """
     heads = getattr(model, "heads", None)
     if heads is None or "joint_relex" not in heads:
@@ -693,6 +1239,15 @@ def _limit_relation_entities(model: Any) -> None:
     head = heads["joint_relex"]
     current = getattr(head, "max_relation_entities", None)
     head.max_relation_entities = _MAX_RELATION_ENTITIES if current is None else min(current, _MAX_RELATION_ENTITIES)
+    decode = getattr(head, "_decode_relation_entity_spans", None)
+    if not callable(decode):
+        raise RuntimeError("GLiFormer's relation head no longer decodes entity candidates where the adapter expects")
+
+    def charged(*args: Any, **kwargs: Any) -> Any:
+        with candidate_units(PROPOSAL_UNITS):
+            return decode(*args, **kwargs)
+
+    vars(head)["_decode_relation_entity_spans"] = charged
 
 
 def _format_row(row: dict[str, Any], formatter: Any) -> dict[str, Any]:
