@@ -4,8 +4,8 @@ Routing is **optional**. Without the keys below, auto-route warns and skips; the
 scan itself still succeeds.
 
 **Upstream deep-links:**
-[sie-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/sie-setup.md) ·
-[model-studio-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/model-studio-setup.md).
+[SIE setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-a--superlinked-sie-required-for-routing) ·
+[Model Studio setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-b--alibaba-cloud-model-studio-escalation-only).
 
 Those project pages still describe Model Studio as “optional escalation.” Prefer
 **this page** for routing prerequisites: current AgentVetter
