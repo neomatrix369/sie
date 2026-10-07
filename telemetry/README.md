@@ -709,3 +709,49 @@ histograms, timestamps, temporality or producer domain policies. Local Prometheu
 processing remains unchanged. The pinned collector regression sends raw duplicate
 keys through both rendered receiver branches, including reversed service claims,
 nested values and missing optional fields on successive points.
+
+### Remote fallback observations
+
+The gateway emits `sie.gateway.remote.fallbacks` once when a bridge response
+commits before first output or restores its local refusal. Its bounded labels
+are operation, canonical catalog model, fallback reason, and `committed` or
+`refused`. A later streaming error is counted by the existing stream metrics.
+`sie.gateway.remote.serving.duration` records seconds between the first and
+latest committed bridges since that gateway last observed a successful local
+response for the model. A local stream resets the period only after its first
+valid output event; HTTP 200 before an error does not reset it. A gap longer than five minutes between committed
+bridges starts a new period, so an idle model's next cold request cannot inherit
+an old outage duration. Refused bridges do not extend the period. This is a
+per-replica observation, not a fleet clock.
+
+The facade retains at most 256 exact model names for the process lifetime.
+Additional models collapse to `model=other` on the counter and have no duration
+series. Disabled telemetry constructs no point attributes. The collector
+preserves only the declared attributes, exports through the existing OTLP and
+Prometheus paths, and the queue-routing dashboard displays both instruments.
+
+`sie.gateway.remote.numerical_admissions` counts each decision on a numerical
+`encode` or `score` bridge or threshold route, made when the gateway is about
+to commit to the remote attempt. Its labels are operation, canonical catalog
+model, `admitted` or `refused`, and the reason: `none`, `no_admission` (no
+eligible remote worker advertises a current admission), `local_unobserved` (a
+live local worker reports no complete process inventory) or
+`uncovered_identity` (a live local process reports an identity or model
+contract outside the admission) or `unmeasured_request` (the request sets an
+instruction or a runtime option other than `is_query`, or asks for an output
+that the admission did not measure). A local worker past the heartbeat timeout, and every worker
+until the gateway has heard worker health for one heartbeat timeout, counts as
+`local_unobserved`. A request counts once, with the decision that applied. On a
+fallback route, a request that sets an instruction or another runtime option,
+or asks for an output the model does not declare, is not a bridge candidate, so
+it records no decision. On a `threshold` route the same request records
+`unmeasured_request`. It
+keeps its own 256-model bound with the same `other` overflow, and the
+queue-routing dashboard displays it.
+
+`SIERemoteFallbackPersistent` requires recent committed activity from the same
+producer instance and collector generation before comparing its duration with
+`alertRules.remoteFallbackPersistenceSeconds` (600 by default, integer 1–86400).
+The rule uses the maximum active replica duration per model. Local success
+records zero; idle historical samples cannot sustain the alert. These metrics
+are diagnostics and do not change KEDA control signals.

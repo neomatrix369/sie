@@ -34,6 +34,7 @@ pub const METHOD_PROCESS_SCORE_BATCH: &str = "ProcessScoreBatch";
 pub const METHOD_PROCESS_EXTRACT_BATCH: &str = "ProcessExtractBatch";
 pub const METHOD_PROCESS_GENERATE: &str = "ProcessGenerate";
 pub const METHOD_WORKER_CAPABILITIES: &str = "WorkerCapabilities";
+pub const METHOD_NUMERICAL_PROFILE_SNAPSHOT: &str = "NumericalProfileSnapshot";
 pub const METHOD_SIGNAL_GENERATE_CANCEL: &str = "SignalGenerateCancel";
 /// RPC that accepts a whole pre-formed batch (mixed op kinds illegal —
 /// one `RunBatchRequest` is a single op) and returns today's
@@ -42,6 +43,11 @@ pub const METHOD_SIGNAL_GENERATE_CANCEL: &str = "SignalGenerateCancel";
 /// for backends that don't implement `run_batch` and for unit tests
 /// that don't wire a scheduler.
 pub const METHOD_RUN_BATCH: &str = "RunBatch";
+pub const METHOD_RUN_BATCH_WITH_EXECUTION_AUTHORITY_V1: &str = "RunBatchWithExecutionAuthorityV1";
+pub const METHOD_PROCESS_GENERATE_WITH_EXECUTION_AUTHORITY_V1: &str =
+    "ProcessGenerateWithExecutionAuthorityV1";
+/// Execution authority plus the numerical admission that every item names.
+pub const METHOD_RUN_BATCH_WITH_NUMERICAL_ADMISSION_V1: &str = "RunBatchWithNumericalAdmissionV1";
 pub const METHOD_APPLY_MODEL_CONFIG: &str = "ApplyModelConfig";
 pub const METHOD_REPLACE_MODEL_CONFIGS: &str = "ReplaceModelConfigs";
 pub const METHOD_SET_PINNED_MODELS: &str = "SetPinnedModels";
@@ -433,7 +439,51 @@ pub struct WorkerCapabilitiesRequest {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NumericalProfileSnapshotRequest {
+    // No caller-supplied process or profile identity.
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NumericalAdmissionObservation {
+    pub sha256: String,
+    pub kind: String,
+    pub local_identities: Vec<String>,
+    pub model_contract_sha256: String,
+    pub outputs: Vec<String>,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NumericalProfileObservation {
+    pub model_id: String,
+    #[serde(default)]
+    pub local_identity: Option<String>,
+    #[serde(default)]
+    pub model_contract_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_contract_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_execution_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<NumericalAdmissionObservation>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NumericalProfileSnapshotResponse {
+    #[serde(default)]
+    pub runtime_instance_id: Option<String>,
+    #[serde(default)]
+    pub profiles: Vec<NumericalProfileObservation>,
+    #[serde(default)]
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerCapabilitiesResponse {
+    #[serde(default)]
+    pub supports_execution_authority_v1: bool,
+    #[serde(default)]
+    pub supports_numerical_admission_v1: bool,
     #[serde(default)]
     pub has_generation_models: bool,
     #[serde(default)]
@@ -689,6 +739,8 @@ pub struct EncodeBatchItem {
     pub profile_id: Option<String>,
     #[serde(default)]
     pub bundle_config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numerical_admission_sha256: Option<String>,
     #[serde(default)]
     pub payload_fetch_ms: f64,
     /// Rust-side pre-tokenised input. `None` when the model has no
@@ -729,6 +781,10 @@ pub struct ScoreBatchItem {
     pub options: Option<serde_json::Value>,
     #[serde(default)]
     pub profile_id: Option<String>,
+    #[serde(default)]
+    pub bundle_config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numerical_admission_sha256: Option<String>,
     #[serde(default)]
     pub payload_fetch_ms: f64,
     /// Rust-side pre-tokenised input, ordering `[query, doc_0, doc_1, ...]`.
@@ -861,6 +917,10 @@ pub struct ItemOutcome {
     /// `WorkResult` wire unchanged.
     #[serde(default)]
     pub units: Option<UnitCounts>,
+    /// Seconds after which a retryable error may succeed. Optional; passed
+    /// through onto the `WorkResult` wire unchanged.
+    #[serde(default)]
+    pub retry_after_s: Option<u32>,
 }
 
 /// Mirror of `sie_server.ipc_types.UnitCounts` — a field is set only when
@@ -1267,6 +1327,7 @@ mod tests {
             postprocessing_ms: None,
             raw_output: None,
             units: None,
+            retry_after_s: None,
         };
         let bytes = rmp_serde::to_vec_named(&outcome).unwrap();
         let back: ItemOutcome = rmp_serde::from_slice(&bytes).unwrap();
@@ -1374,6 +1435,7 @@ mod tests {
             options: None,
             profile_id: None,
             bundle_config_hash: None,
+            numerical_admission_sha256: None,
             payload_fetch_ms: 0.0,
             prepared_tokens: None,
         };
@@ -1401,6 +1463,7 @@ mod tests {
             options: None,
             profile_id: None,
             bundle_config_hash: None,
+            numerical_admission_sha256: None,
             payload_fetch_ms: 0.0,
             prepared_tokens: None,
         });

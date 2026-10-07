@@ -182,6 +182,13 @@ config:
 # config deltas. It does not own config persistence or writes;
 # POST /v1/configs/models is not registered on the gateway (axum returns 405).
 gateway:
+  # -- Experimental shared-demand routing. Creates an isolated authenticated
+  # control broker; disabled deployments continue to refuse threshold policies.
+  thresholdRouting:
+    enabled: false
+    # -- Same pinned broker image used by gateway integration tests.
+    image: nats:2.12-alpine@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
+
   # -- Job/friendly model aliases → canonical model id, optionally bundle-
   # qualified. Maps a request like `model: "sql"` to a real model, and a
   # `bundle:/org/model` target pins a precision/profile bundle (e.g. route SQL
@@ -436,13 +443,15 @@ machineProfiles:
 # has the fields of the server's upstreams file: kind (sie or openai),
 # base_url (https outside loopback), rate_cap (requests_per_minute and
 # max_concurrency, required), optional breaker (failures, window_s, cooldown_s),
-# and an optional proxy_url. api_key_secret names
+# optional proxy_url, and OpenAI-only equivalence (max_age_s, record_files).
+# Proof files are trusted worker-local artifacts; this policy does not enable
+# cluster fallback. api_key_secret names
 # the Kubernetes Secret and key that hold the credential; a credential never
 # goes in values.
 # Example:
 #   team-sie:
 #     kind: sie
-#     base_url: https://sie.example.internal
+#     base_url: https://team-sie.example.com
 #     api_key_secret:
 #       name: team-sie-upstream
 #       key: api-key
@@ -911,6 +920,14 @@ workers:
     # iam.gke.io/gcp-service-account).
     serviceAccount:
       annotations: {}
+    # -- Equivalence evidence for hybrid encode and score routing. Name an
+    # existing ConfigMap whose keys are the evidence files that the upstreams'
+    # equivalence.record_files name. It is mounted read-only at
+    # /etc/sie/equivalence in remote lanes only, and every record_files path
+    # must then be /etc/sie/equivalence/<key>. Remote lanes re-read the files on
+    # use, so replacing the ConfigMap's data needs no restart.
+    equivalence:
+      configMap: ""
     # -- NetworkPolicy for the remote lanes' pods, rendered whenever a remote
     # lane is enabled. Ingress: only this release's gateway pods, on the worker
     # ports; the generic workers.networkPolicy then excludes the remote lanes.
@@ -1488,6 +1505,9 @@ serviceMonitor:
 # using an external Prometheus Operator.
 alertRules:
   enabled: false
+  # -- Alert after committed remote bridges span this many seconds without
+  # observed local success. Requires recent activity from that gateway replica.
+  remoteFallbackPersistenceSeconds: 600
 
 # -- Grafana dashboard ConfigMaps
 dashboards:

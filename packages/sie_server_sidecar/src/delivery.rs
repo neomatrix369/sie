@@ -120,6 +120,19 @@ pub enum Delivery {
 }
 
 impl Delivery {
+    pub fn execution_authority_model_matches(&self, model_id: &str) -> bool {
+        match self {
+            Self::Nats(message, ..) => {
+                crate::subject::execution_authority_model_matches(&message.subject, model_id)
+            }
+            Self::Local(..) => true,
+        }
+    }
+
+    pub fn requires_execution_authority_v1(&self) -> bool {
+        matches!(self, Self::Nats(msg, ..) if crate::subject::requires_execution_authority_v1(&msg.subject))
+    }
+
     /// True when this delivery arrived worker-directly rather than via the
     /// pool subject: a NATS message on a worker-specific direct-dispatch
     /// subject, or any local-ingest delivery (the caller addressed THIS
@@ -247,6 +260,7 @@ mod tests {
             payload_fetch_ms: None,
             units: None,
             executed_bundle_config_hash: None,
+            retry_after_s: None,
         }
     }
 

@@ -490,6 +490,7 @@ mod tests {
             watch_polling: false,
             multi_router: false,
             request_timeout: 30.0,
+            max_item_text_bytes: 2 * 1024 * 1024,
             max_stream_pending: 50_000,
             max_lane_in_flight_items:
                 crate::queue::lane_admission::DEFAULT_MAX_LANE_IN_FLIGHT_ITEMS,
@@ -782,6 +783,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -850,6 +852,9 @@ mod tests {
         hash: &str,
     ) -> crate::types::worker::WorkerStatusMessage {
         crate::types::worker::WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: name.into(),
             gpu_count: 1,
             total_gpu_slots: None,
@@ -869,6 +874,7 @@ mod tests {
             pool_name: "default".into(),
             saturated: false,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         }
     }
@@ -1081,6 +1087,7 @@ mod tests {
         let _ = state.model_registry.add_model_config(ModelConfig {
             name: "empty/model".to_string(),
             hf_revision: None,
+            routing: None,
             adapter_module: None,
             default_bundle: None,
             pool: None,

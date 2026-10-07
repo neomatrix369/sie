@@ -71,9 +71,12 @@ pub trait ModelAccessPolicy: Send + Sync {
     /// alias expansion, `__`→`/`, and case folding. A gate that decides on the
     /// caller's raw string cannot see through a registry alias, so an alias
     /// pointing at a refused model would dispatch it; deciding here is what
-    /// makes the verdict authoritative for every surface that resolves a model.
-    /// Edge gates upstream may still refuse early, but they are an optimisation,
-    /// not the decision.
+    /// makes the verdict authoritative for the model a request resolves to.
+    /// Before a bridge, the gateway also asks it about the remote profile the
+    /// bridge would serve, with the request extensions minus the
+    /// admission-outcome slot; a refusal there keeps the local route and is
+    /// neither returned nor recorded. Edge gates upstream may still refuse
+    /// early, but they are an optimisation, not the decision.
     ///
     /// `ext` carries the request extensions, so an implementation can record the
     /// refusal on whatever per-request observability slot the deployment
@@ -109,6 +112,46 @@ pub trait ModelAccessPolicy: Send + Sync {
     fn generation_route_policy(&self) -> Option<&dyn GenerationRoutePolicy> {
         None
     }
+
+    /// Whether the request for `model` may be served through its remote
+    /// profile `remote_model` for `reason`, for the caller in `ext`.
+    ///
+    /// It governs only the implicit routes of a bare model: a fallback bridge
+    /// and a `threshold` route. A request that names the remote profile,
+    /// directly or through an alias, is governed by [`Self::visible`] and
+    /// [`Self::serving_refusal`] like any other model, so a caller who can see
+    /// the remote profile can name it.
+    ///
+    /// The gateway asks only about a route it admits on its own: a bare model
+    /// whose routing names `remote_model` and permits `reason`, no caller
+    /// profile, bundle, pool or engine selector, no `X-SIE-Remote: forbid`, and
+    /// a transport with execution authority v1. [`Self::visible`] and
+    /// [`Self::serving_refusal`] have passed for `model` and for `remote_model`.
+    /// Both ids are canonical and come from the registry snapshot that holds
+    /// the route's worker hash. The gateway decides once per request, remote
+    /// profile and reason, and reuses that decision.
+    ///
+    /// `false` keeps the local route: the caller receives the answer it would
+    /// have received without a remote route. The default is `false`.
+    fn remote_route_admitted(
+        &self,
+        _model: &str,
+        _remote_model: &str,
+        _reason: RemoteRouteReason,
+        _ext: &axum::http::Extensions,
+    ) -> bool {
+        false
+    }
+}
+
+/// Why the gateway would serve a bare-model request through the model's
+/// remote profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteRouteReason {
+    /// The local route refused before accepting the work, for this trigger.
+    Fallback(crate::types::model::FallbackTrigger),
+    /// A `threshold` decision routes the request remotely.
+    Threshold,
 }
 
 /// Customer-visible generation intent selected from a validated request.
@@ -152,6 +195,20 @@ pub trait GenerationRoutePolicy: Send + Sync {
         customer_model: &str,
         intent: GenerationRequestIntent,
     ) -> Option<GovernedGenerationRoute>;
+
+    /// The governed route of `customer_model`'s remote profile for `intent`.
+    ///
+    /// `None` means generation for that model and intent is never bridged
+    /// while this policy governs generation. A bridge is planned only when
+    /// this route names the same model, bundle and pool as the registry's
+    /// remote plan, and the bridged request dispatches on this route.
+    fn resolve_remote(
+        &self,
+        _customer_model: &str,
+        _intent: GenerationRequestIntent,
+    ) -> Option<GovernedGenerationRoute> {
+        None
+    }
 }
 
 pub struct AppState {
@@ -979,6 +1036,7 @@ mod flat_404_tests {
             watch_polling: false,
             multi_router: false,
             request_timeout: 30.0,
+            max_item_text_bytes: 2 * 1024 * 1024,
             max_stream_pending: 50_000,
             max_lane_in_flight_items:
                 crate::queue::lane_admission::DEFAULT_MAX_LANE_IN_FLIGHT_ITEMS,

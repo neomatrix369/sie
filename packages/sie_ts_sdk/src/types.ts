@@ -163,6 +163,8 @@ export interface RequestMetadata {
   executionIdentitySha256?: string;
   /** Stable release/deployment binding shared by placement variants. */
   executionBindingSha256?: string;
+  /** Opaque local worker process used by numerical equivalence probes. */
+  runtimeInstanceId?: string;
   usage?: RequestUsage;
   /**
    * Exact committed debit — the authoritative charge for this request.
@@ -264,6 +266,13 @@ export interface ModelCapabilities {
 export interface ProfileInfo {
   /** Whether this profile is served for a bare (un-suffixed) model id */
   is_default?: boolean;
+  /** Immutable local-profile digest; absent/null when it cannot be identified. */
+  identity?: string | null;
+  /** Operator-bound upstream/model/profile contract digest. */
+  remote_contract_sha256?: string | null;
+  /** Digest of the serving code that runs this remote profile. */
+  remote_execution_sha256?: string | null;
+  runtime_instance_id?: string | null;
 }
 
 /**
@@ -713,12 +722,50 @@ export interface ClusterSummary {
   total_qps: number;
 }
 
+/** Process diagnostics at observation time; grants no execution authority. */
+export interface NumericalProcessInventory {
+  observed_at_unix_ms: number;
+  children: NumericalProcessObservation[];
+}
+
+export interface NumericalProcessObservation {
+  child_index: number;
+  status: "observed" | "incomplete" | "unavailable" | "invalid";
+  snapshot?: NumericalProfileSnapshot | null;
+}
+
+export interface NumericalProfileSnapshot {
+  runtime_instance_id: string | null;
+  complete: boolean;
+  profiles: NumericalProfileObservation[];
+}
+
+export interface NumericalProfileObservation {
+  model_id: string;
+  model_contract_sha256: string | null;
+  local_identity: string | null;
+  remote_contract_sha256?: string | null;
+  remote_execution_sha256?: string | null;
+  admission?: NumericalAdmissionObservation | null;
+}
+
+/** Local execution identities that current evidence covers for a model's remote profile. */
+export interface NumericalAdmissionObservation {
+  sha256: string;
+  kind: "openai" | "sie";
+  local_identities: string[];
+  model_contract_sha256: string;
+  outputs: string[];
+  expires_at_unix_ms: number;
+}
+
 export interface ClusterWorkerInfo {
   url: string;
   gpu: string;
   healthy: boolean;
   queue_depth: number;
   loaded_models: string[];
+  numerical_process_inventory?: NumericalProcessInventory;
 }
 
 export interface ModelSummary {

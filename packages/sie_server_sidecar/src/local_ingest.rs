@@ -1555,6 +1555,20 @@ fn validate_work_items_with_limit(
                 wi.operation, body.endpoint
             ));
         }
+        if wi.operation == "load" {
+            return Err(
+                "InvalidTransportBinding: load is not supported on the local-ingest lane"
+                    .to_string(),
+            );
+        }
+        if wi.numerical_admission_sha256.is_some()
+            || (wi.fallback_reason.is_some() && matches!(wi.operation.as_str(), "encode" | "score"))
+        {
+            return Err(
+                "InvalidTransportBinding: numerical admission is not supported on the local-ingest lane"
+                    .to_string(),
+            );
+        }
         if wi.model_id != body.model {
             return Err(format!(
                 "InvalidTransportBinding: model_id {:?} does not match envelope model {:?}",
@@ -1644,6 +1658,7 @@ fn error_result(wi: &WorkItem, worker_id: &str, code: &str, message: &str) -> Wo
         // caller addressed this worker's socket, not a pool subject.
         worker_direct: true,
         executed_bundle_config_hash: None,
+        retry_after_s: None,
     }
 }
 
@@ -1864,6 +1879,8 @@ mod tests {
             tracestate: None,
             timestamp: 0.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         }
     }
 
@@ -2018,6 +2035,22 @@ mod tests {
     }
 
     #[test]
+    fn work_item_validation_rejects_local_load_only_before_dispatch() {
+        let mut item = sample_work_item();
+        item.operation = "load".into();
+        item.item = None;
+        let mut body = bound_body(std::slice::from_ref(&item));
+        assert!(validate_work_items(&body, std::slice::from_ref(&item))
+            .unwrap_err()
+            .contains("does not match endpoint"));
+        body.endpoint = "load".into();
+        assert_eq!(
+            validate_work_items(&body, &[item]).unwrap_err(),
+            "InvalidTransportBinding: load is not supported on the local-ingest lane"
+        );
+    }
+
+    #[test]
     fn work_item_validation_binds_execution_authority_fields() {
         let item = sample_work_item();
         let body = bound_body(std::slice::from_ref(&item));
@@ -2034,11 +2067,25 @@ mod tests {
             .unwrap_err()
             .contains("engine"));
 
-        let mut wrong_hash = item;
+        let mut wrong_hash = item.clone();
         wrong_hash.bundle_config_hash = "other-hash".into();
         assert!(validate_work_items(&body, &[wrong_hash])
             .unwrap_err()
             .contains("bundle_config_hash"));
+
+        let mut admitted = item.clone();
+        admitted.numerical_admission_sha256 = Some("a".repeat(64));
+        assert_eq!(
+            validate_work_items(&body, &[admitted]).unwrap_err(),
+            "InvalidTransportBinding: numerical admission is not supported on the local-ingest lane"
+        );
+
+        let mut bridged = item;
+        bridged.fallback_reason = Some("provisioning".into());
+        assert_eq!(
+            validate_work_items(&body, &[bridged]).unwrap_err(),
+            "InvalidTransportBinding: numerical admission is not supported on the local-ingest lane"
+        );
     }
 
     #[test]
@@ -2422,6 +2469,8 @@ mod tests {
             tracestate: None,
             timestamp: 0.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         };
         let items = rmp_serde::to_vec_named(&vec![work_item]).unwrap();
         let request = RequestEnvelope {

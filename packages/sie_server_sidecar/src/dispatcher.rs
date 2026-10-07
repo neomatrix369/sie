@@ -53,7 +53,10 @@ use crate::scheduler::{
     ProductionSchedulerRegistry, SchedulerItem, SchedulerMeta,
 };
 use crate::shutdown::Shutdown;
-use crate::subject::{extract_model_id, is_worker_direct_work_subject};
+use crate::subject::{
+    execution_authority_model_matches, extract_model_id, is_worker_direct_work_subject,
+    requires_execution_authority_v1, requires_numerical_admission_v1,
+};
 use crate::tokenize::TokenizerRegistry;
 use crate::work_deadline::{
     apparent_age_ms, unix_now_s, ClockSkewSignal, DeadlineStatus, WorkDeadlinePolicy,
@@ -74,6 +77,16 @@ const MODEL_LOADING_ERROR_CODE: &str = "MODEL_LOADING";
 /// the Python `ErrorCode.MODEL_LOAD_FAILED`.
 const MODEL_LOAD_FAILED_ERROR_CODE: &str = "MODEL_LOAD_FAILED";
 const INVALID_INPUT_ERROR_CODE: &str = "INVALID_INPUT";
+/// A remote profile's upstream cannot serve now; retryable, like the single
+/// server's `QUEUE_FULL` for a busy or unreachable upstream.
+const QUEUE_FULL_ERROR_CODE: &str = "QUEUE_FULL";
+/// The code of a numerical admission refusal, as the backend's fence and the
+/// single server's bridge refusal report it.
+const INFERENCE_ERROR_CODE: &str = "INFERENCE_ERROR";
+const NUMERICAL_ADMISSION_RETRY_AFTER_S: u32 = 1;
+const FALLBACK_REFUSAL_MESSAGE: &str = "The remote profile cannot serve this request now";
+/// Operation of a work item that only asks the worker to load its model.
+const LOAD_OPERATION: &str = "load";
 const PAYLOAD_TOO_LARGE_ERROR_CODE: &str = "PAYLOAD_TOO_LARGE";
 const PAYLOAD_ERROR_CODE: &str = "payload_error";
 const PAYLOAD_RESOLVE_ERROR_MESSAGE: &str = "failed to resolve item";
@@ -660,6 +673,27 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    fn execution_hash_is_current(&self, wi: &WorkItem) -> bool {
+        !wi.bundle_config_hash.is_empty()
+            && self.config_apply_state.is_some()
+            && unknown_bundle_config_hash(std::iter::once(wi), self.config_apply_state.as_deref())
+                .is_none()
+    }
+
+    fn execution_authority_is_available(&self, wi: &WorkItem, needs_scheduler: bool) -> bool {
+        self.execution_hash_is_current(wi)
+            && self
+                .worker_pool
+                .execution_authority_v1()
+                .load(Ordering::Acquire)
+            && (wi.numerical_admission_sha256.is_none()
+                || self
+                    .worker_pool
+                    .numerical_admission_v1()
+                    .load(Ordering::Acquire))
+            && (!needs_scheduler || (self.scheduler_registry.is_some() && self.shutdown.is_some()))
+    }
+
     /// Construct with a default-sized concurrency semaphore from env.
     ///
     /// `scheduler_registry` + `shutdown` together gate the scheduler
@@ -778,17 +812,16 @@ impl Dispatcher {
         }
 
         let _execution_guard = if let Some(state) = self.config_apply_state.as_ref() {
-            let guard = state.lock_execution().await;
-            if !state.accepts_work(&wi.bundle_config_hash, &wi.model_id) {
-                return Err(GenerateDispatchError::new(
-                    "BUNDLE_CONFIG_MISMATCH",
-                    "worker configuration changed before generation execution",
-                ));
-            }
-            Some(guard)
+            Some(state.lock_execution().await)
         } else {
             None
         };
+        if unknown_bundle_config_hash([&wi], self.config_apply_state.as_deref()).is_some() {
+            return Err(GenerateDispatchError::new(
+                "BUNDLE_CONFIG_MISMATCH",
+                "worker configuration changed before generation execution",
+            ));
+        }
         let executed_hash = wi.bundle_config_hash.clone();
         let reply_subject = wi.reply_subject.clone();
         let expected_request_id = wi.request_id.clone();
@@ -1007,7 +1040,9 @@ impl Dispatcher {
             return false;
         };
         let telemetry = &self.runtime_state.telemetry;
-        if !self.work_deadline.enforce {
+        // A bridged caller never waits past the gateway's deadline, so
+        // admitted work is dropped then whatever the enforcement setting.
+        if !self.work_deadline.enforce && wi.numerical_admission_sha256.is_none() {
             if stage == "before_ipc" {
                 telemetry.work_item_deadline_exceeded(&wi.operation, "executed");
                 if let Some(suppressed) = EXPIRED_EXECUTE_WARNINGS.allow() {
@@ -1161,11 +1196,12 @@ fn unknown_bundle_config_hash<'a>(
     items: impl IntoIterator<Item = &'a WorkItem>,
     state: Option<&ConfigApplyState>,
 ) -> Option<(&'a str, usize)> {
-    let state = state?;
     let mut first_unknown: Option<&'a str> = None;
     let mut count = 0usize;
     for wi in items {
-        if !state.accepts_work(&wi.bundle_config_hash, &wi.model_id) {
+        if state.map_or(!wi.bundle_config_hash.is_empty(), |state| {
+            !state.accepts_work(&wi.bundle_config_hash, &wi.model_id)
+        }) {
             count += 1;
             if first_unknown.is_none() {
                 first_unknown = Some(wi.bundle_config_hash.as_str());
@@ -1262,6 +1298,31 @@ impl Dispatcher {
             };
             match rmp_serde::from_slice::<WorkItem>(&msg.payload) {
                 Ok(mut wi) => {
+                    // These contracts are derived from the consumer's
+                    // versioned subject. Admitted work travels only on a
+                    // subject no sidecar without the admission fence
+                    // consumes, and its payload field must agree with that
+                    // subject. Refuse before readiness or payload fetch.
+                    let admission_violation = numerical_admission_violation(&msg.subject, &wi);
+                    let stale_admission = admission_violation.is_none()
+                        && wi.numerical_admission_sha256.is_some()
+                        && !self.execution_hash_is_current(&wi);
+                    if admission_violation.is_none()
+                        && !stale_admission
+                        && requires_execution_authority_v1(&msg.subject)
+                        && (!execution_authority_model_matches(&msg.subject, &wi.model_id)
+                            || !self
+                                .execution_authority_is_available(&wi, wi.operation != "generate"))
+                    {
+                        nak_one_with_reason(
+                            &Delivery::Nats(msg, admission_permit, None),
+                            base_delay_ms,
+                            &self.runtime_state.telemetry,
+                            "execution_authority_unavailable",
+                        )
+                        .await;
+                        continue;
+                    }
                     if !reply_subject_is_safe(&wi.reply_subject) {
                         // ACK-to-drop (not NAK): the subject is attacker-
                         // controlled; retrying just amplifies the attempt.
@@ -1284,6 +1345,20 @@ impl Dispatcher {
                         continue;
                     }
                     let mut delivery = Delivery::Nats(msg, admission_permit, None);
+                    if let Some(violation) = admission_violation {
+                        warn!(
+                            work_item_id = %wi.work_item_id,
+                            model = %wi.model_id,
+                            violation,
+                            "work breaks the numerical admission contract — answering and ACKing",
+                        );
+                        self.refuse_violation(&wi, &delivery).await;
+                        continue;
+                    }
+                    if stale_admission {
+                        self.refuse_stale_admission(&wi, &delivery).await;
+                        continue;
+                    }
                     self.observe_deadline_clock(&wi, &delivery);
                     if self.settle_if_cancelled(&wi, &delivery, "intake").await {
                         continue;
@@ -1460,6 +1535,19 @@ impl Dispatcher {
             (!wi.profile_id.trim().is_empty()).then(|| wi.profile_id.trim().to_string());
         let delivery = DeliveryContext::from_message(&msg);
         let base_delay_ms = base_nak_delay_ms();
+        if requires_execution_authority_v1(&msg.subject)
+            && (!execution_authority_model_matches(&msg.subject, &wi.model_id)
+                || !self.execution_authority_is_available(&wi, false))
+        {
+            nak_msg_with_reason(
+                &msg,
+                base_delay_ms,
+                &self.runtime_state.telemetry,
+                "execution_authority_unavailable",
+            )
+            .await;
+            return;
+        }
         info!(
             work_item_id = %wi.work_item_id,
             request_id = %wi.request_id,
@@ -1883,24 +1971,22 @@ impl Dispatcher {
         // inference takes shared guards. Re-check after payload resolution so
         // a queued A request can never execute after the worker advances to B.
         let _execution_guard = if let Some(state) = self.config_apply_state.as_ref() {
-            let guard = state.lock_execution().await;
-            if !state.accepts_work(&wi.bundle_config_hash, &model_id) {
-                let reason = barrier_nak_reason(Some(state), &model_id);
-                info!(
-                    model = %model_id,
-                    expected_hash = %wi.bundle_config_hash,
-                    local_hash = %state.current_bundle_config_hash(),
-                    reason,
-                    "generate work refused at the config barrier before execution — NAKing"
-                );
-                nak_msg_with_reason(&msg, base_delay_ms, &self.runtime_state.telemetry, reason)
-                    .await;
-                return;
-            }
-            Some(guard)
+            Some(state.lock_execution().await)
         } else {
             None
         };
+        if unknown_bundle_config_hash([&wi], self.config_apply_state.as_deref()).is_some() {
+            let reason = barrier_nak_reason(self.config_apply_state.as_deref(), &model_id);
+            info!(
+                model = %model_id,
+                expected_hash = %wi.bundle_config_hash,
+                local_hash = %self.config_apply_state.as_ref().map(|state| state.current_bundle_config_hash()).unwrap_or_default(),
+                reason,
+                "generate work refused at the config barrier before execution — NAKing"
+            );
+            nak_msg_with_reason(&msg, base_delay_ms, &self.runtime_state.telemetry, reason).await;
+            return;
+        }
 
         let work_item_msgpack = match rmp_serde::to_vec_named(&wi) {
             Ok(bytes) => bytes,
@@ -1978,9 +2064,10 @@ impl Dispatcher {
         // cancellation — would be entirely absent from the age distribution.
         record_work_item_ages(&self.runtime_state.telemetry, std::iter::once(&wi));
         self.runtime_state.inflight_batches.inc();
+        let requires_authority = requires_execution_authority_v1(&msg.subject);
         let result = self
             .worker_pool
-            .process_generate(
+            .process_generate_with_authority(
                 ProcessGenerateRequest {
                     model_id: model_id.clone(),
                     work_item_msgpack,
@@ -2006,6 +2093,7 @@ impl Dispatcher {
                         .map_err(|e| IpcError::Server(e.to_string()))
                     }
                 },
+                requires_authority,
             )
             .await;
         decrement_gauge(&self.runtime_state.inflight_batches, 1);
@@ -2192,15 +2280,24 @@ impl Dispatcher {
         items: Vec<(WorkItem, Delivery)>,
         ready_deadline: Option<tokio::time::Instant>,
     ) -> Result<(), DispatchError> {
-        let mut items = self
+        let items = self
             .retain_uncancelled(items, "before_model_readiness")
             .await;
+        let mut items = self.answer_stale_admissions(items).await;
         if items.is_empty() {
             return Ok(());
         }
         let group_started = Instant::now();
         let group_size = items.len();
         let base_delay_ms = base_nak_delay_ms();
+        if items.iter().any(|(wi, delivery)| {
+            delivery.requires_execution_authority_v1()
+                && (!delivery.execution_authority_model_matches(&wi.model_id)
+                    || !self.execution_authority_is_available(wi, true))
+        }) {
+            nak_all(&items, base_delay_ms, &self.runtime_state.telemetry).await;
+            return Ok(());
+        }
         if let Some((expected_hash, unknown_hash_count)) = unknown_bundle_config_hash(
             items.iter().map(|(wi, _)| wi),
             self.config_apply_state.as_deref(),
@@ -2225,6 +2322,7 @@ impl Dispatcher {
         }
         let readiness_resp = loop {
             items = self.retain_uncancelled(items, "model_readiness").await;
+            items = self.answer_stale_admissions(items).await;
             if items.is_empty() {
                 return Ok(());
             }
@@ -2394,6 +2492,13 @@ impl Dispatcher {
                 "encode" => encode_items.push((wi, delivery)),
                 "score" => score_items.push((wi, delivery)),
                 "extract" => extract_items.push((wi, delivery)),
+                // The model is ready by now, which is all a load asks for.
+                LOAD_OPERATION => {
+                    debug!(model = %model_id, "load-only work item: model ready");
+                    if let Err(e) = ack(&delivery, &self.runtime_state.telemetry).await {
+                        warn!(error = %e, "ack of a load-only work item failed");
+                    }
+                }
                 _ => unknown_items.push((wi, delivery)),
             }
         }
@@ -2495,6 +2600,23 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Answer admitted items instead of sending them through a method that
+    /// never re-verifies a numerical admission.
+    async fn refuse_admitted_items(
+        &self,
+        items: Vec<(WorkItem, Delivery)>,
+    ) -> Vec<(WorkItem, Delivery)> {
+        let mut kept = Vec::with_capacity(items.len());
+        for (wi, delivery) in items {
+            if wi.numerical_admission_sha256.is_none() {
+                kept.push((wi, delivery));
+                continue;
+            }
+            self.refuse_violation(&wi, &delivery).await;
+        }
+        kept
+    }
+
     // -- encode -----------------------------------------------------------
 
     async fn handle_encode(
@@ -2502,6 +2624,7 @@ impl Dispatcher {
         model_id: &str,
         items: Vec<(WorkItem, Delivery)>,
     ) -> Result<(), DispatchError> {
+        let items = self.refuse_admitted_items(items).await;
         let mut resolved: Vec<(WorkItem, Delivery, MsgValue, f64, Option<String>)> =
             Vec::with_capacity(items.len());
         for (wi, delivery) in items {
@@ -2559,34 +2682,34 @@ impl Dispatcher {
         }
 
         let _execution_guard = if let Some(state) = self.config_apply_state.as_ref() {
-            let guard = state.lock_execution().await;
-            if let Some((expected_hash, unknown_hash_count)) =
-                unknown_bundle_config_hash(resolved.iter().map(|(wi, _, _, _, _)| wi), Some(state))
-            {
-                info!(
-                    model = %model_id,
-                    expected_hash,
-                    unknown_hash_count,
-                    local_hash = %state.current_bundle_config_hash(),
-                    "encode work refused at the config barrier before execution — NAKing"
-                );
-                let msgs_only: Vec<(WorkItem, Delivery)> = resolved
-                    .into_iter()
-                    .map(|(wi, delivery, _, _, _)| (wi, delivery))
-                    .collect();
-                nak_all_at_barrier(
-                    &msgs_only,
-                    base_nak_delay_ms(),
-                    &self.runtime_state.telemetry,
-                    Some(state),
-                )
-                .await;
-                return Ok(());
-            }
-            Some(guard)
+            Some(state.lock_execution().await)
         } else {
             None
         };
+        if let Some((expected_hash, unknown_hash_count)) = unknown_bundle_config_hash(
+            resolved.iter().map(|(wi, _, _, _, _)| wi),
+            self.config_apply_state.as_deref(),
+        ) {
+            info!(
+                model = %model_id,
+                expected_hash,
+                unknown_hash_count,
+                local_hash = %self.config_apply_state.as_ref().map(|state| state.current_bundle_config_hash()).unwrap_or_default(),
+                "encode work refused at the config barrier before execution — NAKing"
+            );
+            let msgs_only: Vec<(WorkItem, Delivery)> = resolved
+                .into_iter()
+                .map(|(wi, delivery, _, _, _)| (wi, delivery))
+                .collect();
+            nak_all_at_barrier(
+                &msgs_only,
+                base_nak_delay_ms(),
+                &self.runtime_state.telemetry,
+                self.config_apply_state.as_deref(),
+            )
+            .await;
+            return Ok(());
+        }
 
         let mut active = Vec::with_capacity(resolved.len());
         for item in resolved {
@@ -2624,6 +2747,7 @@ impl Dispatcher {
                     options: wi.options.clone(),
                     profile_id: opt_non_empty(&wi.profile_id),
                     bundle_config_hash: opt_non_empty(&wi.bundle_config_hash),
+                    numerical_admission_sha256: None,
                     payload_fetch_ms: *fm,
                     prepared_tokens,
                 }
@@ -2676,6 +2800,7 @@ impl Dispatcher {
         model_id: &str,
         items: Vec<(WorkItem, Delivery)>,
     ) -> Result<(), DispatchError> {
+        let items = self.refuse_admitted_items(items).await;
         let mut prepared: Vec<(WorkItem, Delivery, MsgValue, Vec<MsgValue>, f64)> =
             Vec::with_capacity(items.len());
         for (wi, delivery) in items {
@@ -2728,34 +2853,34 @@ impl Dispatcher {
         }
 
         let _execution_guard = if let Some(state) = self.config_apply_state.as_ref() {
-            let guard = state.lock_execution().await;
-            if let Some((expected_hash, unknown_hash_count)) =
-                unknown_bundle_config_hash(prepared.iter().map(|(wi, _, _, _, _)| wi), Some(state))
-            {
-                info!(
-                    model = %model_id,
-                    expected_hash,
-                    unknown_hash_count,
-                    local_hash = %state.current_bundle_config_hash(),
-                    "score work refused at the config barrier before execution — NAKing"
-                );
-                let msgs_only: Vec<(WorkItem, Delivery)> = prepared
-                    .into_iter()
-                    .map(|(wi, delivery, _, _, _)| (wi, delivery))
-                    .collect();
-                nak_all_at_barrier(
-                    &msgs_only,
-                    base_nak_delay_ms(),
-                    &self.runtime_state.telemetry,
-                    Some(state),
-                )
-                .await;
-                return Ok(());
-            }
-            Some(guard)
+            Some(state.lock_execution().await)
         } else {
             None
         };
+        if let Some((expected_hash, unknown_hash_count)) = unknown_bundle_config_hash(
+            prepared.iter().map(|(wi, _, _, _, _)| wi),
+            self.config_apply_state.as_deref(),
+        ) {
+            info!(
+                model = %model_id,
+                expected_hash,
+                unknown_hash_count,
+                local_hash = %self.config_apply_state.as_ref().map(|state| state.current_bundle_config_hash()).unwrap_or_default(),
+                "score work refused at the config barrier before execution — NAKing"
+            );
+            let msgs_only: Vec<(WorkItem, Delivery)> = prepared
+                .into_iter()
+                .map(|(wi, delivery, _, _, _)| (wi, delivery))
+                .collect();
+            nak_all_at_barrier(
+                &msgs_only,
+                base_nak_delay_ms(),
+                &self.runtime_state.telemetry,
+                self.config_apply_state.as_deref(),
+            )
+            .await;
+            return Ok(());
+        }
 
         let mut active = Vec::with_capacity(prepared.len());
         for item in prepared {
@@ -2797,6 +2922,8 @@ impl Dispatcher {
                 instruction: wi.instruction.clone(),
                 options: wi.options.clone(),
                 profile_id: opt_non_empty(&wi.profile_id),
+                bundle_config_hash: opt_non_empty(&wi.bundle_config_hash),
+                numerical_admission_sha256: None,
                 payload_fetch_ms: *fm,
                 prepared_tokens: None,
             })
@@ -2924,34 +3051,34 @@ impl Dispatcher {
         }
 
         let _execution_guard = if let Some(state) = self.config_apply_state.as_ref() {
-            let guard = state.lock_execution().await;
-            if let Some((expected_hash, unknown_hash_count)) =
-                unknown_bundle_config_hash(resolved.iter().map(|(wi, _, _, _, _)| wi), Some(state))
-            {
-                info!(
-                    model = %model_id,
-                    expected_hash,
-                    unknown_hash_count,
-                    local_hash = %state.current_bundle_config_hash(),
-                    "extract work refused at the config barrier before execution — NAKing"
-                );
-                let msgs_only: Vec<(WorkItem, Delivery)> = resolved
-                    .into_iter()
-                    .map(|(wi, delivery, _, _, _)| (wi, delivery))
-                    .collect();
-                nak_all_at_barrier(
-                    &msgs_only,
-                    base_nak_delay_ms(),
-                    &self.runtime_state.telemetry,
-                    Some(state),
-                )
-                .await;
-                return Ok(());
-            }
-            Some(guard)
+            Some(state.lock_execution().await)
         } else {
             None
         };
+        if let Some((expected_hash, unknown_hash_count)) = unknown_bundle_config_hash(
+            resolved.iter().map(|(wi, _, _, _, _)| wi),
+            self.config_apply_state.as_deref(),
+        ) {
+            info!(
+                model = %model_id,
+                expected_hash,
+                unknown_hash_count,
+                local_hash = %self.config_apply_state.as_ref().map(|state| state.current_bundle_config_hash()).unwrap_or_default(),
+                "extract work refused at the config barrier before execution — NAKing"
+            );
+            let msgs_only: Vec<(WorkItem, Delivery)> = resolved
+                .into_iter()
+                .map(|(wi, delivery, _, _, _)| (wi, delivery))
+                .collect();
+            nak_all_at_barrier(
+                &msgs_only,
+                base_nak_delay_ms(),
+                &self.runtime_state.telemetry,
+                self.config_apply_state.as_deref(),
+            )
+            .await;
+            return Ok(());
+        }
 
         let mut active = Vec::with_capacity(resolved.len());
         for item in resolved {
@@ -3213,12 +3340,115 @@ impl Dispatcher {
                 }
             }
             Disposition::NakRetry => {
-                nak_one(
-                    delivery,
-                    outcome.nak_delay_ms.unwrap_or_else(base_nak_delay_ms),
-                    &self.runtime_state.telemetry,
-                )
-                .await;
+                let delay_ms = outcome.nak_delay_ms.unwrap_or_else(base_nak_delay_ms);
+                if wi.fallback_reason.is_some() || wi.numerical_admission_sha256.is_some() {
+                    let retry_after_s = outcome
+                        .retry_after_s
+                        .unwrap_or_else(|| delay_ms.div_ceil(1000).try_into().unwrap_or(u32::MAX));
+                    self.refuse_fallback_attempt(
+                        wi,
+                        delivery,
+                        outcome
+                            .error_code
+                            .as_deref()
+                            .unwrap_or(QUEUE_FULL_ERROR_CODE),
+                        retry_after_s,
+                    )
+                    .await;
+                    return;
+                }
+                nak_one(delivery, delay_ms, &self.runtime_state.telemetry).await;
+            }
+        }
+    }
+
+    /// Answer an item that breaks the numerical admission contract and ACK it
+    /// whatever the publish result: it can never become valid, and a NAK
+    /// could hand it to a consumer without the fence.
+    async fn refuse_violation(&self, wi: &WorkItem, delivery: &Delivery) {
+        let mut outcome =
+            synthetic_error_outcome(wi, INFERENCE_ERROR_CODE, FALLBACK_REFUSAL_MESSAGE);
+        outcome.retry_after_s = Some(NUMERICAL_ADMISSION_RETRY_AFTER_S);
+        if let Err(e) = self
+            .deliver_result(wi, delivery, &outcome, None, None)
+            .await
+        {
+            warn!(
+                work_item_id = %wi.work_item_id,
+                error = %e,
+                "failed to publish a numerical admission refusal — ACKing anyway"
+            );
+        }
+        if let Err(e) = ack(delivery, &self.runtime_state.telemetry).await {
+            warn!(error = %e, "ack after a numerical admission refusal failed");
+        }
+    }
+
+    /// Answer an admitted item whose configuration hash this worker no longer
+    /// holds. Redelivery to the pinned worker rarely converges, and its
+    /// bridged caller is waiting with a local refusal.
+    async fn refuse_stale_admission(&self, wi: &WorkItem, delivery: &Delivery) {
+        info!(
+            work_item_id = %wi.work_item_id,
+            model = %wi.model_id,
+            "admitted work names a configuration this worker does not hold — answering"
+        );
+        self.refuse_fallback_attempt(
+            wi,
+            delivery,
+            INFERENCE_ERROR_CODE,
+            NUMERICAL_ADMISSION_RETRY_AFTER_S,
+        )
+        .await;
+    }
+
+    /// Answer the admitted items whose configuration hash is no longer
+    /// current, and return the others.
+    async fn answer_stale_admissions(
+        &self,
+        items: Vec<(WorkItem, Delivery)>,
+    ) -> Vec<(WorkItem, Delivery)> {
+        let mut kept = Vec::with_capacity(items.len());
+        for (wi, delivery) in items {
+            if wi.numerical_admission_sha256.is_some() && !self.execution_hash_is_current(&wi) {
+                self.refuse_stale_admission(&wi, &delivery).await;
+            } else {
+                kept.push((wi, delivery));
+            }
+        }
+        kept
+    }
+
+    /// Answer a work item the gateway sent to a remote profile in place of a
+    /// refusing local route. The gateway is holding that local refusal for
+    /// its caller, so a redelivery would only make the caller wait: the item
+    /// is answered at once with a retryable error and ACKed. If the error
+    /// cannot be published the item is NAKed, as for any failed publish.
+    async fn refuse_fallback_attempt(
+        &self,
+        wi: &WorkItem,
+        delivery: &Delivery,
+        code: &str,
+        retry_after_s: u32,
+    ) {
+        let mut outcome = synthetic_error_outcome(wi, code, FALLBACK_REFUSAL_MESSAGE);
+        outcome.retry_after_s = Some(retry_after_s);
+        match self
+            .deliver_result(wi, delivery, &outcome, None, None)
+            .await
+        {
+            Ok(()) | Err(crate::publisher::PublishError::EmptyReplySubject) => {
+                if let Err(e) = ack(delivery, &self.runtime_state.telemetry).await {
+                    warn!(error = %e, "ack after a fallback refusal failed");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    work_item_id = %wi.work_item_id,
+                    error = %e,
+                    "failed to publish a fallback refusal — NAKing"
+                );
+                nak_one(delivery, base_nak_delay_ms(), &self.runtime_state.telemetry).await;
             }
         }
     }
@@ -3615,6 +3845,7 @@ impl Dispatcher {
                 options: wi.options.clone(),
                 profile_id: opt_non_empty(&wi.profile_id),
                 bundle_config_hash: opt_non_empty(&wi.bundle_config_hash),
+                numerical_admission_sha256: wi.numerical_admission_sha256.clone(),
                 payload_fetch_ms: fetch_ms,
                 prepared_tokens,
             };
@@ -3681,6 +3912,8 @@ impl Dispatcher {
                 instruction: wi.instruction.clone(),
                 options: wi.options.clone(),
                 profile_id: opt_non_empty(&wi.profile_id),
+                bundle_config_hash: opt_non_empty(&wi.bundle_config_hash),
+                numerical_admission_sha256: wi.numerical_admission_sha256.clone(),
                 payload_fetch_ms: fetch_ms,
                 prepared_tokens: None,
             };
@@ -4298,6 +4531,7 @@ fn synthetic_error_outcome(wi: &WorkItem, code: &str, message: &str) -> ItemOutc
         postprocessing_ms: None,
         raw_output: None,
         units: None,
+        retry_after_s: None,
     }
 }
 
@@ -4735,6 +4969,33 @@ async fn nak_one(
     nak_one_with_reason(delivery, delay_ms, telemetry, "retry").await;
 }
 
+/// Why an item breaks the numerical admission contract, if it does. Admitted
+/// work names a numerical admission, travels only on the admission subject
+/// for its own model, and is encode or score: the operations whose backend
+/// method re-verifies the admission before execution. A numerical remote
+/// attempt that stands in for a local refusal is always admitted work.
+fn numerical_admission_violation(subject: &str, wi: &WorkItem) -> Option<&'static str> {
+    let numerical = matches!(wi.operation.as_str(), "encode" | "score");
+    match (
+        wi.numerical_admission_sha256.is_some(),
+        requires_numerical_admission_v1(subject),
+    ) {
+        (true, false) => Some("admitted_work_off_the_admission_subject"),
+        (false, true) => Some("unadmitted_work_on_the_admission_subject"),
+        (true, true) if !numerical => Some("admitted_work_is_not_encode_or_score"),
+        (true, true) if wi.bundle_config_hash.is_empty() => {
+            Some("admitted_work_names_no_configuration")
+        }
+        (true, true) if !execution_authority_model_matches(subject, &wi.model_id) => {
+            Some("admitted_work_names_another_model")
+        }
+        (false, false) if numerical && wi.fallback_reason.is_some() => {
+            Some("numerical_fallback_without_admission")
+        }
+        _ => None,
+    }
+}
+
 async fn nak_one_with_reason(
     delivery: &Delivery,
     delay_ms: u64,
@@ -5004,6 +5265,88 @@ async fn process_scheduler_batch(
     batch: crate::scheduler::FormattedBatch<SchedulerItem, SchedulerMeta>,
     role: WaveRole,
 ) {
+    assert_eq!(
+        batch.items.len(),
+        batch.metadata.len(),
+        "FormattedBatch items and metadata must stay aligned"
+    );
+    let mut partition_role = role;
+    for partition in split_by_contract(batch) {
+        if partition.items.is_empty() {
+            continue;
+        }
+        process_scheduler_contract_batch(
+            model_id,
+            dispatcher,
+            scheduler,
+            op,
+            lora.clone(),
+            partition,
+            partition_role,
+        )
+        .await;
+        // The RPCs retain one wave/pipeline permit. Preserve its Primary/Drain
+        // roles and the configured controller cadence across them.
+        partition_role = WaveRole::Drain;
+    }
+}
+
+/// The backend method a scheduler batch runs through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchContract {
+    NumericalAdmission = 0,
+    ExecutionAuthority = 1,
+    Legacy = 2,
+}
+
+impl BatchContract {
+    fn of<'a>(metadata: impl IntoIterator<Item = &'a SchedulerMeta>) -> Self {
+        let mut contract = Self::Legacy;
+        for meta in metadata {
+            if meta.wi.numerical_admission_sha256.is_some() {
+                return Self::NumericalAdmission;
+            }
+            if meta.delivery.requires_execution_authority_v1() {
+                contract = Self::ExecutionAuthority;
+            }
+        }
+        contract
+    }
+}
+
+/// Keep the execution contracts separate even when the scheduler coalesces
+/// a verified request with an older producer's empty-hash work: the legacy
+/// sibling must not invalidate or downgrade the verified request's RPC, and
+/// admitted numerical work must not share a method that skips admission.
+fn split_by_contract(
+    batch: crate::scheduler::FormattedBatch<SchedulerItem, SchedulerMeta>,
+) -> [crate::scheduler::FormattedBatch<SchedulerItem, SchedulerMeta>; 3] {
+    let flush_reason = batch.flush_reason;
+    let mut partitions = std::array::from_fn(|_| crate::scheduler::FormattedBatch {
+        items: Vec::new(),
+        metadata: Vec::new(),
+        total_cost: 0,
+        flush_reason,
+    });
+    for (item, meta) in batch.items.into_iter().zip(batch.metadata) {
+        let partition: &mut crate::scheduler::FormattedBatch<SchedulerItem, SchedulerMeta> =
+            &mut partitions[BatchContract::of(std::iter::once(&meta)) as usize];
+        partition.total_cost += item.cost();
+        partition.items.push(item);
+        partition.metadata.push(meta);
+    }
+    partitions
+}
+
+async fn process_scheduler_contract_batch(
+    model_id: &str,
+    dispatcher: &Arc<Dispatcher>,
+    scheduler: &Arc<ProductionScheduler>,
+    op: SchedOp,
+    lora: crate::scheduler::LoraKey,
+    batch: crate::scheduler::FormattedBatch<SchedulerItem, SchedulerMeta>,
+    role: WaveRole,
+) {
     if batch.items.is_empty() {
         return;
     }
@@ -5205,37 +5548,38 @@ async fn process_scheduler_batch(
     dispatcher.runtime_state.inflight_batches.inc();
 
     let _execution_guard = if let Some(state) = dispatcher.config_apply_state.as_ref() {
-        let guard = state.lock_execution().await;
-        if let Some((expected_hash, unknown_hash_count)) =
-            unknown_bundle_config_hash(batch.metadata.iter().map(|meta| &meta.wi), Some(state))
-        {
-            dispatcher.runtime_state.inflight_batches.dec();
-            info!(
-                model = %model_id,
-                op = op_label,
-                expected_hash,
-                unknown_hash_count,
-                local_hash = %state.current_bundle_config_hash(),
-                "scheduler work refused at the config barrier before execution — NAKing batch"
-            );
-            let msgs_only: Vec<(WorkItem, Delivery)> = batch
-                .metadata
-                .into_iter()
-                .map(|meta| (meta.wi, meta.delivery))
-                .collect();
-            nak_all_at_barrier(
-                &msgs_only,
-                base_nak_delay_ms(),
-                &dispatcher.runtime_state.telemetry,
-                Some(state),
-            )
-            .await;
-            return;
-        }
-        Some(guard)
+        Some(state.lock_execution().await)
     } else {
         None
     };
+    if let Some((expected_hash, unknown_hash_count)) = unknown_bundle_config_hash(
+        batch.metadata.iter().map(|meta| &meta.wi),
+        dispatcher.config_apply_state.as_deref(),
+    ) {
+        dispatcher.runtime_state.inflight_batches.dec();
+        info!(
+            model = %model_id,
+            op = op_label,
+            expected_hash,
+            unknown_hash_count,
+            local_hash = %dispatcher.config_apply_state.as_ref().map(|state| state.current_bundle_config_hash()).unwrap_or_default(),
+            "scheduler work refused at the config barrier before execution — NAKing batch"
+        );
+        let msgs_only: Vec<(WorkItem, Delivery)> = batch
+            .metadata
+            .into_iter()
+            .map(|meta| (meta.wi, meta.delivery))
+            .collect();
+        let msgs_only = dispatcher.answer_stale_admissions(msgs_only).await;
+        nak_all_at_barrier(
+            &msgs_only,
+            base_nak_delay_ms(),
+            &dispatcher.runtime_state.telemetry,
+            dispatcher.config_apply_state.as_deref(),
+        )
+        .await;
+        return;
+    }
 
     // AFTER the config execution barrier above, not before it. The barrier can
     // still NAK the whole batch for a bundle-hash change, and a NAK'd batch
@@ -5267,11 +5611,27 @@ async fn process_scheduler_batch(
     // the backend roundtrip.
     let dispatch_started_at = Instant::now();
 
-    let outcome = match dispatcher
-        .backend
-        .run_batch_with_budget(req, run_batch_budget)
-        .await
-    {
+    let result = match BatchContract::of(&batch.metadata) {
+        BatchContract::NumericalAdmission => {
+            dispatcher
+                .backend
+                .run_batch_with_numerical_admission_v1(req, run_batch_budget)
+                .await
+        }
+        BatchContract::ExecutionAuthority => {
+            dispatcher
+                .backend
+                .run_batch_with_execution_authority_v1(req, run_batch_budget)
+                .await
+        }
+        BatchContract::Legacy => {
+            dispatcher
+                .backend
+                .run_batch_with_budget(req, run_batch_budget)
+                .await
+        }
+    };
+    let outcome = match result {
         Ok(o) => o,
         Err(e) => {
             dispatcher.runtime_state.inflight_batches.dec();
@@ -6058,6 +6418,8 @@ mod tests {
             tracestate: None,
             timestamp: 0.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         }
     }
 
@@ -6075,6 +6437,7 @@ mod tests {
             options: work.options.clone(),
             profile_id: Some(work.profile_id.clone()),
             bundle_config_hash: Some(work.bundle_config_hash.clone()),
+            numerical_admission_sha256: work.numerical_admission_sha256.clone(),
             payload_fetch_ms: 0.0,
             prepared_tokens: None,
         })
@@ -6307,6 +6670,287 @@ mod tests {
         assert!(backend.encoded_models().is_empty());
     }
 
+    /// Every model is ready; every encode item comes back as `NakRetry`
+    /// carrying `outcome`'s error code, retry hint and delay.
+    struct NakingBackend {
+        error_code: Option<&'static str>,
+        retry_after_s: Option<u32>,
+        nak_delay_ms: Option<u64>,
+        encoded: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::backend::InferenceBackend for NakingBackend {
+        fn name(&self) -> &'static str {
+            "naking"
+        }
+
+        fn supports(&self, _model_id: &str) -> bool {
+            true
+        }
+
+        async fn ensure_model_ready(
+            &self,
+            _model_id: &str,
+        ) -> Result<crate::ipc_types::EnsureModelReadyResponse, BackendError> {
+            Ok(crate::ipc_types::EnsureModelReadyResponse {
+                state: ReadinessState::Ready,
+                batch_budget: None,
+                descriptor: None,
+            })
+        }
+
+        async fn process_encode_batch(
+            &self,
+            req: ProcessEncodeBatchRequest,
+        ) -> Result<BatchOutcome, BackendError> {
+            self.encoded.fetch_add(req.items.len(), Ordering::SeqCst);
+            let outcomes = req
+                .items
+                .iter()
+                .map(|item| ItemOutcome {
+                    nak_delay_ms: self.nak_delay_ms,
+                    error_code: self.error_code.map(str::to_string),
+                    retry_after_s: self.retry_after_s,
+                    ..outcome(
+                        &item.request_id,
+                        item.item_index,
+                        Disposition::NakRetry,
+                        None,
+                        None,
+                    )
+                })
+                .collect();
+            Ok(BatchOutcome {
+                outcomes,
+                batched_f16_multivectors: Vec::new(),
+            })
+        }
+
+        async fn process_score_batch(
+            &self,
+            _req: ProcessScoreBatchRequest,
+        ) -> Result<BatchOutcome, BackendError> {
+            Err(BackendError::UnsupportedModel("score".into()))
+        }
+
+        async fn process_extract_batch(
+            &self,
+            _req: ProcessExtractBatchRequest,
+        ) -> Result<BatchOutcome, BackendError> {
+            Err(BackendError::UnsupportedModel("extract".into()))
+        }
+    }
+
+    fn naking_backend(
+        error_code: Option<&'static str>,
+        retry_after_s: Option<u32>,
+        nak_delay_ms: Option<u64>,
+    ) -> Arc<NakingBackend> {
+        Arc::new(NakingBackend {
+            error_code,
+            retry_after_s,
+            nak_delay_ms,
+            encoded: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    async fn settle_one(
+        dispatcher: &Arc<Dispatcher>,
+        work: WorkItem,
+    ) -> Vec<crate::delivery::LocalDeliveryEvent> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        dispatcher
+            .dispatch_decoded(
+                vec![(work, Delivery::Local(LocalDelivery::new(0, 0, tx)))],
+                1,
+                Instant::now(),
+            )
+            .await;
+        dispatcher.join_parked_groups(Duration::from_secs(5)).await;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn fallback_attempt(model: &str) -> WorkItem {
+        WorkItem {
+            fallback_reason: Some("model_loading".to_string()),
+            ..wi("bridge", 0, model, "encode")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_attempt_is_answered_at_once_where_other_work_is_redelivered() {
+        let dispatcher = dispatcher_with_backend(naking_backend(None, None, Some(2_500)));
+
+        let ordinary = settle_one(&dispatcher, wi("plain", 0, "acme/model:remote", "encode")).await;
+        let bridged = settle_one(&dispatcher, fallback_attempt("acme/model:remote")).await;
+
+        assert!(
+            matches!(
+                ordinary.as_slice(),
+                [crate::delivery::LocalDeliveryEvent::Retry {
+                    slot: 0,
+                    delay_ms: 2_500,
+                    ..
+                }]
+            ),
+            "{ordinary:?}"
+        );
+        let [crate::delivery::LocalDeliveryEvent::Result { slot: 0, result }] = bridged.as_slice()
+        else {
+            panic!("a fallback attempt must settle with a result: {bridged:?}");
+        };
+        assert!(!result.success);
+        assert_eq!(result.error_code.as_deref(), Some(QUEUE_FULL_ERROR_CODE));
+        assert_eq!(
+            result.retry_after_s,
+            Some(3),
+            "the NAK delay, rounded up to seconds"
+        );
+        assert_eq!(result.error.as_deref(), Some(FALLBACK_REFUSAL_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn an_admitted_item_is_answered_at_once_even_without_a_held_refusal() {
+        let dispatcher = dispatcher_with_backend(naking_backend(None, None, None));
+        let admitted = WorkItem {
+            numerical_admission_sha256: Some("a".repeat(64)),
+            ..wi("admitted", 0, "acme/model:remote", "encode")
+        };
+        let refusal = ItemOutcome {
+            nak_delay_ms: Some(1_000),
+            error_code: Some(INFERENCE_ERROR_CODE.to_string()),
+            ..outcome("admitted", 0, Disposition::NakRetry, None, None)
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        dispatcher
+            .apply_outcome(
+                &admitted,
+                &Delivery::Local(LocalDelivery::new(0, 0, tx)),
+                &refusal,
+                0.0,
+                None,
+            )
+            .await;
+
+        let Ok(crate::delivery::LocalDeliveryEvent::Result { slot: 0, result }) = rx.try_recv()
+        else {
+            panic!("an admitted item must settle with a result");
+        };
+        assert!(!result.success);
+        assert_eq!(result.error_code.as_deref(), Some(INFERENCE_ERROR_CODE));
+        assert_eq!(result.retry_after_s, Some(1));
+    }
+
+    #[tokio::test]
+    async fn the_scheduler_less_path_answers_admitted_items_without_the_backend() {
+        for op in ["encode", "score"] {
+            let backend = naking_backend(None, None, Some(2_500));
+            let mut dispatcher = dispatcher_with_backend(backend.clone());
+            Arc::get_mut(&mut dispatcher).unwrap().config_apply_state =
+                Some(Arc::new(ConfigApplyState::new("fresh".into())));
+
+            let events = settle_one(
+                &dispatcher,
+                WorkItem {
+                    numerical_admission_sha256: Some("a".repeat(64)),
+                    bundle_config_hash: "fresh".into(),
+                    ..wi("admitted", 0, "acme/model:remote", op)
+                },
+            )
+            .await;
+
+            let [crate::delivery::LocalDeliveryEvent::Result { slot: 0, result }] =
+                events.as_slice()
+            else {
+                panic!("{op}: an admitted item must settle with a result: {events:?}");
+            };
+            assert!(!result.success, "{op}");
+            assert_eq!(
+                result.error_code.as_deref(),
+                Some(INFERENCE_ERROR_CODE),
+                "{op}"
+            );
+            assert_eq!(result.retry_after_s, Some(1), "{op}");
+            assert_eq!(backend.encoded.load(Ordering::SeqCst), 0, "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fallback_refusal_keeps_the_engines_code_and_retry_hint() {
+        let dispatcher =
+            dispatcher_with_backend(naking_backend(Some("MODEL_LOADING"), Some(7), None));
+
+        let bridged = settle_one(&dispatcher, fallback_attempt("acme/model:remote")).await;
+
+        let [crate::delivery::LocalDeliveryEvent::Result { result, .. }] = bridged.as_slice()
+        else {
+            panic!("a fallback attempt must settle with a result: {bridged:?}");
+        };
+        assert_eq!(result.error_code.as_deref(), Some("MODEL_LOADING"));
+        assert_eq!(result.retry_after_s, Some(7));
+    }
+
+    #[tokio::test]
+    async fn a_gateway_bridge_whose_upstream_refuses_is_answered_with_the_upstreams_wait() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../wire-fixtures/serving_disclosure.json"))
+                .unwrap();
+        let dispatcher = dispatcher_with_backend(naking_backend(
+            Some(QUEUE_FULL_ERROR_CODE),
+            Some(7),
+            Some(base_nak_delay_ms()),
+        ));
+        for trigger in fixture["response_headers"]["fallback_reason"]["values"]
+            .as_array()
+            .unwrap()
+        {
+            let mut wire: rmpv::Value = rmp_serde::from_slice(
+                &rmp_serde::to_vec_named(&wi("bridge", 0, "acme/model:remote", "encode")).unwrap(),
+            )
+            .unwrap();
+            let rmpv::Value::Map(fields) = &mut wire else {
+                unreachable!("a work item is a msgpack map")
+            };
+            fields.push(("fallback_reason".into(), trigger.as_str().unwrap().into()));
+            let work: WorkItem =
+                rmp_serde::from_slice(&rmp_serde::to_vec_named(&wire).unwrap()).unwrap();
+
+            let events = settle_one(&dispatcher, work).await;
+
+            let [crate::delivery::LocalDeliveryEvent::Result { result, .. }] = events.as_slice()
+            else {
+                panic!("{trigger}: a bridged item must settle with a result: {events:?}");
+            };
+            assert!(!result.success);
+            assert_eq!(result.error_code.as_deref(), Some(QUEUE_FULL_ERROR_CODE));
+            assert_eq!(result.retry_after_s, Some(7), "{trigger}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_load_only_work_item_settles_once_its_model_is_ready_without_running() {
+        let backend = naking_backend(None, None, None);
+        let dispatcher = dispatcher_with_backend(backend.clone());
+
+        let events = settle_one(
+            &dispatcher,
+            WorkItem {
+                item: None,
+                ..wi("load", 0, "acme/model", LOAD_OPERATION)
+            },
+        )
+        .await;
+
+        assert!(events.is_empty(), "a load publishes nothing: {events:?}");
+        assert_eq!(backend.encoded.load(Ordering::SeqCst), 0);
+    }
+
     fn dispatcher_listing_unsupported(
         backend: SharedBackend,
         unsupported: &[&str],
@@ -6504,6 +7148,393 @@ mod tests {
             context: async_nats::jetstream::new(client),
         };
         Delivery::Nats(message, None, None)
+    }
+
+    async fn authority_test_delivery() -> Delivery {
+        let mut delivery = unacknowledgeable_nats_delivery().await;
+        if let Delivery::Nats(message, ..) = &mut delivery {
+            message.message.subject =
+                "sie.work.test.machine.bundle.cold.worker.execution-authority-v1".into();
+        }
+        delivery
+    }
+
+    async fn admission_test_delivery() -> Delivery {
+        let mut delivery = unacknowledgeable_nats_delivery().await;
+        if let Delivery::Nats(message, ..) = &mut delivery {
+            message.message.subject =
+                "sie.work.test.machine.bundle.cold.worker.numerical-admission-v1".into();
+        }
+        delivery
+    }
+
+    #[tokio::test]
+    async fn stale_authority_generation_refuses_before_readiness_or_payload_fetch() {
+        let backend = LoadingModelBackend::new("cold");
+        let mut dispatcher = dispatcher_with_backend(backend.clone());
+        Arc::get_mut(&mut dispatcher).unwrap().config_apply_state =
+            Some(Arc::new(ConfigApplyState::new("fresh".into())));
+        dispatcher
+            .worker_pool
+            .execution_authority_v1()
+            .store(true, Ordering::Release);
+        let mut work = wi("verified", 0, "cold", "generate");
+        work.bundle_config_hash = "stale".into();
+        work.payload_ref = Some("must-not-fetch".into());
+        let Delivery::Nats(message, permit, _) = authority_test_delivery().await else {
+            unreachable!()
+        };
+        dispatcher
+            .handle_generate_item(work, QueuedMessage::new(message, permit))
+            .await;
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 0);
+        assert!(backend.encoded_models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_authority_generation_refuses_before_readiness_or_payload_fetch() {
+        let backend = LoadingModelBackend::new("cold");
+        let mut dispatcher = dispatcher_with_backend(backend.clone());
+        Arc::get_mut(&mut dispatcher).unwrap().config_apply_state =
+            Some(Arc::new(ConfigApplyState::new("fresh".into())));
+        dispatcher
+            .worker_pool
+            .execution_authority_v1()
+            .store(true, Ordering::Release);
+        let mut work = wi("verified", 0, "another", "generate");
+        work.bundle_config_hash = "fresh".into();
+        work.payload_ref = Some("must-not-fetch".into());
+        let Delivery::Nats(message, permit, _) = authority_test_delivery().await else {
+            unreachable!()
+        };
+        dispatcher
+            .handle_generate_item(work, QueuedMessage::new(message, permit))
+            .await;
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 0);
+        assert!(backend.encoded_models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn half_wired_scheduler_cannot_downgrade_verified_numeric_work() {
+        let backend = LoadingModelBackend::new("cold");
+        let mut dispatcher = dispatcher_with_backend(backend.clone());
+        let mutable = Arc::get_mut(&mut dispatcher).unwrap();
+        mutable.config_apply_state = Some(Arc::new(ConfigApplyState::new("fresh".into())));
+        mutable.scheduler_registry = Some(Arc::new(ProductionSchedulerRegistry::new(
+            crate::scheduler::BatchConfig::from_env_or_default(),
+        )));
+        mutable.shutdown = None;
+        dispatcher
+            .worker_pool
+            .execution_authority_v1()
+            .store(true, Ordering::Release);
+        let mut work = wi("verified", 0, "cold", "encode");
+        work.bundle_config_hash = "fresh".into();
+        dispatcher
+            .dispatch_decoded(
+                vec![(work, authority_test_delivery().await)],
+                1,
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 0);
+        assert!(backend.encoded_models().is_empty());
+    }
+
+    #[test]
+    fn the_admission_subject_carries_exactly_the_admitted_numerical_work() {
+        let admission = "sie.work.p.m.b.model.worker.numerical-admission-v1";
+        let authority = "sie.work.p.m.b.model.worker.execution-authority-v1";
+        let direct = "sie.work.p.m.b.model.worker";
+        let pooled = "sie.work.p.m.b.model";
+        let off = Some("admitted_work_off_the_admission_subject");
+        let unadmitted = Some("unadmitted_work_on_the_admission_subject");
+        let not_numerical = Some("admitted_work_is_not_encode_or_score");
+        let bridge = Some("numerical_fallback_without_admission");
+        for (subject, model, op, token, fallback, violation) in [
+            (admission, "model", "encode", true, true, None),
+            (admission, "model", "score", true, false, None),
+            (admission, "model", "extract", true, false, not_numerical),
+            (admission, "model", "generate", true, true, not_numerical),
+            (
+                admission,
+                "other",
+                "encode",
+                true,
+                false,
+                Some("admitted_work_names_another_model"),
+            ),
+            (admission, "model", "encode", false, false, unadmitted),
+            (admission, "model", "generate", false, false, unadmitted),
+            (authority, "model", "encode", true, true, off),
+            (direct, "model", "score", true, false, off),
+            (pooled, "model", "encode", true, false, off),
+            (pooled, "model", "encode", false, true, bridge),
+            (authority, "model", "score", false, true, bridge),
+            (pooled, "model", "generate", false, true, None),
+            (authority, "model", "encode", false, false, None),
+            (pooled, "model", "extract", false, true, None),
+        ] {
+            let mut work = wi("req", 0, model, op);
+            work.numerical_admission_sha256 = token.then(|| "a".repeat(64));
+            work.fallback_reason = fallback.then(|| "provisioning".to_string());
+            work.bundle_config_hash = "fresh".into();
+            assert_eq!(
+                numerical_admission_violation(subject, &work),
+                violation,
+                "{subject} {model} {op} {token} {fallback}"
+            );
+        }
+        let mut unpinned = wi("req", 0, "model", "encode");
+        unpinned.numerical_admission_sha256 = Some("a".repeat(64));
+        assert_eq!(
+            numerical_admission_violation(admission, &unpinned),
+            Some("admitted_work_names_no_configuration")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admitted_item_with_a_configuration_this_worker_no_longer_holds_is_answered() {
+        let backend = naking_backend(None, None, Some(2_500));
+        let mut dispatcher = dispatcher_with_backend(backend.clone());
+        Arc::get_mut(&mut dispatcher).unwrap().config_apply_state =
+            Some(Arc::new(ConfigApplyState::new("fresh".into())));
+        let admitted = |hash: &str| WorkItem {
+            numerical_admission_sha256: Some("a".repeat(64)),
+            bundle_config_hash: hash.into(),
+            ..wi("admitted", 0, "acme/model:remote", "encode")
+        };
+
+        let stale = settle_one(&dispatcher, admitted("stale")).await;
+        let [crate::delivery::LocalDeliveryEvent::Result { slot: 0, result }] = stale.as_slice()
+        else {
+            panic!("a stale admitted item must settle with a result: {stale:?}");
+        };
+        assert_eq!(result.error_code.as_deref(), Some(INFERENCE_ERROR_CODE));
+        assert_eq!(result.retry_after_s, Some(1));
+        assert_eq!(backend.encoded.load(Ordering::SeqCst), 0);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ordinary = WorkItem {
+            bundle_config_hash: "stale".into(),
+            ..wi("plain", 0, "acme/model:remote", "encode")
+        };
+        let kept = dispatcher
+            .answer_stale_admissions(vec![
+                (
+                    admitted("fresh"),
+                    Delivery::Local(LocalDelivery::new(0, 0, tx.clone())),
+                ),
+                (ordinary, Delivery::Local(LocalDelivery::new(1, 0, tx))),
+            ])
+            .await;
+        assert_eq!(
+            kept.len(),
+            2,
+            "a current admission and ordinary work are kept"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_admission_that_goes_stale_while_its_model_loads_is_answered() {
+        let backend = LoadingModelBackend::new("cold");
+        let mut dispatcher = dispatcher_with_backend(backend.clone());
+        let state = Arc::new(ConfigApplyState::new("fresh".into()));
+        Arc::get_mut(&mut dispatcher).unwrap().config_apply_state = Some(Arc::clone(&state));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let admitted = WorkItem {
+            numerical_admission_sha256: Some("a".repeat(64)),
+            bundle_config_hash: "fresh".into(),
+            ..wi("admitted", 0, "cold", "encode")
+        };
+
+        dispatcher
+            .dispatch_decoded(
+                vec![(admitted, Delivery::Local(LocalDelivery::new(0, 0, tx)))],
+                1,
+                Instant::now(),
+            )
+            .await;
+        // The second probe comes from the parked group's readiness loop.
+        while backend.probes.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+        state.set_bundle_hash("next".into());
+        dispatcher
+            .join_parked_groups(crate::nats_consumer::redelivery_envelope() * 2)
+            .await;
+
+        let Ok(crate::delivery::LocalDeliveryEvent::Result { slot: 0, result }) = rx.try_recv()
+        else {
+            panic!("an admission that went stale must settle with a result");
+        };
+        assert_eq!(result.error_code.as_deref(), Some(INFERENCE_ERROR_CODE));
+        assert!(backend.encoded_models().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admitted_work_past_its_deadline_is_dropped_whatever_the_enforcement_flag() {
+        let dispatcher = dispatcher_with_backend(naking_backend(None, None, None));
+        assert!(!dispatcher.work_deadline.enforce);
+        let now = unix_now_s();
+        let expired = |token: Option<String>| WorkItem {
+            numerical_admission_sha256: token,
+            timestamp: now - 180.0,
+            deadline: Some(now - 60.0),
+            ..wi("late", 0, "acme/model:remote", "encode")
+        };
+        let delivery = admission_test_delivery().await;
+        assert!(
+            dispatcher
+                .settle_if_expired(&expired(Some("a".repeat(64))), &delivery, "before_ipc")
+                .await
+        );
+        assert!(
+            !dispatcher
+                .settle_if_expired(&expired(None), &delivery, "before_ipc")
+                .await,
+            "ordinary work still runs without enforcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_breaking_the_admission_contract_never_reaches_the_backend() {
+        let admitted = Some("a".repeat(64));
+        for (subject, token, fallback_reason) in [
+            ("sie.work.pool.machine.bundle.cold", admitted.clone(), None),
+            (
+                "sie.work.pool.machine.bundle.cold.worker.execution-authority-v1",
+                admitted.clone(),
+                None,
+            ),
+            (
+                "sie.work.pool.machine.bundle.cold.worker.numerical-admission-v1",
+                None,
+                None,
+            ),
+            (
+                "sie.work.pool.machine.bundle.cold",
+                None,
+                Some("provisioning".to_string()),
+            ),
+        ] {
+            let backend = LoadingModelBackend::new("cold");
+            let dispatcher = dispatcher_with_backend(backend.clone());
+            let mut work = wi("refused", 0, "cold", "encode");
+            work.numerical_admission_sha256 = token;
+            work.fallback_reason = fallback_reason;
+            let Delivery::Nats(mut message, permit, _) = unacknowledgeable_nats_delivery().await
+            else {
+                unreachable!()
+            };
+            message.message.subject = subject.into();
+            message.message.payload = rmp_serde::to_vec_named(&work).unwrap().into();
+            dispatcher
+                .handle_batch(vec![QueuedMessage::new(message, permit)])
+                .await;
+            dispatcher.join_parked_groups(Duration::from_secs(1)).await;
+            assert_eq!(backend.probes.load(Ordering::SeqCst), 0, "{subject}");
+            assert!(backend.encoded_models().is_empty(), "{subject}");
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_work_never_reaches_a_backend_without_the_admission_method() {
+        let backend = LoadingModelBackend::new("cold");
+        let mut dispatcher = dispatcher_with_backend(backend.clone());
+        let mutable = Arc::get_mut(&mut dispatcher).unwrap();
+        mutable.config_apply_state = Some(Arc::new(ConfigApplyState::new("fresh".into())));
+        mutable.scheduler_registry = Some(Arc::new(ProductionSchedulerRegistry::new(
+            crate::scheduler::BatchConfig::from_env_or_default(),
+        )));
+        mutable.shutdown = Some(Arc::new(Shutdown::new()));
+        dispatcher
+            .worker_pool
+            .execution_authority_v1()
+            .store(true, Ordering::Release);
+        let mut work = wi("admitted", 0, "cold", "encode");
+        work.bundle_config_hash = "fresh".into();
+        work.numerical_admission_sha256 = Some("a".repeat(64));
+        assert!(!dispatcher.execution_authority_is_available(&work, true));
+        dispatcher
+            .dispatch_decoded(
+                vec![(work.clone(), admission_test_delivery().await)],
+                1,
+                Instant::now(),
+            )
+            .await;
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 0);
+        assert!(backend.encoded_models().is_empty());
+
+        dispatcher
+            .worker_pool
+            .numerical_admission_v1()
+            .store(true, Ordering::Release);
+        assert!(dispatcher.execution_authority_is_available(&work, true));
+    }
+
+    #[tokio::test]
+    async fn admitted_verified_and_legacy_work_split_into_separate_methods() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut admitted = wi("admitted", 0, "model", "encode");
+        admitted.numerical_admission_sha256 = Some("a".repeat(64));
+        let verified = wi("verified", 0, "model", "encode");
+        let legacy = wi("legacy", 0, "model", "encode");
+        let entries = [
+            (
+                legacy,
+                Delivery::Local(LocalDelivery::new(0, 0, tx.clone())),
+            ),
+            (admitted, admission_test_delivery().await),
+            (verified, authority_test_delivery().await),
+        ];
+        let mut batch = crate::scheduler::FormattedBatch {
+            items: Vec::new(),
+            metadata: Vec::new(),
+            total_cost: 0,
+            flush_reason: crate::scheduler::FlushReason::CountCap,
+        };
+        for (work, delivery) in entries {
+            let item = encode_scheduler_item(&work);
+            batch.total_cost += item.cost();
+            batch.items.push(item);
+            batch.metadata.push(SchedulerMeta::new_with_worker_direct(
+                work, delivery, 0.0, true,
+            ));
+        }
+        assert_eq!(
+            BatchContract::of(&batch.metadata),
+            BatchContract::NumericalAdmission
+        );
+
+        let partitions = split_by_contract(batch);
+
+        let requests = partitions
+            .iter()
+            .map(|partition| {
+                partition
+                    .metadata
+                    .iter()
+                    .map(|meta| meta.wi.request_id.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests, [["admitted"], ["verified"], ["legacy"]]);
+        assert_eq!(
+            partitions
+                .iter()
+                .map(|partition| BatchContract::of(&partition.metadata))
+                .collect::<Vec<_>>(),
+            [
+                BatchContract::NumericalAdmission,
+                BatchContract::ExecutionAuthority,
+                BatchContract::Legacy,
+            ]
+        );
+        assert!(partitions
+            .iter()
+            .all(|partition| partition.items.len() == partition.metadata.len()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -7084,6 +8115,41 @@ mod tests {
     }
 
     #[test]
+    fn unknown_bundle_config_hash_refuses_pinned_work_without_authority() {
+        let mut pinned = wi("r1", 0, "A", "encode");
+        pinned.bundle_config_hash = "hash-1".into();
+        let legacy = wi("r1", 1, "A", "encode");
+        assert_eq!(unknown_bundle_config_hash([&legacy], None), None);
+        assert_eq!(
+            unknown_bundle_config_hash([&legacy, &pinned], None),
+            Some(("hash-1", 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_work_never_reaches_a_backend_without_config_authority() {
+        let backend = naking_backend(None, None, None);
+        let dispatcher = dispatcher_with_backend(backend.clone());
+        let mut work = wi("pinned", 0, "A", "encode");
+        work.bundle_config_hash = "hash-1".into();
+        let events = settle_one(&dispatcher, work).await;
+        assert_eq!(backend.encoded.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            events.as_slice(),
+            [crate::delivery::LocalDeliveryEvent::Retry { .. }]
+        ));
+
+        let mut work = wi("pinned-gen", 0, "A", "generate");
+        work.bundle_config_hash = "hash-1".into();
+        work.generate = Some(MsgValue::Map(Vec::new()));
+        let error = dispatcher
+            .process_local_generate(work, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "BUNDLE_CONFIG_MISMATCH");
+    }
+
+    #[test]
     fn unknown_bundle_config_hash_reports_first_unknown_and_count() {
         let state = ConfigApplyState::new("hash-1".into());
 
@@ -7128,7 +8194,9 @@ mod tests {
         let mut naking = 0;
         for (site, _) in production.match_indices(barrier) {
             let rest = &production[site..];
-            let refusal = &rest[..rest.find("Some(guard)").expect("a barrier keeps its guard")];
+            let refusal = &rest[..rest
+                .find("return")
+                .expect("a barrier refuses before execution")];
             if !refusal.contains("nak") {
                 continue; // local-ingest generate answers with an error, not a NAK
             }
@@ -7737,6 +8805,7 @@ mod tests {
             postprocessing_ms: post_ms,
             raw_output: None,
             units: None,
+            retry_after_s: None,
         }
     }
 

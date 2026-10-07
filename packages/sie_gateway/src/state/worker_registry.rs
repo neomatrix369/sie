@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -8,10 +8,105 @@ use tokio::sync::RwLock;
 
 use crate::routing::hrw::{RingEntry, RingSnapshot};
 use crate::state::pool_manager::normalize_pool_name;
-use crate::types::worker::MAX_UNSUPPORTED_MODELS;
+use crate::types::model::FallbackTrigger;
+use crate::types::worker::{
+    NumericalAdmissionObservation, NumericalSnapshotStatus, MAX_UNSUPPORTED_MODELS,
+};
 use crate::types::{
     ClusterStatus, ModelInfo, WorkerHealth, WorkerInfo, WorkerState, WorkerStatusMessage,
 };
+
+/// An admission must outlive this margin when a bridge relies on it, so the
+/// remote process does not refuse the item for expiry while it is in flight.
+pub(crate) const NUMERICAL_ADMISSION_EXPIRY_MARGIN_MS: u64 = 5_000;
+
+/// The two sides of a numerical bridge for one model.
+pub(crate) struct NumericalLanes<'a> {
+    /// The bare model, as worker inventories name it.
+    pub model: &'a str,
+    pub local_bundles: &'a [String],
+    /// The model's own pool, `default` when it names none. Workers load only
+    /// the models of their own pool.
+    pub local_pool: &'a str,
+    /// The remote profile's routable id and its exact lane contract.
+    pub remote_model: &'a str,
+    pub remote_bundle: &'a str,
+    pub remote_pool: &'a str,
+    pub remote_hash: &'a str,
+    /// The outputs the request asks for, all of which the admission must list.
+    pub outputs: &'a [String],
+}
+
+/// A numerical bridge pinned to the admitted remote workers of one model.
+pub(crate) struct NumericalPin<'a> {
+    /// The bare model, as worker inventories name it.
+    pub model: &'a str,
+    pub admitted: &'a AdmittedWorkers,
+}
+
+/// Why a numerical bridge stays closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumericalRefusal {
+    /// No eligible remote worker advertises a current admission.
+    NoAdmission,
+    /// A live local worker has no complete process inventory.
+    LocalUnobserved,
+    /// A live local process reports an identity or model contract the
+    /// admission does not cover.
+    UncoveredIdentity,
+    /// The request asks for runtime options or outputs that the admission
+    /// did not measure.
+    UnmeasuredRequest,
+}
+
+impl NumericalRefusal {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoAdmission => "no_admission",
+            Self::LocalUnobserved => "local_unobserved",
+            Self::UncoveredIdentity => "uncovered_identity",
+            Self::UnmeasuredRequest => "unmeasured_request",
+        }
+    }
+}
+
+/// Admitted remote worker names, each with the admission digest it advertises.
+pub(crate) type AdmittedWorkers = HashMap<String, String>;
+
+/// The admission every observed child of a remote worker reports for `model`,
+/// with the earliest expiry, when it outlives the margin.
+fn remote_admission<'a>(
+    worker: &'a WorkerState,
+    model: &str,
+    now_unix_ms: u64,
+) -> Option<&'a NumericalAdmissionObservation> {
+    let inventory = worker.numerical_process_inventory.as_deref()?;
+    let mut agreed: Option<&NumericalAdmissionObservation> = None;
+    let mut expires_at_unix_ms = u64::MAX;
+    for child in &inventory.children {
+        if child.status != NumericalSnapshotStatus::Observed {
+            return None;
+        }
+        let profile = child
+            .snapshot
+            .as_ref()?
+            .profiles
+            .iter()
+            .find(|profile| profile.model_id == model)?;
+        let admission = profile.admission.as_ref()?;
+        if profile.model_contract_sha256.as_deref()
+            != Some(admission.model_contract_sha256.as_str())
+            || agreed.is_some_and(|agreed| agreed.sha256 != admission.sha256)
+        {
+            return None;
+        }
+        agreed = Some(admission);
+        expires_at_unix_ms = expires_at_unix_ms.min(admission.expires_at_unix_ms);
+    }
+    agreed.filter(|_| {
+        expires_at_unix_ms >= now_unix_ms.saturating_add(NUMERICAL_ADMISSION_EXPIRY_MARGIN_MS)
+    })
+}
 
 /// Rate-limit gate for the duplicate-worker-name warning, in whole
 /// seconds since process start. `ring_snapshot_for` runs on the
@@ -95,12 +190,16 @@ struct RegistrySnapshot {
     all_healthy: Vec<WorkerState>,
     /// Healthy workers indexed by lowercase bundle name.
     by_bundle: HashMap<String, Vec<WorkerState>>,
+    /// Every registered worker, whatever its health. Numerical admission must
+    /// see starting and degraded workers that may serve a model next.
+    all: Vec<WorkerState>,
 }
 
 impl RegistrySnapshot {
     fn build(workers: &HashMap<String, WorkerState>) -> Self {
         let mut all_healthy = Vec::new();
         let mut by_bundle: HashMap<String, Vec<WorkerState>> = HashMap::new();
+        let all = workers.values().cloned().collect();
 
         for w in workers.values() {
             if !w.healthy() {
@@ -116,6 +215,7 @@ impl RegistrySnapshot {
         Self {
             all_healthy,
             by_bundle,
+            all,
         }
     }
 }
@@ -139,6 +239,17 @@ pub struct WorkerRegistry {
     request_count: AtomicU64,
     last_qps_calculation: RwLock<Instant>,
     current_qps: RwLock<f64>,
+    health_view: Mutex<HealthView>,
+}
+
+/// How long this gateway has heard worker health without a gap. A worker
+/// that has not reported yet is indistinguishable from an absent one, so a
+/// numerical admission waits one heartbeat timeout after the health stream
+/// starts, resumes, or delivers a status after a longer silence.
+#[derive(Default)]
+struct HealthView {
+    continuous_since: Option<Instant>,
+    last_status: Option<Instant>,
 }
 
 impl WorkerRegistry {
@@ -173,7 +284,58 @@ impl WorkerRegistry {
             request_count: AtomicU64::new(0),
             last_qps_calculation: RwLock::new(Instant::now()),
             current_qps: RwLock::new(0.0),
+            health_view: Mutex::new(HealthView::default()),
         }
+    }
+
+    /// Record that the health subscription started or resumed. Statuses
+    /// published while it was down were never seen.
+    pub fn health_subscription_started(&self) {
+        let now = Instant::now();
+        let mut view = self
+            .health_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        view.continuous_since = Some(now);
+        view.last_status = Some(now);
+    }
+
+    fn note_health_status(&self) {
+        let now = Instant::now();
+        let mut view = self
+            .health_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if view
+            .last_status
+            .is_none_or(|last| now.duration_since(last) > self.heartbeat_timeout)
+        {
+            view.continuous_since = Some(now);
+        }
+        view.last_status = Some(now);
+    }
+
+    /// Whether every live worker has had a heartbeat timeout to report since
+    /// this gateway's view of worker health last became continuous.
+    fn health_view_is_settled(&self) -> bool {
+        self.health_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .continuous_since
+            .is_some_and(|since| since.elapsed() >= self.heartbeat_timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn settle_health_view_for_tests(&self) {
+        let mut view = self
+            .health_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let settled = Instant::now()
+            .checked_sub(self.heartbeat_timeout)
+            .unwrap_or_else(Instant::now);
+        view.continuous_since = Some(settled);
+        view.last_status = Some(Instant::now());
     }
 
     /// Rebuild the pre-computed snapshot from the current worker state.
@@ -192,6 +354,7 @@ impl WorkerRegistry {
     }
 
     pub async fn update_worker(&self, url: &str, msg: WorkerStatusMessage) -> bool {
+        self.note_health_status();
         let (became_healthy, became_degraded, worker_copy) = {
             let mut workers = self.workers.write().await;
             let exists = workers.contains_key(url);
@@ -206,6 +369,10 @@ impl WorkerRegistry {
                     machine_profile: String::new(),
                     bundle: "default".to_string(),
                     bundle_config_hash: String::new(),
+                    supports_execution_authority_v1: false,
+                    supports_numerical_admission_v1: false,
+                    supports_numerical_admission_subject_v1: false,
+                    numerical_process_inventory: None,
                     models: Vec::new(),
                     queue_depth: 0,
                     pending_cost: 0,
@@ -235,6 +402,17 @@ impl WorkerRegistry {
                 msg.bundle.clone()
             };
             w.bundle_config_hash = msg.bundle_config_hash.clone();
+            w.supports_execution_authority_v1 = msg.supports_execution_authority_v1;
+            w.supports_numerical_admission_v1 =
+                msg.supports_execution_authority_v1 && msg.supports_numerical_admission_v1;
+            w.supports_numerical_admission_subject_v1 =
+                w.supports_numerical_admission_v1 && msg.supports_numerical_admission_subject_v1;
+            // Replace on every heartbeat: legacy or invalid observations clear
+            // the previous process inventory rather than retaining stale IDs.
+            w.numerical_process_inventory = msg
+                .numerical_process_inventory
+                .filter(|inventory| inventory.valid())
+                .map(Arc::new);
             let overflow = msg.unsupported_models.len() > MAX_UNSUPPORTED_MODELS;
             if overflow && !w.unsupported_overflow {
                 tracing::warn!(
@@ -777,6 +955,256 @@ impl WorkerRegistry {
         }
     }
 
+    /// Classify a refusal before dispatch, using only this execution scope.
+    /// A starting worker keeps the lane provisioning; a usable worker wins over
+    /// degraded peers. This is refusal evidence, never permission to dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn unavailable_lane_trigger(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        expected_hash: &str,
+        admitted_worker_names: Option<&HashSet<String>>,
+    ) -> Option<FallbackTrigger> {
+        if expected_hash.is_empty() {
+            return None;
+        }
+        let workers = self.workers.read().await;
+        let mut saturated = false;
+        let mut unhealthy = false;
+        let mut starting = false;
+        for worker in workers.values().filter(|worker| {
+            worker.bundle.eq_ignore_ascii_case(bundle)
+                && worker.pool_name.eq_ignore_ascii_case(pool)
+                && (machine_profile.is_empty()
+                    || worker.machine_profile.eq_ignore_ascii_case(machine_profile))
+                && !worker.machine_profile.is_empty()
+                && worker.bundle_config_hash == expected_hash
+                && worker.supports_model(model)
+                && worker_allowed_by_admission(worker, admitted_worker_names)
+                && worker.last_heartbeat.elapsed() <= self.stale_evict_after
+        }) {
+            match worker.health {
+                WorkerHealth::Healthy if worker.ready_gpu_slots > 0 => {
+                    if !worker.saturated
+                        && worker.last_heartbeat.elapsed() <= self.heartbeat_timeout
+                    {
+                        return None;
+                    }
+                    if worker.last_heartbeat.elapsed() > self.heartbeat_timeout {
+                        unhealthy = true;
+                    } else {
+                        saturated = true;
+                    }
+                }
+                WorkerHealth::Unhealthy => unhealthy = true,
+                _ if worker.last_heartbeat.elapsed() > self.heartbeat_timeout => unhealthy = true,
+                _ => starting = true,
+            }
+        }
+        if saturated {
+            Some(FallbackTrigger::Saturated)
+        } else if unhealthy && !starting {
+            Some(FallbackTrigger::Unhealthy)
+        } else {
+            None
+        }
+    }
+
+    /// Select only a fresh, positively capable worker for verified direct dispatch.
+    /// The versioned subject keeps the execution fence even after a worker rollback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execution_authority_worker(
+        &self,
+        model: &str,
+        pool: &str,
+        machine_profile: &str,
+        bundle: &str,
+        expected_hash: &str,
+        admitted_worker_names: Option<&HashSet<String>>,
+        numerical: Option<&NumericalPin<'_>>,
+    ) -> Option<String> {
+        if expected_hash.is_empty() {
+            return None;
+        }
+        let snap = self.snapshot.load();
+        let candidates = snap.by_bundle.get(&bundle.to_lowercase())?;
+        let mut name_counts = HashMap::<&str, usize>::with_capacity(snap.all_healthy.len());
+        for worker in &snap.all_healthy {
+            *name_counts.entry(worker.name.as_str()).or_default() += 1;
+        }
+        let ring = RingSnapshot::from_entries(
+            candidates
+                .iter()
+                .filter(|w| {
+                    w.eligible_for_dispatch()
+                && w.supports_execution_authority_v1
+                && w.last_heartbeat.elapsed() <= self.heartbeat_timeout
+                && w.bundle_config_hash == expected_hash
+                && w.pool_name.eq_ignore_ascii_case(pool)
+                && w.machine_profile.eq_ignore_ascii_case(machine_profile)
+                && w.supports_model(model)
+                && worker_allowed_by_admission(w, admitted_worker_names)
+                && numerical.is_none_or(|pin| self.still_admitted(w, pin))
+                // Avoid subject normalization collisions and ambiguous worker identities.
+                && !w.name.is_empty()
+                && w.name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && name_counts.get(w.name.as_str()) == Some(&1)
+                })
+                .map(|w| {
+                    RingEntry::with_pressure(
+                        w.name.clone(),
+                        w.ready_gpu_slots,
+                        w.queue_depth,
+                        w.pending_cost,
+                        w.inflight_batches,
+                    )
+                }),
+        );
+        let seed = uuid::Uuid::now_v7().to_string();
+        let key = crate::routing::key::RoutingKeyResolved {
+            hash: Some(crate::routing::key::hash_bytes(&seed)),
+            source: crate::routing::key::KeySource::RoutingKey,
+            #[cfg(feature = "raw-routing-logs")]
+            raw_for_debug: None,
+        };
+        crate::routing::pick_worker(&ring, &key).map(str::to_owned)
+    }
+
+    /// Remote workers that may run a numerical bridge for `lanes.model`.
+    ///
+    /// A remote worker qualifies when it is fresh, eligible, positively
+    /// supports execution authority and numerical admission, carries the
+    /// exact remote hash, and every one of its children reports the same
+    /// current admission, which must list every requested output. Its
+    /// admission must then cover every local process that could serve the
+    /// model: each child of each worker on the model's local bundles and pool,
+    /// starting workers included, must report an admitted identity and the
+    /// admission's model contract. A local worker past the heartbeat timeout that has not
+    /// been evicted cannot be vouched for, and neither can any worker until
+    /// this gateway has heard worker health for one heartbeat timeout. With
+    /// no local worker the remote admission decides alone.
+    pub(crate) fn numerical_admission(
+        &self,
+        lanes: &NumericalLanes<'_>,
+        now_unix_ms: u64,
+    ) -> Result<AdmittedWorkers, NumericalRefusal> {
+        let snap = self.snapshot.load();
+        let mut name_counts = HashMap::<&str, usize>::with_capacity(snap.all.len());
+        for worker in &snap.all {
+            *name_counts.entry(worker.name.as_str()).or_default() += 1;
+        }
+        let advertised: Vec<(&WorkerState, &NumericalAdmissionObservation)> = snap
+            .all
+            .iter()
+            .filter(|w| {
+                w.eligible_for_dispatch()
+                    && w.supports_execution_authority_v1
+                    && w.supports_numerical_admission_subject_v1
+                    && w.last_heartbeat.elapsed() <= self.heartbeat_timeout
+                    && !lanes.remote_hash.is_empty()
+                    && w.bundle_config_hash == lanes.remote_hash
+                    && w.bundle.eq_ignore_ascii_case(lanes.remote_bundle)
+                    && w.pool_name.eq_ignore_ascii_case(lanes.remote_pool)
+                    && w.supports_model(lanes.remote_model)
+                    && !w.name.is_empty()
+                    && w.name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    && name_counts.get(w.name.as_str()) == Some(&1)
+            })
+            .filter_map(|w| Some((w, remote_admission(w, lanes.model, now_unix_ms)?)))
+            .collect();
+        if advertised.is_empty() {
+            return Err(NumericalRefusal::NoAdmission);
+        }
+        let remote: Vec<(&WorkerState, &NumericalAdmissionObservation)> = advertised
+            .into_iter()
+            .filter(|(_, admission)| {
+                !lanes.outputs.is_empty()
+                    && lanes
+                        .outputs
+                        .iter()
+                        .all(|output| admission.outputs.iter().any(|admitted| admitted == output))
+            })
+            .collect();
+        if remote.is_empty() {
+            return Err(NumericalRefusal::UnmeasuredRequest);
+        }
+        if !self.health_view_is_settled() {
+            return Err(NumericalRefusal::LocalUnobserved);
+        }
+        let mut local = Vec::new();
+        for worker in snap.all.iter().filter(|w| {
+            lanes
+                .local_bundles
+                .iter()
+                .any(|bundle| w.bundle.eq_ignore_ascii_case(bundle))
+                && w.pool_name.eq_ignore_ascii_case(lanes.local_pool)
+                && w.supports_model(lanes.model)
+        }) {
+            if worker.last_heartbeat.elapsed() > self.heartbeat_timeout {
+                return Err(NumericalRefusal::LocalUnobserved);
+            }
+            let Some(inventory) = worker.numerical_process_inventory.as_deref() else {
+                return Err(NumericalRefusal::LocalUnobserved);
+            };
+            for child in &inventory.children {
+                let Some(snapshot) = child
+                    .snapshot
+                    .as_ref()
+                    .filter(|_| child.status == NumericalSnapshotStatus::Observed)
+                else {
+                    return Err(NumericalRefusal::LocalUnobserved);
+                };
+                let profile = snapshot
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.model_id == lanes.model);
+                local.push((
+                    profile.and_then(|profile| profile.local_identity.as_deref()),
+                    profile.and_then(|profile| profile.model_contract_sha256.as_deref()),
+                ));
+            }
+        }
+        let admitted: AdmittedWorkers = remote
+            .into_iter()
+            .filter(|(_, admission)| {
+                local.iter().all(|(identity, contract)| {
+                    identity.is_some_and(|identity| {
+                        admission
+                            .local_identities
+                            .iter()
+                            .any(|admitted| admitted == identity)
+                    }) && *contract == Some(admission.model_contract_sha256.as_str())
+                })
+            })
+            .map(|(worker, admission)| (worker.name.clone(), admission.sha256.clone()))
+            .collect();
+        if admitted.is_empty() {
+            Err(NumericalRefusal::UncoveredIdentity)
+        } else {
+            Ok(admitted)
+        }
+    }
+
+    /// Whether `worker` still runs a numerical bridge under the admission
+    /// this gateway pinned for it.
+    fn still_admitted(&self, worker: &WorkerState, pin: &NumericalPin<'_>) -> bool {
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+            });
+        worker.supports_numerical_admission_subject_v1
+            && pin.admitted.get(&worker.name).is_some_and(|pinned| {
+                remote_admission(worker, pin.model, now_unix_ms)
+                    .is_some_and(|admission| &admission.sha256 == pinned)
+            })
+    }
+
     pub async fn get_models(&self) -> HashMap<String, Vec<String>> {
         let snap = self.snapshot.load();
         let mut models: HashMap<String, Vec<String>> = HashMap::new();
@@ -857,6 +1285,7 @@ impl WorkerRegistry {
                 bundle_config_hash: w.bundle_config_hash.clone(),
                 unsupported_models: w.unsupported_models.to_vec(),
                 unsupported_models_overflow: w.unsupported_overflow,
+                numerical_process_inventory: w.numerical_process_inventory.as_deref().cloned(),
             });
 
             if w.healthy() {
@@ -929,6 +1358,9 @@ mod tests {
     use crate::types::WorkerStatusMessage;
     fn make_msg(ready: bool) -> WorkerStatusMessage {
         WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: "worker-1".into(),
             ready,
             gpu_count: 1,
@@ -951,12 +1383,729 @@ mod tests {
             memory_total_bytes: None,
             saturated: false,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         }
     }
 
     fn registry() -> WorkerRegistry {
         WorkerRegistry::new(Duration::from_secs(30), None)
+    }
+
+    #[tokio::test]
+    async fn numerical_inventory_includes_saturated_workers_and_replaces_processes() {
+        let reg = registry();
+        let mut message = make_msg(true);
+        message.saturated = true;
+        message.numerical_process_inventory = serde_json::from_value(serde_json::json!({
+            "observed_at_unix_ms": 1,
+            "children": [{"child_index": 0, "status": "observed", "snapshot": {
+                "runtime_instance_id": "a".repeat(64), "complete": true, "profiles": []
+            }}]
+        }))
+        .unwrap();
+        reg.update_worker("http://w1", message.clone()).await;
+        let status = reg.get_cluster_status().await;
+        assert!(status.workers[0].healthy);
+        let inventory = status.workers[0]
+            .numerical_process_inventory
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            inventory.children[0]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .runtime_instance_id
+                .as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert!(!reg.workers.read().await["http://w1"].eligible_for_dispatch());
+        message
+            .numerical_process_inventory
+            .as_mut()
+            .unwrap()
+            .children[0]
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .runtime_instance_id = Some("b".repeat(64));
+        reg.update_worker("http://w1", message).await;
+        let status = reg.get_cluster_status().await;
+        assert_eq!(
+            status.workers[0]
+                .numerical_process_inventory
+                .as_ref()
+                .unwrap()
+                .children[0]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .runtime_instance_id
+                .as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        // A legacy heartbeat must not keep a previous process's proof metadata.
+        reg.update_worker("http://w1", make_msg(true)).await;
+        let status = reg.get_cluster_status().await;
+        assert!(status.workers[0].healthy);
+        assert!(status.workers[0].numerical_process_inventory.is_none());
+    }
+
+    const MODEL: &str = "acme/hybrid";
+    const COVERED: &str =
+        "v2:sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER: &str =
+        "v2:sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const CONTRACT: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const NOW_MS: u64 = 1_800_000_000_000;
+
+    fn admission(sha256: char, expires_at_unix_ms: u64) -> serde_json::Value {
+        serde_json::json!({
+            "sha256": sha256.to_string().repeat(64),
+            "kind": "openai",
+            "local_identities": [COVERED],
+            "model_contract_sha256": CONTRACT,
+            "outputs": ["dense"],
+            "expires_at_unix_ms": expires_at_unix_ms,
+        })
+    }
+
+    fn child(index: usize, seed: usize, profile: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "child_index": index,
+            "status": "observed",
+            "snapshot": {
+                "runtime_instance_id": format!("{:064x}", seed * 16 + index + 1),
+                "complete": true,
+                "profiles": [profile],
+            },
+        })
+    }
+
+    fn local_profile(identity: Option<&str>, contract: &str) -> serde_json::Value {
+        serde_json::json!({"model_id": MODEL, "model_contract_sha256": contract, "local_identity": identity})
+    }
+
+    fn remote_profile(admission: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "model_id": MODEL,
+            "model_contract_sha256": CONTRACT,
+            "local_identity": null,
+            "admission": admission,
+        })
+    }
+
+    fn numerical_worker(
+        name: &str,
+        bundle: &str,
+        children: Vec<serde_json::Value>,
+    ) -> WorkerStatusMessage {
+        let mut message = make_msg(true);
+        message.name = name.into();
+        message.bundle = bundle.into();
+        message.pool_name = "default".into();
+        message.bundle_config_hash = format!("{bundle}-hash");
+        message.supports_execution_authority_v1 = true;
+        message.supports_numerical_admission_v1 = true;
+        message.supports_numerical_admission_subject_v1 = true;
+        message.numerical_process_inventory = serde_json::from_value(serde_json::json!({
+            "observed_at_unix_ms": 1,
+            "children": children,
+        }))
+        .unwrap();
+        message
+    }
+
+    fn remote_worker(
+        name: &str,
+        seed: usize,
+        admissions: &[serde_json::Value],
+    ) -> WorkerStatusMessage {
+        numerical_worker(
+            name,
+            "remote",
+            admissions
+                .iter()
+                .enumerate()
+                .map(|(index, admission)| child(index, seed, remote_profile(admission.clone())))
+                .collect(),
+        )
+    }
+
+    fn local_worker(
+        name: &str,
+        seed: usize,
+        profiles: &[serde_json::Value],
+    ) -> WorkerStatusMessage {
+        numerical_worker(
+            name,
+            "default",
+            profiles
+                .iter()
+                .enumerate()
+                .map(|(index, profile)| child(index, seed, profile.clone()))
+                .collect(),
+        )
+    }
+
+    fn decide(
+        reg: &WorkerRegistry,
+        local_pool: &str,
+        outputs: &[&str],
+    ) -> Result<AdmittedWorkers, NumericalRefusal> {
+        let local_bundles = ["default".to_string()];
+        let outputs: Vec<String> = outputs.iter().map(|output| output.to_string()).collect();
+        reg.numerical_admission(
+            &NumericalLanes {
+                model: MODEL,
+                local_bundles: &local_bundles,
+                local_pool,
+                remote_model: "acme/hybrid:remote",
+                remote_bundle: "remote",
+                remote_pool: "default",
+                remote_hash: "remote-hash",
+                outputs: &outputs,
+            },
+            NOW_MS,
+        )
+    }
+
+    fn numerical_decision(reg: &WorkerRegistry) -> Result<AdmittedWorkers, NumericalRefusal> {
+        reg.settle_health_view_for_tests();
+        decide(reg, "default", &["dense"])
+    }
+
+    #[tokio::test]
+    async fn numerical_admission_needs_a_current_admission_that_covers_every_live_local_process() {
+        let current = admission('a', NOW_MS + 60_000);
+        let reg = registry();
+        reg.update_worker(
+            "http://r1",
+            remote_worker("remote-1", 1, &[current.clone(), current.clone()]),
+        )
+        .await;
+        assert_eq!(
+            numerical_decision(&reg).unwrap(),
+            HashMap::from([("remote-1".to_string(), "a".repeat(64))]),
+            "with no live local process the remote admission decides"
+        );
+        let covered = local_profile(Some(COVERED), CONTRACT);
+        reg.update_worker(
+            "http://l1",
+            local_worker("local-1", 2, &[covered.clone(), covered.clone()]),
+        )
+        .await;
+        assert!(numerical_decision(&reg).is_ok());
+
+        let cases: [(&str, Option<WorkerStatusMessage>, NumericalRefusal); 5] = [
+            (
+                "uncovered identity",
+                Some(local_worker(
+                    "local-1",
+                    2,
+                    &[covered.clone(), local_profile(Some(OTHER), CONTRACT)],
+                )),
+                NumericalRefusal::UncoveredIdentity,
+            ),
+            (
+                "other model contract",
+                Some(local_worker(
+                    "local-1",
+                    2,
+                    &[local_profile(Some(COVERED), &"4".repeat(64))],
+                )),
+                NumericalRefusal::UncoveredIdentity,
+            ),
+            (
+                "no identity",
+                Some(local_worker("local-1", 2, &[local_profile(None, CONTRACT)])),
+                NumericalRefusal::UncoveredIdentity,
+            ),
+            (
+                "model missing from the process",
+                Some(local_worker(
+                    "local-1",
+                    2,
+                    &[
+                        serde_json::json!({"model_id": "acme/other", "model_contract_sha256": CONTRACT, "local_identity": COVERED}),
+                    ],
+                )),
+                NumericalRefusal::UncoveredIdentity,
+            ),
+            ("no inventory", None, NumericalRefusal::LocalUnobserved),
+        ];
+        for (case, message, refusal) in cases {
+            let message = message.unwrap_or_else(|| {
+                let mut legacy = local_worker("local-1", 2, std::slice::from_ref(&covered));
+                legacy.numerical_process_inventory = None;
+                legacy
+            });
+            reg.update_worker("http://l1", message).await;
+            assert_eq!(numerical_decision(&reg), Err(refusal), "{case}");
+        }
+
+        let mut incomplete = local_worker("local-1", 2, std::slice::from_ref(&covered));
+        let child = &mut incomplete
+            .numerical_process_inventory
+            .as_mut()
+            .unwrap()
+            .children[0];
+        child.status = NumericalSnapshotStatus::Incomplete;
+        child.snapshot.as_mut().unwrap().complete = false;
+        reg.update_worker("http://l1", incomplete).await;
+        assert_eq!(
+            numerical_decision(&reg),
+            Err(NumericalRefusal::LocalUnobserved)
+        );
+        reg.update_worker("http://l1", local_worker("local-1", 2, &[covered]))
+            .await;
+        assert!(numerical_decision(&reg).is_ok());
+    }
+
+    #[tokio::test]
+    async fn numerical_admission_covers_starting_and_stale_workers_of_the_models_pool() {
+        let reg = registry();
+        reg.update_worker(
+            "http://r1",
+            remote_worker("remote-1", 1, &[admission('a', NOW_MS + 60_000)]),
+        )
+        .await;
+        let uncovered = local_profile(Some(OTHER), CONTRACT);
+        let mut starting = local_worker("local-1", 2, std::slice::from_ref(&uncovered));
+        starting.ready = false;
+        reg.update_worker("http://l1", starting).await;
+        assert_eq!(
+            numerical_decision(&reg),
+            Err(NumericalRefusal::UncoveredIdentity)
+        );
+
+        let mut elsewhere = local_worker("local-1", 2, std::slice::from_ref(&uncovered));
+        elsewhere.pool_name = "other-pool".into();
+        reg.update_worker("http://l1", elsewhere).await;
+        assert!(
+            numerical_decision(&reg).is_ok(),
+            "a worker loads only the models of its own pool"
+        );
+
+        reg.update_worker(
+            "http://l1",
+            local_worker("local-1", 2, &[local_profile(Some(COVERED), CONTRACT)]),
+        )
+        .await;
+        assert!(numerical_decision(&reg).is_ok());
+        {
+            let mut workers = reg.workers.write().await;
+            workers.get_mut("http://l1").unwrap().last_heartbeat =
+                Instant::now() - Duration::from_secs(60);
+            reg.rebuild_snapshot(&workers);
+        }
+        assert_eq!(
+            numerical_decision(&reg),
+            Err(NumericalRefusal::LocalUnobserved),
+            "a stale worker that has not been evicted may still serve"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_of_another_pool_on_the_same_bundle_leaves_the_bridge_open() {
+        let reg = registry();
+        reg.update_worker(
+            "http://r1",
+            remote_worker("remote-1", 1, &[admission('a', NOW_MS + 60_000)]),
+        )
+        .await;
+        reg.update_worker(
+            "http://l1",
+            local_worker("local-1", 2, &[local_profile(Some(COVERED), CONTRACT)]),
+        )
+        .await;
+        assert!(numerical_decision(&reg).is_ok());
+
+        let mut batch = local_worker(
+            "batch-1",
+            3,
+            &[
+                serde_json::json!({"model_id": "acme/batch-only", "model_contract_sha256": CONTRACT, "local_identity": OTHER}),
+            ],
+        );
+        batch.pool_name = "batch".into();
+        reg.update_worker("http://b1", batch).await;
+        assert!(
+            numerical_decision(&reg).is_ok(),
+            "a batch-pool worker never serves a model of the default pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn numerical_admission_waits_one_heartbeat_timeout_after_health_resumes() {
+        let reg = registry();
+        reg.update_worker(
+            "http://r1",
+            remote_worker("remote-1", 1, &[admission('a', NOW_MS + 60_000)]),
+        )
+        .await;
+        assert_eq!(
+            decide(&reg, "default", &["dense"]),
+            Err(NumericalRefusal::LocalUnobserved),
+            "the first status starts the view"
+        );
+        reg.settle_health_view_for_tests();
+        assert!(decide(&reg, "default", &["dense"]).is_ok());
+
+        reg.health_subscription_started();
+        assert_eq!(
+            decide(&reg, "default", &["dense"]),
+            Err(NumericalRefusal::LocalUnobserved),
+            "a resumed subscription missed statuses"
+        );
+        reg.settle_health_view_for_tests();
+        reg.health_view
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_status = Instant::now().checked_sub(reg.heartbeat_timeout * 2);
+        reg.update_worker(
+            "http://r1",
+            remote_worker("remote-1", 1, &[admission('a', NOW_MS + 60_000)]),
+        )
+        .await;
+        assert_eq!(
+            decide(&reg, "default", &["dense"]),
+            Err(NumericalRefusal::LocalUnobserved),
+            "a status after a long silence follows an outage"
+        );
+    }
+
+    #[tokio::test]
+    async fn numerical_admission_must_list_every_requested_output() {
+        let reg = registry();
+        reg.update_worker(
+            "http://r1",
+            remote_worker("remote-1", 1, &[admission('a', NOW_MS + 60_000)]),
+        )
+        .await;
+        reg.settle_health_view_for_tests();
+        assert!(decide(&reg, "default", &["dense"]).is_ok());
+        for outputs in [&["sparse"][..], &["dense", "multivector"], &[]] {
+            assert_eq!(
+                decide(&reg, "default", outputs),
+                Err(NumericalRefusal::UnmeasuredRequest),
+                "{outputs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn numerical_selection_requires_the_pinned_admission() {
+        let reg = registry();
+        reg.update_worker(
+            "http://r1",
+            remote_worker("remote-1", 1, &[admission('a', NOW_MS + 60_000)]),
+        )
+        .await;
+        let admitted = numerical_decision(&reg).unwrap();
+        let pick = |reg: &WorkerRegistry| {
+            reg.execution_authority_worker(
+                "acme/hybrid:remote",
+                "default",
+                "l4-spot",
+                "remote",
+                "remote-hash",
+                None,
+                Some(&NumericalPin {
+                    model: MODEL,
+                    admitted: &admitted,
+                }),
+            )
+        };
+        let message = remote_worker("remote-1", 1, &[admission('a', u64::MAX)]);
+        reg.update_worker("http://r1", message.clone()).await;
+        assert_eq!(pick(&reg).as_deref(), Some("remote-1"));
+
+        let mut downgraded = message.clone();
+        downgraded.supports_numerical_admission_v1 = false;
+        reg.update_worker("http://r1", downgraded).await;
+        assert!(pick(&reg).is_none(), "the capability was withdrawn");
+
+        let replaced = remote_worker("remote-1", 1, &[admission('b', u64::MAX)]);
+        reg.update_worker("http://r1", replaced).await;
+        assert!(
+            pick(&reg).is_none(),
+            "the admission changed after the decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn numerical_admission_needs_a_capable_current_and_unanimous_remote_worker() {
+        let current = admission('a', NOW_MS + 60_000);
+        let cases: [(&str, WorkerStatusMessage); 8] = [
+            (
+                "expires within the margin",
+                remote_worker("remote-1", 1, &[admission('a', NOW_MS + 4_000)]),
+            ),
+            (
+                "children disagree",
+                remote_worker(
+                    "remote-1",
+                    1,
+                    &[current.clone(), admission('b', NOW_MS + 60_000)],
+                ),
+            ),
+            ("no numerical admission support", {
+                let mut message = remote_worker("remote-1", 1, std::slice::from_ref(&current));
+                message.supports_numerical_admission_v1 = false;
+                message
+            }),
+            ("a build that predates the admission subject", {
+                let mut message = remote_worker("remote-1", 1, std::slice::from_ref(&current));
+                message.supports_numerical_admission_subject_v1 = false;
+                message
+            }),
+            ("no execution authority", {
+                let mut message = remote_worker("remote-1", 1, std::slice::from_ref(&current));
+                message.supports_execution_authority_v1 = false;
+                message
+            }),
+            ("another configuration hash", {
+                let mut message = remote_worker("remote-1", 1, std::slice::from_ref(&current));
+                message.bundle_config_hash = "stale".into();
+                message
+            }),
+            ("saturated", {
+                let mut message = remote_worker("remote-1", 1, std::slice::from_ref(&current));
+                message.saturated = true;
+                message
+            }),
+            (
+                "the child reports another model contract",
+                numerical_worker(
+                    "remote-1",
+                    "remote",
+                    vec![child(
+                        0,
+                        1,
+                        serde_json::json!({
+                            "model_id": MODEL,
+                            "model_contract_sha256": "4".repeat(64),
+                            "local_identity": null,
+                            "admission": current.clone(),
+                        }),
+                    )],
+                ),
+            ),
+        ];
+        for (case, message) in cases {
+            let reg = registry();
+            reg.update_worker("http://r1", message).await;
+            assert_eq!(
+                numerical_decision(&reg),
+                Err(NumericalRefusal::NoAdmission),
+                "{case}"
+            );
+        }
+
+        let reg = registry();
+        reg.update_worker("http://r1", remote_worker("remote-1", 1, &[current]))
+            .await;
+        let mut narrower = admission('b', NOW_MS + 60_000);
+        narrower["local_identities"] = serde_json::json!([OTHER]);
+        reg.update_worker("http://r2", remote_worker("remote-2", 3, &[narrower]))
+            .await;
+        reg.update_worker(
+            "http://l1",
+            local_worker("local-1", 2, &[local_profile(Some(COVERED), CONTRACT)]),
+        )
+        .await;
+        assert_eq!(
+            numerical_decision(&reg).unwrap(),
+            HashMap::from([("remote-1".to_string(), "a".repeat(64))]),
+            "only a remote worker whose own admission covers the local fleet is admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_lane_trigger_is_scoped_and_usable_workers_win() {
+        let reg = registry();
+        let mut message = make_msg(true);
+        message.pool_name = "default".into();
+        message.saturated = true;
+        reg.update_worker("http://w1", message.clone()).await;
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            Some(FallbackTrigger::Saturated)
+        );
+        for (pool, gpu, bundle, hash) in [
+            ("other", "l4-spot", "default", "abc123"),
+            ("default", "h100", "default", "abc123"),
+            ("default", "l4-spot", "other", "abc123"),
+            ("default", "l4-spot", "default", "old"),
+        ] {
+            assert_eq!(
+                reg.unavailable_lane_trigger("BAAI/bge-m3", pool, gpu, bundle, hash, None)
+                    .await,
+                None
+            );
+        }
+        let admitted = HashSet::from(["other-worker".to_string()]);
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                Some(&admitted)
+            )
+            .await,
+            None
+        );
+        message.name = "worker-2".into();
+        message.saturated = false;
+        reg.update_worker("http://w2", message).await;
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            None
+        );
+        reg.mark_unhealthy("http://w1").await;
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            None
+        );
+        reg.mark_unhealthy("http://w2").await;
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            Some(FallbackTrigger::Unhealthy)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_lane_trigger_keeps_startup_provisioning_and_excludes_unsupported() {
+        let reg = registry();
+        let mut message = make_msg(false);
+        message.pool_name = "default".into();
+        reg.update_worker("http://w1", message.clone()).await;
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            None
+        );
+        message.ready = true;
+        message.saturated = true;
+        message.unsupported_models = vec!["BAAI/bge-m3".into()];
+        reg.update_worker("http://w1", message).await;
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_lane_trigger_treats_stale_health_as_unhealthy_until_eviction() {
+        let reg = registry();
+        let mut message = make_msg(true);
+        message.pool_name = "default".into();
+        reg.update_worker("http://w1", message).await;
+        reg.workers
+            .write()
+            .await
+            .get_mut("http://w1")
+            .unwrap()
+            .last_heartbeat = Instant::now() - reg.heartbeat_timeout - Duration::from_secs(1);
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            Some(FallbackTrigger::Unhealthy)
+        );
+        reg.workers
+            .write()
+            .await
+            .get_mut("http://w1")
+            .unwrap()
+            .health = WorkerHealth::Unknown;
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            Some(FallbackTrigger::Unhealthy)
+        );
+        reg.workers
+            .write()
+            .await
+            .get_mut("http://w1")
+            .unwrap()
+            .last_heartbeat = Instant::now() - reg.stale_evict_after - Duration::from_secs(1);
+        assert_eq!(
+            reg.unavailable_lane_trigger(
+                "BAAI/bge-m3",
+                "default",
+                "l4-spot",
+                "default",
+                "abc123",
+                None
+            )
+            .await,
+            None
+        );
     }
 
     // ── update_worker ──────────────────────────────────────────────
@@ -1188,6 +2337,9 @@ mod tests {
     async fn test_update_worker_compact_field_fallback() {
         let reg = registry();
         let msg = WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: "w-compact".into(),
             ready: true,
             gpu_count: 1,
@@ -1207,6 +2359,7 @@ mod tests {
             memory_total_bytes: Some(8000),
             saturated: false,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         };
         reg.update_worker("http://w1:8080", msg).await;
@@ -1224,6 +2377,9 @@ mod tests {
     async fn test_update_worker_compact_fields_none_defaults_to_zero() {
         let reg = registry();
         let msg = WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: "w-none".into(),
             ready: true,
             gpu_count: 1,
@@ -1243,6 +2399,7 @@ mod tests {
             memory_total_bytes: None,
             saturated: false,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         };
         reg.update_worker("http://w1:8080", msg).await;
@@ -1312,6 +2469,107 @@ mod tests {
         let reg = registry();
         reg.mark_unhealthy("http://nonexistent:8080").await;
         assert!(reg.workers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn verified_worker_selection_requires_fresh_positive_authority_and_admission() {
+        let reg = registry();
+        let mut good = make_msg(true);
+        good.pool_name = "tenant".into();
+        good.supports_execution_authority_v1 = true;
+        let pick = |hash: &str, names: Option<&HashSet<String>>| {
+            reg.execution_authority_worker(
+                "BAAI/bge-m3",
+                "tenant",
+                "l4-spot",
+                "default",
+                hash,
+                names,
+                None,
+            )
+        };
+        reg.update_worker("w1", good.clone()).await;
+        assert_eq!(pick("abc123", None).as_deref(), Some("worker-1"));
+        assert!(pick("", None).is_none());
+        assert!(pick("different", None).is_none());
+        assert!(pick("abc123", Some(&HashSet::new())).is_none());
+        let admitted = HashSet::from(["worker-1".to_string()]);
+        assert!(pick("abc123", Some(&admitted)).is_some());
+        for case in 0..7 {
+            let mut bad = good.clone();
+            match case {
+                0 => bad.supports_execution_authority_v1 = false,
+                1 => bad.ready = false,
+                2 => bad.saturated = true,
+                3 => bad.ready_gpu_slots = Some(0),
+                4 => bad.unsupported_models = vec!["BAAI/bge-m3".into()],
+                5 => bad.name = "worker.1".into(),
+                _ => bad.bundle_config_hash.clear(),
+            }
+            reg.update_worker("w1", bad).await;
+            assert!(pick("abc123", None).is_none(), "case {case}");
+        }
+        reg.update_worker("w1", good.clone()).await;
+        let mut duplicate = good;
+        duplicate.pool_name = "another-tenant".into();
+        reg.update_worker("w2", duplicate).await;
+        assert!(pick("abc123", None).is_none(), "duplicate worker identity");
+    }
+
+    #[tokio::test]
+    async fn verified_selection_uses_pressure_and_distributes_equal_pressure() {
+        let reg = registry();
+        for (name, cost) in [("hot", 100), ("idle-a", 0), ("idle-b", 0)] {
+            let mut msg = make_msg(true);
+            msg.name = name.into();
+            msg.pool_name = "tenant".into();
+            msg.supports_execution_authority_v1 = true;
+            msg.pending_cost = Some(cost);
+            reg.update_worker(name, msg).await;
+        }
+        let selected: HashSet<_> = (0..128)
+            .map(|_| {
+                reg.execution_authority_worker(
+                    "BAAI/bge-m3",
+                    "tenant",
+                    "l4-spot",
+                    "default",
+                    "abc123",
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            selected,
+            HashSet::from(["idle-a".to_string(), "idle-b".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_selection_refuses_stale_snapshot_before_heartbeat_sweep() {
+        let reg = registry();
+        let mut msg = make_msg(true);
+        msg.pool_name = "tenant".into();
+        msg.supports_execution_authority_v1 = true;
+        reg.update_worker("w1", msg).await;
+        let mut workers = reg.workers.write().await;
+        workers.get_mut("w1").unwrap().last_heartbeat =
+            Instant::now() - reg.heartbeat_timeout - Duration::from_secs(1);
+        reg.rebuild_snapshot(&workers);
+        drop(workers);
+        assert!(reg
+            .execution_authority_worker(
+                "BAAI/bge-m3",
+                "tenant",
+                "l4-spot",
+                "default",
+                "abc123",
+                None,
+                None
+            )
+            .is_none());
     }
 
     // ── check_heartbeats ───────────────────────────────────────────
@@ -1797,6 +3055,9 @@ mod tests {
         models: &[&str],
     ) -> WorkerStatusMessage {
         WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: "w".into(),
             ready,
             gpu_count: 1,
@@ -1816,6 +3077,7 @@ mod tests {
             memory_total_bytes: None,
             saturated,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         }
     }

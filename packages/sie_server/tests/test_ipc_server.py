@@ -6,6 +6,7 @@ import hashlib
 import os
 import struct
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -22,9 +23,11 @@ import sie_server.ipc_server as ipc_server_module
 import yaml
 from sie_config.model_registry import ModelRegistry as ConfigModelRegistry
 from sie_sdk.bundle_utils import match_bundle_models
-from sie_server.api.ws import compute_bundle_config_hash_cached
+from sie_server.api.ws import BundleConfigView, compute_bundle_config_hash_cached
+from sie_server.config.equivalence import model_contract_digest
 from sie_server.config.model import ModelConfig
 from sie_server.core.inference_output import ExtractOutput, ScoreOutput
+from sie_server.core.profile_identity import runtime_instance_id
 from sie_server.core.readiness import mark_not_ready, mark_ready, register_liveness_probe
 from sie_server.core.registry import ModelRegistry
 from sie_server.core.timing import RequestTiming
@@ -32,19 +35,380 @@ from sie_server.core.worker.types import WorkerResult
 from sie_server.ipc_server import IpcServer, IpcServerError
 from sie_server.ipc_types import (
     IPC_VERSION,
+    METHOD_PROCESS_GENERATE_WITH_EXECUTION_AUTHORITY_V1,
+    METHOD_RUN_BATCH_WITH_EXECUTION_AUTHORITY_V1,
     ApplyModelConfigRequest,
+    BatchOutcome,
     IpcResponseChunkV1,
+    NumericalProfileSnapshotRequest,
+    ProcessEncodeBatchRequest,
+    ProcessExtractBatchRequest,
     ProcessGenerateRequest,
+    ProcessScoreBatchRequest,
     ReplaceModelConfigEntry,
     ReplaceModelConfigsRequest,
     ResponseEnvelope,
+    RunBatchRequest,
     SetPinnedModelsRequest,
     SignalGenerateCancelRequest,
+    WorkerCapabilitiesResponse,
 )
 from sie_server.observability import worker_telemetry
 from sie_server.queue_executor import QueueExecutor
 
 _LEN_STRUCT = struct.Struct("!I")
+
+
+def _pinned_execution_server(monkeypatch: pytest.MonkeyPatch) -> tuple[IpcServer, ModelRegistry, str]:
+    registry = ModelRegistry(enable_hot_reload=False)
+    registry.add_config(ModelConfig(**yaml.safe_load(_qwen_default_only_yaml())))
+    monkeypatch.setattr(
+        ws_module,
+        "_bundle_adapter_modules",
+        lambda _bundle: frozenset({"sie_server.adapters.sglang.generation"}),
+    )
+    executor = QueueExecutor(registry)
+    server = IpcServer(_short_sock_path(), executor, worker_id="w", bundle_id="sglang")
+    return server, registry, executor.bundle_config_view("sglang").bundle_config_hash
+
+
+@pytest.mark.parametrize("method", ["encode", "score", "extract", "run_batch"])
+@pytest.mark.parametrize("authority", ["valid", "legacy", "stale", "missing_bundle", "unsupported", "mixed"])
+async def test_ipc_batch_execution_checks_live_authority_before_inputs(
+    monkeypatch: pytest.MonkeyPatch, method: str, authority: str
+) -> None:
+    server, registry, expected = _pinned_execution_server(monkeypatch)
+    model_id = "Qwen/Qwen3.6-27B"
+    item = {
+        "work_item_id": "req.0",
+        "request_id": "req",
+        "item_index": 0,
+        "total_items": 1,
+        "timestamp": 1.0,
+        "bundle_config_hash": expected if authority != "legacy" else None,
+    }
+    if authority == "stale":
+        changed = ModelConfig.model_validate(registry.get_config(model_id).model_dump(mode="json"))
+        changed.profiles["default"].max_batch_tokens += 1
+        registry.add_config(changed)
+    elif authority == "missing_bundle":
+        server._bundle_id = ""
+    elif authority == "unsupported":
+        monkeypatch.setattr(server._executor, "bundle_config_view", lambda _: BundleConfigView(expected, [model_id]))
+    op = "encode" if method == "run_batch" else method
+    item.update(
+        {"query_item": {"text": "query"}, "score_items": [{"text": "doc"}]}
+        if op == "score"
+        else {"item": {"text": "secret-input"}}
+    )
+    items = [item]
+    if authority == "mixed":
+        items.append({**item, "work_item_id": "req.1", "item_index": 1, "bundle_config_hash": "stale"})
+    request_type = {
+        "encode": ProcessEncodeBatchRequest,
+        "score": ProcessScoreBatchRequest,
+        "extract": ProcessExtractBatchRequest,
+        "run_batch": RunBatchRequest,
+    }[method]
+    body = {"model_id": model_id, "items": items}
+    if method == "run_batch":
+        body.update(batch_id=1, lora_key="", total_cost=1)
+        body["items"] = [
+            {
+                "op": "encode",
+                "encode": value,
+                "work_item_id": value["work_item_id"],
+                "request_id": value["request_id"],
+                "item_index": value["item_index"],
+            }
+            for value in items
+        ]
+    request = msgspec.convert(body, type=request_type)
+    inference = AsyncMock(return_value=BatchOutcome(outcomes=[]))
+    monkeypatch.setattr(server._executor, f"process_{op}_batch", inference)
+    outcome = await getattr(server, f"_handle_{'run_batch' if method == 'run_batch' else 'process_' + method}")(request)
+    if authority in {"valid", "legacy"}:
+        inference.assert_awaited_once()
+    else:
+        inference.assert_not_awaited()
+        assert len(outcome.outcomes) == len(items)
+        assert all(value.disposition == "nak_retry" for value in outcome.outcomes)
+        assert all(value.result_msgpack is None and value.units is None for value in outcome.outcomes)
+
+
+async def test_ipc_uses_control_plane_scope_rather_than_ping_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    server, registry, _ = _pinned_execution_server(monkeypatch)
+    config = ModelConfig.model_validate(registry.get_config("Qwen/Qwen3.6-27B").model_dump(mode="json"))
+    alternate = type(config.profiles["default"]).model_validate(config.profiles["default"].model_dump(mode="json"))
+    alternate.adapter_path = "sie_server.adapters.mlx.generation:MLXGenerationAdapter"
+    config.profiles["alternate"] = alternate
+    registry.add_config(config)
+    server._executor._record_control_plane_adapters(
+        "sglang", ["sie_server.adapters.sglang.generation", "sie_server.adapters.mlx.generation"]
+    )
+    authority = server._executor.bundle_config_view("sglang")
+    assert authority.bundle_config_hash != server._executor.compute_bundle_config_hash("sglang")
+    async with server._execution_config(config.sie_id, [authority.bundle_config_hash]) as valid:
+        assert valid
+
+
+async def test_a_registry_profile_outside_the_bundle_hash_cannot_execute_pinned_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, registry, expected = _pinned_execution_server(monkeypatch)
+    raw = registry.get_config("Qwen/Qwen3.6-27B").model_dump(mode="json")
+    raw["profiles"]["alternate"] = {
+        **raw["profiles"]["default"],
+        "adapter_path": "sie_server.adapters.mlx.generation:MLXGenerationAdapter",
+    }
+    registry.add_config(ModelConfig.model_validate(raw))
+    assert registry.has_model(raw["sie_id"] + ":alternate")
+    assert server._executor.bundle_config_view("sglang").bundle_config_hash == expected
+    assert server._executor.bundle_config_view("sglang").unsupported_models == []
+    async with server._execution_config(raw["sie_id"] + ":alternate", [expected]) as valid:
+        assert not valid
+    async with server._execution_config(raw["sie_id"], [expected]) as valid:
+        assert valid
+
+
+async def test_ipc_inference_holds_live_configuration_until_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    server, registry, expected = _pinned_execution_server(monkeypatch)
+    config = ModelConfig.model_validate(registry.get_config("Qwen/Qwen3.6-27B").model_dump(mode="json"))
+    config.profiles["default"].max_batch_tokens += 1
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def execute(_request: ProcessEncodeBatchRequest) -> BatchOutcome:
+        entered.set()
+        await finish.wait()
+        assert server._executor.bundle_config_view("sglang").bundle_config_hash == expected
+        return BatchOutcome(outcomes=[])
+
+    monkeypatch.setattr(server._executor, "process_encode_batch", execute)
+    req = msgspec.convert(
+        {
+            "model_id": config.sie_id,
+            "items": [
+                {
+                    "work_item_id": "r.0",
+                    "request_id": "r",
+                    "item_index": 0,
+                    "total_items": 1,
+                    "timestamp": 1.0,
+                    "item": {"text": "secret"},
+                    "bundle_config_hash": expected,
+                }
+            ],
+        },
+        type=ProcessEncodeBatchRequest,
+    )
+    inference = asyncio.create_task(server._handle_process_encode(req))
+    await entered.wait()
+    reload = asyncio.create_task(registry.add_config_async(config))
+    await asyncio.sleep(0)
+    assert not reload.done()
+    finish.set()
+    await asyncio.wait_for(asyncio.gather(inference, reload), 1)
+    assert server._executor.bundle_config_view("sglang").bundle_config_hash != expected
+
+
+@pytest.mark.parametrize("authority", ["stale", "missing_bundle", "different_model", "grammar_rewrite"])
+async def test_pinned_generation_refuses_before_processor_or_prewarm(
+    monkeypatch: pytest.MonkeyPatch, authority: str
+) -> None:
+    server, _registry, expected = _pinned_execution_server(monkeypatch)
+    model_id = "Qwen/Qwen3.6-27B"
+    work_item = {"model_id": model_id, "bundle_config_hash": expected, "generate": {"prompt": "secret"}}
+    if authority == "stale":
+        work_item["bundle_config_hash"] = "stale"
+    elif authority == "missing_bundle":
+        server._bundle_id = ""
+    elif authority == "different_model":
+        work_item["model_id"] = "other/model"
+    else:
+        work_item["generate"]["grammar"] = {"type": "json"}
+        monkeypatch.setattr(
+            ipc_server_module, "resolve_grammar_serving_model", lambda _registry, _model: model_id + ":remote"
+        )
+    processor = AsyncMock()
+    monkeypatch.setattr(server, "_get_streaming_processor", processor)
+    writer = _CapturingWriter()
+    await server._handle_process_generate(
+        ProcessGenerateRequest(model_id=model_id, work_item_msgpack=msgpack.packb(work_item, use_bin_type=True)),
+        request_id="ipc-r",
+        writer=writer,
+    )
+    processor.assert_not_awaited()
+    assert [frame["body"]["kind"] for frame in _decode_written_frames(writer)] == ["nak", "done"]
+
+
+async def test_generation_retains_config_until_stream_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    server, registry, expected = _pinned_execution_server(monkeypatch)
+    config = ModelConfig.model_validate(registry.get_config("Qwen/Qwen3.6-27B").model_dump(mode="json"))
+    entered = asyncio.Event()
+    processor = MagicMock()
+
+    async def stream(_message: object, _model: str) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    processor.process = AsyncMock(side_effect=stream)
+    monkeypatch.setattr(server, "_get_streaming_processor", AsyncMock(return_value=processor))
+    work_item = {"model_id": config.sie_id, "bundle_config_hash": expected, "generate": {"prompt": "secret"}}
+    task = asyncio.create_task(
+        server._handle_process_generate(
+            ProcessGenerateRequest(
+                model_id=config.sie_id, work_item_msgpack=msgpack.packb(work_item, use_bin_type=True)
+            ),
+            request_id="ipc-r",
+            writer=_CapturingWriter(),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    config.profiles["default"].max_batch_tokens += 1
+    writer = asyncio.create_task(registry.add_config_async(config))
+    await asyncio.sleep(0)
+    assert not writer.done()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(writer, 1)
+    assert server._executor.bundle_config_view("sglang").bundle_config_hash != expected
+
+
+async def test_pinned_generation_settles_an_unavailable_grammar_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    server, registry, _ = _pinned_execution_server(monkeypatch)
+    raw = registry.get_config("Qwen/Qwen3.6-27B").model_dump(mode="json")
+    raw["tasks"]["generate"]["grammar_profile"] = "missing"
+    raw["profiles"]["missing"] = {**raw["profiles"]["default"]}
+    registry.add_config(ModelConfig.model_validate(raw))
+    registry._configs.pop(raw["sie_id"] + ":missing")
+    expected = server._executor.bundle_config_view("sglang").bundle_config_hash
+    work_item = {
+        "model_id": raw["sie_id"],
+        "request_id": "req",
+        "reply_subject": "reply.req",
+        "bundle_config_hash": expected,
+        "generate": {"prompt": "secret", "grammar": {"kind": "json_schema", "value": {"type": "object"}}},
+    }
+    load = AsyncMock()
+    monkeypatch.setattr(registry, "load_async", load)
+    writer = _CapturingWriter()
+    await server._handle_process_generate(
+        ProcessGenerateRequest(model_id=raw["sie_id"], work_item_msgpack=msgpack.packb(work_item, use_bin_type=True)),
+        request_id="ipc-r",
+        writer=writer,
+        require_authority=True,
+    )
+    events = [frame["body"] for frame in _decode_written_frames(writer)]
+    assert [event["kind"] for event in events] == ["in_progress", "publish", "ack", "done"]
+    terminal = msgpack.unpackb(events[1]["payload"], raw=False)
+    assert terminal["error"]["code"] == "unsupported_field"
+    assert terminal["error"]["param"] == "grammar"
+    load.assert_not_awaited()
+
+
+async def test_exported_routing_validation_keeps_ipc_loop_responsive(monkeypatch: pytest.MonkeyPatch) -> None:
+    server, registry, _ = _pinned_execution_server(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def validate(*_args, **_kwargs) -> None:
+        entered.set()
+        release.wait(2)
+        finished.set()
+
+    monkeypatch.setattr("sie_server.queue_executor.validate_model_routing", validate)
+    request = ReplaceModelConfigsRequest(
+        bundle_id="sglang",
+        epoch=1,
+        bundle_config_hash="",
+        models=[ReplaceModelConfigEntry(model_id="Qwen/Qwen3.6-27B", model_config=_qwen_default_only_yaml())],
+    )
+    task = asyncio.create_task(server._executor.replace_model_configs(request))
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not finished.is_set()
+        assert registry.has_model("Qwen/Qwen3.6-27B")
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 1)
+
+
+@pytest.mark.parametrize("shape", ["generate", "options"])
+async def test_an_unchanged_bundle_hash_cannot_reinterpret_a_grammar_target(
+    monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    server, registry, _ = _pinned_execution_server(monkeypatch)
+    raw = registry.get_config("Qwen/Qwen3.6-27B").model_dump(mode="json")
+    raw["profiles"]["alternate"] = {
+        **raw["profiles"]["default"],
+        "adapter_path": "sie_server.adapters.mlx.generation:MLXGenerationAdapter",
+    }
+    registry.add_config(ModelConfig.model_validate(raw))
+    expected = server._executor.bundle_config_view("sglang").bundle_config_hash
+    raw["tasks"]["generate"]["grammar_profile"] = "alternate"
+    await registry.add_config_async(ModelConfig.model_validate(raw))
+    assert server._executor.bundle_config_view("sglang").bundle_config_hash == expected
+    assert ipc_server_module.resolve_grammar_serving_model(registry, raw["sie_id"]) == raw["sie_id"] + ":alternate"
+    processor = AsyncMock()
+    monkeypatch.setattr(server, "_get_streaming_processor", processor)
+    work_item = {
+        "model_id": raw["sie_id"],
+        "bundle_config_hash": expected,
+        "generate": {"prompt": "secret", "grammar": {"type": "json"}},
+    }
+    if shape == "options":
+        work_item["options"] = work_item.pop("generate")
+        work_item["generate"] = None
+    writer = _CapturingWriter()
+    await server._handle_process_generate(
+        ProcessGenerateRequest(model_id=raw["sie_id"], work_item_msgpack=msgpack.packb(work_item, use_bin_type=True)),
+        request_id="ipc-r",
+        writer=writer,
+    )
+    processor.assert_not_awaited()
+    assert [frame["body"]["kind"] for frame in _decode_written_frames(writer)] == ["nak", "done"]
+
+
+@pytest.mark.parametrize("operation", ["score", "extract"])
+async def test_run_batch_checks_the_payload_selected_by_its_operation(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    server, _registry, expected = _pinned_execution_server(monkeypatch)
+    common = {"work_item_id": "r.0", "request_id": "r", "item_index": 0, "total_items": 1, "timestamp": 1.0}
+    encode = {**common, "item": {"text": "decoy"}, "bundle_config_hash": expected}
+    selected = {**common, "bundle_config_hash": "stale"}
+    selected.update(
+        {"query_item": {"text": "secret"}, "score_items": [{"text": "doc"}]}
+        if operation == "score"
+        else {"item": {"text": "secret"}}
+    )
+    req = msgspec.convert(
+        {
+            "model_id": "Qwen/Qwen3.6-27B",
+            "batch_id": 1,
+            "lora_key": "",
+            "total_cost": 1,
+            "items": [
+                {
+                    "op": operation,
+                    "encode": encode,
+                    operation: selected,
+                    "work_item_id": "r.0",
+                    "request_id": "r",
+                    "item_index": 0,
+                }
+            ],
+        },
+        type=RunBatchRequest,
+    )
+    inference = AsyncMock(return_value=BatchOutcome(outcomes=[]))
+    monkeypatch.setattr(server._executor, f"process_{operation}_batch", inference)
+    result = await server._handle_run_batch(req)
+    inference.assert_not_awaited()
+    assert [item.disposition for item in result.outcomes] == ["nak_retry"]
 
 
 def _short_sock_path() -> Path:
@@ -116,6 +480,106 @@ class _CapturingWriter:
 
     async def drain(self) -> None:
         return None
+
+
+@pytest.mark.parametrize("op", ["encode", "score", "extract"])
+@pytest.mark.parametrize("authority", ["valid", "stale", "missing", "empty", "decoy"])
+async def test_authority_batch_method_never_falls_back_to_unpinned_execution(
+    monkeypatch: pytest.MonkeyPatch, op: str, authority: str
+) -> None:
+    server, _, expected = _pinned_execution_server(monkeypatch)
+    inference = AsyncMock(return_value=BatchOutcome(outcomes=[]))
+    monkeypatch.setattr(server._executor, f"process_{op}_batch", inference)
+    payload = {
+        "work_item_id": "req.0",
+        "request_id": "req",
+        "item_index": 0,
+        "total_items": 1,
+        "timestamp": 1.0,
+        "bundle_config_hash": {"valid": expected, "stale": "stale", "missing": None, "empty": "", "decoy": None}[
+            authority
+        ],
+        "item": {"text": "secret-input"},
+        "query_item": {"text": "query"},
+        "score_items": [{"text": "doc"}],
+    }
+    item = {"op": op, op: payload, "work_item_id": "req.0", "request_id": "req", "item_index": 0}
+    if authority == "decoy":
+        item["score" if op != "score" else "encode"] = {**payload, "bundle_config_hash": expected}
+    writer = _CapturingWriter()
+    await server._dispatch_frame(
+        msgpack.packb(
+            {
+                "version": IPC_VERSION,
+                "method": METHOD_RUN_BATCH_WITH_EXECUTION_AUTHORITY_V1,
+                "request_id": "req",
+                "body": {
+                    "model_id": "Qwen/Qwen3.6-27B",
+                    "batch_id": 1,
+                    "lora_key": "",
+                    "total_cost": 1,
+                    "items": [item],
+                },
+            },
+            use_bin_type=True,
+        ),
+        cast("asyncio.StreamWriter", writer),
+    )
+    await asyncio.gather(*server._inflight)
+    response = _decode_written_frames(writer)[0]
+    if authority == "valid":
+        assert response["ok"] is True
+        inference.assert_awaited_once()
+    else:
+        inference.assert_not_awaited()
+        if authority == "stale":
+            assert response["body"]["outcomes"][0]["disposition"] == "nak_retry"
+        else:
+            assert response["ok"] is False
+            assert "requires a nonempty hash" in response["error"]
+
+
+@pytest.mark.parametrize("authority", ["valid", "stale", "missing", "empty"])
+async def test_authority_generation_method_requires_live_hash_before_processor(
+    monkeypatch: pytest.MonkeyPatch, authority: str
+) -> None:
+    server, _, expected = _pinned_execution_server(monkeypatch)
+    inference = AsyncMock()
+    monkeypatch.setattr(server, "_process_generate", inference)
+    writer = _CapturingWriter()
+    await server._run_method(
+        METHOD_PROCESS_GENERATE_WITH_EXECUTION_AUTHORITY_V1,
+        "req",
+        {
+            "model_id": "Qwen/Qwen3.6-27B",
+            "work_item_msgpack": msgpack.packb(
+                {
+                    "model_id": "Qwen/Qwen3.6-27B",
+                    "bundle_config_hash": {"valid": expected, "stale": "stale", "missing": None, "empty": ""}[
+                        authority
+                    ],
+                    "generate": {"prompt": "secret-input"},
+                },
+                use_bin_type=True,
+            ),
+        },
+        cast("asyncio.StreamWriter", writer),
+    )
+    if authority == "valid":
+        inference.assert_awaited_once()
+    else:
+        inference.assert_not_awaited()
+        frames = _decode_written_frames(writer)
+        if authority == "stale":
+            assert [frame["body"]["kind"] for frame in frames] == ["nak", "done"]
+        else:
+            assert frames[0]["ok"] is False
+            assert "requires a nonempty generation hash" in frames[0]["error"]
+
+
+def test_legacy_capability_response_does_not_authorize_execution() -> None:
+    response = msgspec.convert({"has_generation_models": True}, type=WorkerCapabilitiesResponse)
+    assert response.supports_execution_authority_v1 is False
 
 
 def _decode_written_frames(writer: _CapturingWriter) -> list[dict]:
@@ -2274,6 +2738,96 @@ class TestHeartbeat:
 
 class TestGenerationSidecarIpc:
     @pytest.mark.asyncio
+    async def test_numerical_snapshot_reports_current_process_and_profile_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        server, registry, _ = _pinned_execution_server(monkeypatch)
+        observed = []
+
+        def identity(config: ModelConfig, profile: str, **kwargs: object) -> str:
+            observed.append((config.sie_id, profile, kwargs))
+            return "v1:sha256:" + "a" * 64
+
+        monkeypatch.setattr(ipc_server_module, "local_profile_identity", identity)
+        config = registry.get_config("Qwen/Qwen3.6-27B")
+        response = await server._handle_numerical_profile_snapshot(NumericalProfileSnapshotRequest())
+        assert response.runtime_instance_id == runtime_instance_id()
+        assert response.complete
+        assert msgspec.to_builtins(response.profiles) == [
+            {
+                "model_id": config.sie_id,
+                "local_identity": "v1:sha256:" + "a" * 64,
+                "model_contract_sha256": model_contract_digest(config),
+            }
+        ]
+        assert observed == [
+            (
+                config.sie_id,
+                "default",
+                {
+                    "device": registry.profile_execution_device(config.sie_id) or "",
+                    "engine_config": registry.engine_config,
+                },
+            )
+        ]
+        assert not registry.loaded_model_names
+
+    @pytest.mark.asyncio
+    async def test_numerical_snapshot_failure_is_incomplete_and_exposes_no_exception(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("DEBUG", logger="sie_server.ipc_server")
+        executor, registry = _make_executor()
+        registry.get_configs_snapshot.side_effect = RuntimeError("private upstream credential")
+        async with IpcServer(_short_sock_path(), executor, worker_id="w") as server:
+            client = await _Client.connect(server.socket_path)
+            try:
+                response = await client.rpc("NumericalProfileSnapshot", {})
+            finally:
+                await client.close()
+        assert response["ok"]
+        assert response["body"] == {"runtime_instance_id": runtime_instance_id(), "profiles": [], "complete": False}
+        assert "private" not in str(response)
+        assert "Could not collect numerical profile snapshot (error_class=internal)" in caplog.text
+        assert "private upstream credential" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_numerical_snapshot_pins_config_and_reports_a_bounded_roster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        server, registry, _ = _pinned_execution_server(monkeypatch)
+        before = registry.get_config("Qwen/Qwen3.6-27B")
+        data = before.model_dump(mode="json")
+        data["profiles"]["default"]["max_batch_tokens"] += 1
+        after = ModelConfig.model_validate(data)
+        started, finish = threading.Event(), threading.Event()
+
+        def identity(_config: ModelConfig, _profile: str, **_kwargs: object) -> None:
+            started.set()
+            assert finish.wait(2)
+
+        monkeypatch.setattr(ipc_server_module, "local_profile_identity", identity)
+        snapshot = asyncio.create_task(server._handle_numerical_profile_snapshot(NumericalProfileSnapshotRequest()))
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            reload = asyncio.create_task(registry.add_config_async(after))
+            await asyncio.sleep(0)
+            assert not reload.done()
+        finally:
+            finish.set()
+        response, _ = await asyncio.wait_for(asyncio.gather(snapshot, reload), 2)
+        assert response.complete
+        assert response.profiles[0].local_identity is None
+        assert response.profiles[0].model_contract_sha256 == model_contract_digest(before)
+        current = await server._handle_numerical_profile_snapshot(NumericalProfileSnapshotRequest())
+        assert current.profiles[0].model_contract_sha256 == model_contract_digest(after)
+        assert current.profiles[0].model_contract_sha256 != response.profiles[0].model_contract_sha256
+        monkeypatch.setattr(ipc_server_module, "_MAX_NUMERICAL_PROFILES", 0)
+        bounded = await server._handle_numerical_profile_snapshot(NumericalProfileSnapshotRequest())
+        assert not bounded.complete
+        assert bounded.profiles == []
+
+    @pytest.mark.asyncio
     async def test_worker_capabilities_reports_generation_models(self) -> None:
         executor, reg = _make_executor()
         gen_cfg = MagicMock()
@@ -2295,6 +2849,8 @@ class TestGenerationSidecarIpc:
 
         assert resp["ok"] is True
         assert resp["body"] == {
+            "supports_execution_authority_v1": True,
+            "supports_numerical_admission_v1": True,
             "has_generation_models": True,
             "generation_models": ["z-generate/model"],
             "supported_models": ["encode/model", "z-generate/model"],

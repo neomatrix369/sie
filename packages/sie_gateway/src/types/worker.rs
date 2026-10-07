@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
 use utoipa::ToSchema;
@@ -30,6 +32,14 @@ pub struct WorkerState {
     pub machine_profile: String,
     pub bundle: String,
     pub bundle_config_hash: String,
+    /// Positive support for the versioned queue and backend execution fence.
+    pub supports_execution_authority_v1: bool,
+    /// Every backend child re-verifies a numerical admission before execution.
+    pub supports_numerical_admission_v1: bool,
+    /// The worker also consumes admitted numerical work on its own subject.
+    pub supports_numerical_admission_subject_v1: bool,
+    /// Diagnostic observations only; never sufficient for numerical admission.
+    pub numerical_process_inventory: Option<Arc<NumericalProcessInventory>>,
     pub models: Vec<String>,
     pub queue_depth: i32,
     pub pending_cost: i64,
@@ -127,6 +137,10 @@ pub struct WorkerInfo {
     /// bundle) while it overflows. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unsupported_models_overflow: bool,
+    /// Most recent process diagnostics, including unavailable children.
+    /// Health and observation time must be checked independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numerical_process_inventory: Option<NumericalProcessInventory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -208,6 +222,12 @@ pub struct WorkerStatusMessage {
     #[serde(default)]
     pub bundle_config_hash: String,
     #[serde(default)]
+    pub supports_execution_authority_v1: bool,
+    #[serde(default)]
+    pub supports_numerical_admission_v1: bool,
+    #[serde(default)]
+    pub supports_numerical_admission_subject_v1: bool,
+    #[serde(default)]
     pub loaded_models: Vec<String>,
     #[serde(default)]
     pub models: Vec<ModelStatus>,
@@ -246,6 +266,246 @@ pub struct WorkerStatusMessage {
     /// covers.
     #[serde(default)]
     pub unsupported_models: Vec<String>,
+    /// Optional bounded diagnostics. Invalid metadata must not drop health.
+    #[serde(default, deserialize_with = "deserialize_numerical_inventory")]
+    pub numerical_process_inventory: Option<NumericalProcessInventory>,
+}
+
+/// Wire budget shared with the sidecar publisher. Never truncate a fleet.
+pub const MAX_NUMERICAL_INVENTORY_BYTES: usize = 64 * 1024;
+pub const MAX_NUMERICAL_CHILDREN: usize = 256;
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NumericalProcessInventory {
+    pub observed_at_unix_ms: u64,
+    pub children: Vec<NumericalProcessObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NumericalProcessObservation {
+    pub child_index: usize,
+    pub status: NumericalSnapshotStatus,
+    pub snapshot: Option<NumericalProfileSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NumericalSnapshotStatus {
+    Observed,
+    Incomplete,
+    Unavailable,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NumericalProfileSnapshot {
+    pub runtime_instance_id: Option<String>,
+    pub complete: bool,
+    pub profiles: Vec<NumericalProfileObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NumericalProfileObservation {
+    pub model_id: String,
+    pub model_contract_sha256: Option<String>,
+    pub local_identity: Option<String>,
+    /// The contract of the model's remote profile on this process's upstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_contract_sha256: Option<String>,
+    /// The serving code that runs the remote profile in this process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_execution_sha256: Option<String>,
+    /// The local execution identities current evidence covers for the remote profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<NumericalAdmissionObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NumericalAdmissionObservation {
+    pub sha256: String,
+    pub kind: String,
+    pub local_identities: Vec<String>,
+    pub model_contract_sha256: String,
+    pub outputs: Vec<String>,
+    pub expires_at_unix_ms: u64,
+}
+
+pub const MAX_ADMITTED_IDENTITIES: usize = 8;
+const NUMERICAL_OUTPUTS: [&str; 4] = ["dense", "multivector", "score", "sparse"];
+
+impl NumericalAdmissionObservation {
+    fn valid(&self) -> bool {
+        let mut identities = HashSet::new();
+        let mut outputs = HashSet::new();
+        sha256_digest(&self.sha256)
+            && matches!(self.kind.as_str(), "openai" | "sie")
+            && !self.local_identities.is_empty()
+            && self.local_identities.len() <= MAX_ADMITTED_IDENTITIES
+            && self
+                .local_identities
+                .iter()
+                .all(|identity| local_identity_digest(identity) && identities.insert(identity))
+            && sha256_digest(&self.model_contract_sha256)
+            && !self.outputs.is_empty()
+            && self.outputs.iter().all(|output| {
+                NUMERICAL_OUTPUTS.contains(&output.as_str()) && outputs.insert(output)
+            })
+            && self.expires_at_unix_ms > 0
+    }
+}
+
+fn sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn local_identity_digest(identity: &str) -> bool {
+    ["v1:sha256:", "v2:sha256:"]
+        .iter()
+        .any(|prefix| identity.strip_prefix(prefix).is_some_and(sha256_digest))
+}
+
+struct InventoryBudget(usize);
+
+impl Write for InventoryBudget {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_NUMERICAL_INVENTORY_BYTES.saturating_sub(self.0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "numerical inventory exceeds wire budget",
+            ));
+        }
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn fits_inventory_budget(value: &impl Serialize) -> bool {
+    serde_json::to_writer(&mut InventoryBudget(0), value).is_ok()
+}
+
+impl NumericalProcessInventory {
+    pub fn valid(&self) -> bool {
+        if self.observed_at_unix_ms == 0
+            || self.children.is_empty()
+            || self.children.len() > MAX_NUMERICAL_CHILDREN
+            || !fits_inventory_budget(self)
+        {
+            return false;
+        }
+        let mut instances = HashMap::new();
+        for (index, child) in self.children.iter().enumerate() {
+            if child.child_index != index {
+                return false;
+            }
+            let Some(snapshot) = &child.snapshot else {
+                if !matches!(
+                    child.status,
+                    NumericalSnapshotStatus::Unavailable | NumericalSnapshotStatus::Invalid
+                ) {
+                    return false;
+                }
+                continue;
+            };
+            if child.status == NumericalSnapshotStatus::Unavailable
+                || snapshot
+                    .runtime_instance_id
+                    .as_deref()
+                    .is_some_and(|id| !sha256_digest(id))
+                || snapshot.profiles.len() > 1024
+            {
+                return false;
+            }
+            let mut models = HashSet::new();
+            for profile in &snapshot.profiles {
+                if profile.model_id.is_empty()
+                    || profile.model_id.len() > 1024
+                    || !models.insert(&profile.model_id)
+                    || profile
+                        .model_contract_sha256
+                        .as_deref()
+                        .is_some_and(|id| !sha256_digest(id))
+                    || profile
+                        .local_identity
+                        .as_deref()
+                        .is_some_and(|id| !local_identity_digest(id))
+                    || profile
+                        .remote_contract_sha256
+                        .as_deref()
+                        .is_some_and(|id| !sha256_digest(id))
+                    || profile
+                        .remote_execution_sha256
+                        .as_deref()
+                        .is_some_and(|id| !sha256_digest(id))
+                    || profile
+                        .admission
+                        .as_ref()
+                        .is_some_and(|admission| !admission.valid())
+                {
+                    return false;
+                }
+            }
+            let complete = snapshot.complete
+                && snapshot.runtime_instance_id.is_some()
+                && snapshot
+                    .profiles
+                    .iter()
+                    .all(|profile| profile.model_contract_sha256.is_some());
+            if (child.status == NumericalSnapshotStatus::Observed && !complete)
+                || (child.status == NumericalSnapshotStatus::Incomplete && complete)
+            {
+                return false;
+            }
+            if let Some(instance) = &snapshot.runtime_instance_id {
+                instances
+                    .entry(instance)
+                    .or_insert_with(Vec::new)
+                    .push(child.status);
+            }
+        }
+        // The pool marks every child sharing a process ID invalid. Preserve
+        // those diagnostics, but never accept duplicate positive observations.
+        instances.values().all(|statuses| {
+            statuses.len() == 1
+                || statuses
+                    .iter()
+                    .all(|status| *status == NumericalSnapshotStatus::Invalid)
+        })
+    }
+}
+
+fn deserialize_numerical_inventory<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<NumericalProcessInventory>, D::Error> {
+    // MessagePack may carry non-JSON values (for example binary data). The
+    // ignored alternative consumes those fully so optional diagnostics cannot
+    // invalidate an otherwise usable health message.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum InventoryWire {
+        Json(serde_json::Value),
+        Ignored(serde::de::IgnoredAny),
+    }
+    let InventoryWire::Json(value) = InventoryWire::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if !fits_inventory_budget(&value) {
+        return Ok(None);
+    }
+    Ok(serde_json::from_value::<NumericalProcessInventory>(value)
+        .ok()
+        .filter(NumericalProcessInventory::valid))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,6 +526,224 @@ pub struct GpuStatus {
 mod tests {
     use super::*;
 
+    fn inventory() -> serde_json::Value {
+        serde_json::json!({
+            "observed_at_unix_ms": 1,
+            "children": [
+                {"child_index": 0, "status": "observed", "snapshot": {
+                    "runtime_instance_id": "a".repeat(64), "complete": true,
+                    "profiles": [{"model_id": "model:default", "model_contract_sha256": "b".repeat(64), "local_identity": null}]
+                }},
+                {"child_index": 1, "status": "unavailable", "snapshot": null}
+            ]
+        })
+    }
+
+    #[test]
+    fn numerical_diagnostics_preserve_missing_children_without_authority() {
+        let message: WorkerStatusMessage = serde_json::from_value(serde_json::json!({
+            "ready": true, "numerical_process_inventory": inventory()
+        }))
+        .unwrap();
+        assert!(message.ready);
+        assert!(!message.supports_execution_authority_v1);
+        let inventory = message.numerical_process_inventory.unwrap();
+        assert_eq!(inventory.children.len(), 2);
+        assert_eq!(
+            inventory.children[1].status,
+            NumericalSnapshotStatus::Unavailable
+        );
+        assert!(inventory.children[0].snapshot.as_ref().unwrap().profiles[0]
+            .local_identity
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_numerical_metadata_never_discards_worker_health() {
+        let mut cases = vec![
+            serde_json::json!(null),
+            serde_json::json!("bad"),
+            inventory(),
+        ];
+        cases[2]["children"][0]["snapshot"]["runtime_instance_id"] = serde_json::json!("bad");
+        let mut unknown = inventory();
+        unknown["children"][0]["snapshot"]["caller_input"] =
+            serde_json::json!("must not be retained");
+        cases.push(unknown);
+        let mut sparse = inventory();
+        sparse["children"][1]["child_index"] = serde_json::json!(2);
+        cases.push(sparse);
+        let mut false_complete = inventory();
+        false_complete["children"][0]["snapshot"]["complete"] = serde_json::json!(false);
+        cases.push(false_complete);
+        let mut too_large = inventory();
+        too_large["padding"] = serde_json::json!("x".repeat(MAX_NUMERICAL_INVENTORY_BYTES));
+        cases.push(too_large);
+        let mut too_many = inventory();
+        too_many["children"] = serde_json::Value::Array(
+            (0..=MAX_NUMERICAL_CHILDREN)
+                .map(|index| {
+                    serde_json::json!({
+                        "child_index": index, "status": "unavailable", "snapshot": null
+                    })
+                })
+                .collect(),
+        );
+        cases.push(too_many);
+        for inventory in cases {
+            let message: WorkerStatusMessage = serde_json::from_value(serde_json::json!({
+                "ready": true, "bundle_config_hash": "hash", "numerical_process_inventory": inventory
+            })).unwrap();
+            assert!(message.ready);
+            assert_eq!(message.bundle_config_hash, "hash");
+            assert!(message.numerical_process_inventory.is_none());
+        }
+    }
+
+    #[test]
+    fn binary_messagepack_diagnostics_do_not_discard_following_health_fields() {
+        let mut bytes = rmp_serde::to_vec_named(&serde_json::json!({
+            "numerical_process_inventory": null, "ready": true
+        }))
+        .unwrap();
+        let nil = bytes.iter().position(|byte| *byte == 0xc0).unwrap();
+        bytes.splice(nil..=nil, [0xc4, 3, 0, 1, 2]);
+        let message: WorkerStatusMessage = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(message.ready);
+        assert!(message.numerical_process_inventory.is_none());
+    }
+
+    #[test]
+    fn duplicate_process_ids_are_only_retained_as_invalid_diagnostics() {
+        let mut value = inventory();
+        value["children"][1] = value["children"][0].clone();
+        value["children"][1]["child_index"] = serde_json::json!(1);
+        let message: WorkerStatusMessage = serde_json::from_value(serde_json::json!({
+            "numerical_process_inventory": value.clone()
+        }))
+        .unwrap();
+        assert!(message.numerical_process_inventory.is_none());
+        for child in value["children"].as_array_mut().unwrap() {
+            child["status"] = serde_json::json!("invalid");
+        }
+        let message: WorkerStatusMessage = serde_json::from_value(serde_json::json!({
+            "numerical_process_inventory": value
+        }))
+        .unwrap();
+        assert_eq!(
+            message.numerical_process_inventory.unwrap().children.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn local_identities_of_both_versions_are_accepted_and_others_refused() {
+        for (identity, accepted) in [
+            (format!("v1:sha256:{}", "c".repeat(64)), true),
+            (format!("v2:sha256:{}", "c".repeat(64)), true),
+            (format!("v3:sha256:{}", "c".repeat(64)), false),
+            (format!("v2:sha256:{}", "C".repeat(64)), false),
+            ("v2:sha256:".to_string(), false),
+        ] {
+            let mut value = inventory();
+            value["children"][0]["snapshot"]["profiles"][0]["local_identity"] =
+                serde_json::json!(identity);
+            let message: WorkerStatusMessage = serde_json::from_value(serde_json::json!({
+                "numerical_process_inventory": value
+            }))
+            .unwrap();
+            assert_eq!(
+                message.numerical_process_inventory.is_some(),
+                accepted,
+                "{identity}"
+            );
+        }
+    }
+
+    fn inventory_with_admission(admission: serde_json::Value) -> serde_json::Value {
+        let mut value = inventory();
+        let profile = &mut value["children"][0]["snapshot"]["profiles"][0];
+        profile["remote_contract_sha256"] = serde_json::json!("e".repeat(64));
+        profile["remote_execution_sha256"] = serde_json::json!("f".repeat(64));
+        profile["admission"] = admission;
+        value
+    }
+
+    fn admission() -> serde_json::Value {
+        serde_json::json!({
+            "sha256": "1".repeat(64),
+            "kind": "sie",
+            "local_identities": [format!("v2:sha256:{}", "2".repeat(64))],
+            "model_contract_sha256": "b".repeat(64),
+            "outputs": ["score"],
+            "expires_at_unix_ms": 1,
+        })
+    }
+
+    fn parsed(value: serde_json::Value) -> Option<NumericalProcessInventory> {
+        serde_json::from_value::<WorkerStatusMessage>(serde_json::json!({
+            "numerical_process_inventory": value
+        }))
+        .unwrap()
+        .numerical_process_inventory
+    }
+
+    #[test]
+    fn remote_admissions_are_carried_and_malformed_ones_drop_the_inventory() {
+        let inventory = parsed(inventory_with_admission(admission())).unwrap();
+        let profile = &inventory.children[0].snapshot.as_ref().unwrap().profiles[0];
+        let carried = profile.admission.as_ref().unwrap();
+        assert_eq!(carried.kind, "sie");
+        assert_eq!(carried.local_identities.len(), 1);
+        assert_eq!(
+            profile.remote_execution_sha256.as_deref(),
+            Some("f".repeat(64).as_str())
+        );
+        let identity = format!("v2:sha256:{}", "2".repeat(64));
+        for (field, value) in [
+            ("sha256", serde_json::json!("x")),
+            ("kind", serde_json::json!("vendor")),
+            ("local_identities", serde_json::json!([])),
+            ("local_identities", serde_json::json!([identity, identity])),
+            (
+                "local_identities",
+                serde_json::json!((0..=MAX_ADMITTED_IDENTITIES)
+                    .map(|index| format!("v2:sha256:{index:064x}"))
+                    .collect::<Vec<_>>()),
+            ),
+            ("model_contract_sha256", serde_json::json!("x")),
+            ("outputs", serde_json::json!(["tokens"])),
+            ("outputs", serde_json::json!(["score", "score"])),
+            ("expires_at_unix_ms", serde_json::json!(0)),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut invalid = admission();
+            invalid[field] = value;
+            assert!(
+                parsed(inventory_with_admission(invalid)).is_none(),
+                "{field}"
+            );
+        }
+        let mut contract = inventory_with_admission(serde_json::Value::Null);
+        contract["children"][0]["snapshot"]["profiles"][0]["remote_contract_sha256"] =
+            serde_json::json!("x");
+        assert!(parsed(contract).is_none());
+    }
+
+    #[test]
+    fn an_observation_without_remote_facts_serializes_as_before() {
+        let inventory = parsed(inventory()).unwrap();
+        let encoded =
+            serde_json::to_value(&inventory.children[0].snapshot.as_ref().unwrap().profiles[0])
+                .unwrap();
+        let mut keys: Vec<_> = encoded.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["local_identity", "model_contract_sha256", "model_id"]
+        );
+    }
+
     fn make_worker(health: WorkerHealth, mem_used: i64, mem_total: i64) -> WorkerState {
         WorkerState {
             url: "http://w1:8080".into(),
@@ -280,6 +758,10 @@ mod tests {
             machine_profile: "l4".into(),
             bundle: "default".into(),
             bundle_config_hash: String::new(),
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
+            numerical_process_inventory: None,
             models: vec![],
             queue_depth: 0,
             pending_cost: 0,

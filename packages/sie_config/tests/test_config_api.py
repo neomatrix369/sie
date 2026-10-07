@@ -497,6 +497,18 @@ class TestConfigAPIModels:
             )
             assert resp.status_code == 400, f"{bad!r} should be rejected, got {resp.status_code}"
 
+    def test_model_id_with_a_trailing_newline_is_rejected(self) -> None:
+        resp = self.client.post(
+            "/v1/configs/models",
+            content=(
+                'sie_id: "org-42/foo\\n"\n'
+                "profiles:\n  default:\n    adapter_path: sie_server.adapters.bert_flash:A\n    max_batch_tokens: 1\n"
+            ),
+            headers={"Content-Type": "application/x-yaml"},
+        )
+        assert resp.status_code == 400, resp.text
+        assert not list((self._store / "models").glob("*\n*"))
+
 
 class TestConfigAPIBundles:
     def setup_method(self) -> None:
@@ -2703,7 +2715,7 @@ class TestConfigAPIRoutingValidation:
         app.state.nats_publisher.publish_config_notification.assert_not_called()
 
     @pytest.mark.parametrize("method", ["POST", "PUT"])
-    def test_generation_fallback_is_refused_without_write_effects(
+    def test_generation_fallback_is_accepted_and_persisted(
         self, app_client: tuple[FastAPI, TestClient], method: str
     ) -> None:
         app, client = app_client
@@ -2711,11 +2723,13 @@ class TestConfigAPIRoutingValidation:
         config["tasks"] = {"generate": {"context_length": 8192, "max_output_tokens": 64}}
         path = "/v1/configs/models" if method == "POST" else "/v1/configs/models/acme/routing"
         response = client.request(method, path, content=yaml.safe_dump(config))
-        assert response.status_code == 422
-        assert "generate" in str(response.json())
-        assert app.state.config_store.read_model("acme/routing") is None
-        assert app.state.config_store.read_epoch() == 0
-        app.state.nats_publisher.publish_config_notification.assert_not_called()
+        assert response.status_code == (201 if method == "POST" else 200), response.text
+        stored = yaml.safe_load(app.state.config_store.read_model("acme/routing"))
+        assert stored["tasks"] == config["tasks"]
+        assert stored["routing"] == config["routing"]
+        assert app.state.model_registry.get_full_config("acme/routing") == stored
+        assert app.state.config_store.read_epoch() == 1
+        app.state.nats_publisher.publish_config_notification.assert_awaited_once()
 
     def test_valid_partial_append_preserves_routing_tasks_and_default(
         self, app_client: tuple[FastAPI, TestClient]
@@ -2736,7 +2750,7 @@ class TestConfigAPIRoutingValidation:
         assert app.state.model_registry.get_full_config(original["sie_id"]) == stored
 
     @pytest.mark.parametrize("inherited_task", [False, True])
-    def test_append_rejects_hybrid_encoding_from_effective_tasks(
+    def test_append_accepts_hybrid_encoding_from_effective_tasks(
         self, app_client: tuple[FastAPI, TestClient], inherited_task: bool
     ) -> None:
         app, client = app_client
@@ -2747,13 +2761,34 @@ class TestConfigAPIRoutingValidation:
         else:
             original.pop("tasks")
         assert client.post("/v1/configs/models", content=yaml.safe_dump(original)).status_code == 201
-        before = app.state.config_store.read_model(original["sie_id"])
-        app.state.nats_publisher.publish_config_notification.reset_mock()
         append = {"sie_id": original["sie_id"], "profiles": {"variant": {"extends": "remote"}}}
         if inherited_task:
             append["routing"] = {"policy": "fallback", "fallback_profile": "remote"}
         else:
             append["tasks"] = {"encode": {"dense": {"dim": 384}}}
+
+        response = client.post("/v1/configs/models", content=yaml.safe_dump(append))
+
+        assert response.status_code == 201, response.text
+        stored = yaml.safe_load(app.state.config_store.read_model(original["sie_id"]))
+        assert stored["tasks"] == {"encode": {"dense": {"dim": 384}}}
+        assert stored["routing"] == {"policy": "fallback", "fallback_profile": "remote"}
+        assert app.state.config_store.read_epoch() == 2
+
+    def test_append_rejects_invalid_routing_from_effective_profiles(
+        self, app_client: tuple[FastAPI, TestClient]
+    ) -> None:
+        app, client = app_client
+        original = _routing_write_config()
+        original.pop("routing")
+        assert client.post("/v1/configs/models", content=yaml.safe_dump(original)).status_code == 201
+        before = app.state.config_store.read_model(original["sie_id"])
+        app.state.nats_publisher.publish_config_notification.reset_mock()
+        append = {
+            "sie_id": original["sie_id"],
+            "profiles": {"variant": {"extends": "default"}},
+            "routing": {"policy": "fallback", "fallback_profile": "variant"},
+        }
 
         response = client.post("/v1/configs/models", content=yaml.safe_dump(append))
 
@@ -2785,14 +2820,14 @@ class TestConfigAPIRoutingValidation:
             app.state.model_registry.add_model_config(append)
         assert app.state.model_registry.get_full_config(original["sie_id"]) == original
 
-    def test_disk_merged_omitted_task_is_checked_before_persistence(
+    def test_disk_merged_omitted_routing_is_checked_before_persistence(
         self, app_client: tuple[FastAPI, TestClient], monkeypatch: pytest.MonkeyPatch
     ) -> None:
         app, client = app_client
         original = _routing_write_config()
-        original.pop("tasks")
+        original.pop("routing")
         assert client.post("/v1/configs/models", content=yaml.safe_dump(original)).status_code == 201
-        disk = {**copy.deepcopy(original), "tasks": {"encode": {"dense": {"dim": 384}}}}
+        disk = {**copy.deepcopy(original), "routing": {"policy": "remote_only"}}
         disk_yaml = yaml.safe_dump(disk)
         app.state.config_store.write_model(original["sie_id"], disk_yaml)
         writer = MagicMock(wraps=app.state.config_store.write_model)

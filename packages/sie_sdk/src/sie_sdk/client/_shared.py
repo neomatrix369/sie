@@ -1073,6 +1073,9 @@ def parse_request_metadata(headers: Any, body: Any = None) -> RequestMetadata | 
         metadata["execution_binding_sha256"] = execution_binding_sha256
 
     served_by = _header_value(headers, SERVED_BY_HEADER)
+    runtime_instance = _header_value(headers, "X-SIE-Runtime-Instance")
+    if isinstance(runtime_instance, str) and re.fullmatch(r"[0-9a-f]{64}", runtime_instance):
+        metadata["runtime_instance_id"] = runtime_instance
     if isinstance(served_by, str) and served_by in SERVED_BY_VALUES:
         metadata["served_by"] = served_by
     upstream = _header_value(headers, UPSTREAM_HEADER)
@@ -1408,9 +1411,16 @@ def handle_error(response: _HttpResponse) -> NoReturn:
     ):
         raise AccountInactiveError(message, code=code, param=param, request=request)
     if response.status_code == HTTP_SERVICE_UNAVAILABLE and code == ACCOUNT_STATE_UNAVAILABLE_ERROR_CODE:
-        raise AccountStateUnavailableError(message, param=param, request=request)
+        raise AccountStateUnavailableError(message, retry_after=get_retry_after(response), param=param, request=request)
     if response.status_code >= HTTP_SERVER_ERROR:
-        raise ServerError(message, code=code, status_code=response.status_code, param=param, request=request)
+        raise ServerError(
+            message,
+            code=code,
+            status_code=response.status_code,
+            param=param,
+            request=request,
+            retry_after=get_retry_after(response),
+        )
     raise RequestError(message, code=code, status_code=response.status_code, param=param, request=request)
 
 
@@ -1606,6 +1616,7 @@ def next_stream_retry_delay(
             status_code=status,
             param=get_error_param(response),
             request=parse_request_metadata(response.headers),
+            retry_after=get_retry_after(response),
         )
 
     if 300 <= status < HTTP_CLIENT_ERROR:
@@ -1628,6 +1639,7 @@ def next_stream_retry_delay(
         status_code=status,
         param=get_error_param(response),
         request=parse_request_metadata(response.headers),
+        retry_after=get_retry_after(response),
     )
 
 

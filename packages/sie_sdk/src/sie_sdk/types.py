@@ -225,6 +225,8 @@ class RequestMetadata(TypedDict, total=False):
     rate_book_version: str
     execution_identity_sha256: str
     execution_binding_sha256: str
+    runtime_instance_id: str
+    #: Opaque local worker process used by numerical equivalence probes.
     #: Which side served the request: ``"local"`` capacity, or a ``"remote"``
     #: upstream, named in ``upstream``.
     served_by: Literal["local", "remote"]
@@ -310,6 +312,11 @@ class ProfileInfo(TypedDict, total=False):
     """
 
     is_default: bool
+    identity: str | None
+    remote_contract_sha256: str | None
+    remote_execution_sha256: str | None
+    runtime_instance_id: str | None
+    """Versioned immutable local-profile digest; absent/null when it cannot be identified."""
 
 
 class ModelLoadError(TypedDict, total=False):
@@ -918,6 +925,45 @@ class ResponseResult(TypedDict, total=False):
     request: RequestMetadata
 
 
+class NumericalAdmissionObservation(TypedDict):
+    """Local execution identities that current evidence covers for a model's remote profile."""
+
+    sha256: str
+    kind: Literal["openai", "sie"]
+    local_identities: list[str]
+    model_contract_sha256: str
+    outputs: list[str]
+    expires_at_unix_ms: int
+
+
+class NumericalProfileObservation(TypedDict):
+    model_id: str
+    model_contract_sha256: str | None
+    local_identity: str | None
+    remote_contract_sha256: NotRequired[str | None]
+    remote_execution_sha256: NotRequired[str | None]
+    admission: NotRequired[NumericalAdmissionObservation | None]
+
+
+class NumericalProfileSnapshot(TypedDict):
+    runtime_instance_id: str | None
+    complete: bool
+    profiles: list[NumericalProfileObservation]
+
+
+class NumericalProcessObservation(TypedDict):
+    child_index: int
+    status: Literal["observed", "incomplete", "unavailable", "invalid"]
+    snapshot: NotRequired[NumericalProfileSnapshot | None]
+
+
+class NumericalProcessInventory(TypedDict):
+    """Process diagnostics at observation time; grants no execution authority."""
+
+    observed_at_unix_ms: int
+    children: list[NumericalProcessObservation]
+
+
 class WorkerInfo(TypedDict, total=False):
     """Information about a single worker in the cluster.
 
@@ -954,6 +1000,7 @@ class WorkerInfo(TypedDict, total=False):
     memory_total_bytes: int
     bundle: NotRequired[str]
     bundle_config_hash: str
+    numerical_process_inventory: NotRequired[NumericalProcessInventory]
 
 
 class CapacityInfo(TypedDict, total=False):
