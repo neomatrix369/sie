@@ -19,9 +19,12 @@ use crate::http_error::{
 };
 use crate::server::AppState;
 
+use super::serving_disclosure::{DeferredFallbackFinish, FallbackAttempt};
+
 use super::proxy::{
-    is_openai_compat_forwarded_header, is_openai_compat_inner_request_header,
-    is_valid_compat_model_id, proxy_request, translate_inner_compat_error,
+    invalid_remote_header_response, is_openai_compat_forwarded_header,
+    is_openai_compat_inner_request_header, is_valid_compat_model_id, proxy_request,
+    translate_inner_compat_error,
 };
 
 const MAX_AUDIO_FILE_BYTES: usize = 24 * 1024 * 1024;
@@ -584,6 +587,9 @@ pub async fn proxy_openai_transcription(
     State(state): State<Arc<AppState>>,
     req: Request,
 ) -> Response {
+    if let Some(response) = invalid_remote_header_response("generate", req.headers()) {
+        return response;
+    }
     if req
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -646,10 +652,8 @@ pub async fn proxy_openai_transcription(
         .method(Method::POST)
         .uri(uri)
         .version(version);
-    for (name, value) in copy_inner_headers(&inbound_headers) {
-        if let Some(name) = name {
-            builder = builder.header(name, value);
-        }
+    for (name, value) in copy_inner_headers(&inbound_headers).iter() {
+        builder = builder.header(name, value);
     }
     let mut inner_request = match builder.body(Body::from(body)) {
         Ok(request) => request,
@@ -667,56 +671,69 @@ pub async fn proxy_openai_transcription(
     };
     *inner_request.extensions_mut() = extensions;
 
+    let fallback = FallbackAttempt::install(&mut inner_request);
+    inner_request
+        .extensions_mut()
+        .insert(DeferredFallbackFinish);
     let native_response = proxy_request(State(state), inner_request, "extract").await;
-    if native_response.status().is_client_error() || native_response.status().is_server_error() {
-        return translate_inner_compat_error(native_response).await;
-    }
-    if native_response.status() != StatusCode::OK {
-        return native_response;
-    }
-
-    // From here the worker has already run and reported its units. Every failure
-    // below is OURS — a successful transcription this handler could not render
-    // into the client's requested shape — and the client gets nothing for it.
-    // Each is marked so a metered composition releases the hold instead of
-    // charging for an undelivered result (see [`GatewayOwnedFault`]).
     let native_headers = native_response.headers().clone();
-    let bytes = match to_bytes(native_response.into_body(), MAX_NATIVE_RESPONSE_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return translation_fault(
-                "read_native_response",
-                "failed to read native extract response",
-            );
+    let mut response = async {
+        if native_response.status().is_client_error() || native_response.status().is_server_error()
+        {
+            return native_response;
         }
-    };
-    let parsed: Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            return translation_fault(
-                "decode_native_response",
-                "native extract response is not valid JSON",
-            );
+        if native_response.status() != StatusCode::OK {
+            return native_response;
         }
-    };
-    let data = parsed
-        .get("items")
-        .and_then(Value::as_array)
-        .filter(|items| items.len() == 1)
-        .and_then(|items| items[0].get("data"))
-        .and_then(Value::as_object);
-    let Some(data) = data else {
-        return translation_fault(
-            "native_response_shape",
-            "native extract response is missing one transcription result",
-        );
-    };
-    let mut response = match format_transcription_response(data, &form) {
-        Ok(response) => response,
-        Err(message) => return translation_fault("format_transcription", message),
-    };
+
+        // From here the worker has already run and reported its units. Every failure
+        // below is OURS — a successful transcription this handler could not render
+        // into the client's requested shape — and the client gets nothing for it.
+        // Each is marked so a metered composition releases the hold instead of
+        // charging for an undelivered result (see [`GatewayOwnedFault`]).
+        let bytes = match to_bytes(native_response.into_body(), MAX_NATIVE_RESPONSE_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return translation_fault(
+                    "read_native_response",
+                    "failed to read native extract response",
+                );
+            }
+        };
+        let parsed: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return translation_fault(
+                    "decode_native_response",
+                    "native extract response is not valid JSON",
+                );
+            }
+        };
+        let data = parsed
+            .get("items")
+            .and_then(Value::as_array)
+            .filter(|items| items.len() == 1)
+            .and_then(|items| items[0].get("data"))
+            .and_then(Value::as_object);
+        let Some(data) = data else {
+            return translation_fault(
+                "native_response_shape",
+                "native extract response is missing one transcription result",
+            );
+        };
+        match format_transcription_response(data, &form) {
+            Ok(response) => response,
+            Err(message) => translation_fault("format_transcription", message),
+        }
+    }
+    .await;
     copy_native_response_headers(&native_headers, response.headers_mut());
-    response
+    let response = fallback.finish(response);
+    if response.status().is_client_error() || response.status().is_server_error() {
+        translate_inner_compat_error(response).await
+    } else {
+        response
+    }
 }
 
 /// A 500 for a post-dispatch translation failure, marked as gateway-owned.
@@ -740,6 +757,9 @@ fn translation_fault(stage: &'static str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::test_support::{
+        TestGateway, HYBRID_EXTRACT_MODEL, LOCAL_LANE, REMOTE_LANE,
+    };
 
     fn multipart_body(fields: &[(&str, &str)], filename: &str, audio: &[u8]) -> (String, Vec<u8>) {
         let boundary = "sie-audio-test";
@@ -844,6 +864,8 @@ mod tests {
             header::CONTENT_TYPE,
             HeaderValue::from_static("multipart/form-data; boundary=test"),
         );
+        inbound.append("x-sie-remote", HeaderValue::from_static("forbid"));
+        inbound.append("x-sie-remote", HeaderValue::from_static("forbid"));
         let inner = copy_inner_headers(&inbound);
         assert_eq!(
             inner.get(header::CONTENT_TYPE).unwrap(),
@@ -853,6 +875,16 @@ mod tests {
         assert_eq!(inner.get(header::AUTHORIZATION).unwrap(), "Bearer test");
         assert!(inner.contains_key("traceparent"));
         assert!(!inner.contains_key(header::COOKIE));
+        let mut builder = Request::builder();
+        for (name, value) in inner.iter() {
+            builder = builder.header(name, value);
+        }
+        let forwarded = builder.body(Body::empty()).unwrap();
+        assert_eq!(
+            forwarded.headers().get_all("x-sie-remote").iter().count(),
+            2
+        );
+        assert!(invalid_remote_header_response("generate", forwarded.headers()).is_some());
 
         let mut native = HeaderMap::new();
         native.insert("x-sie-request-id", HeaderValue::from_static("req-1"));
@@ -959,6 +991,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audio_cluster_fallback_preserves_bridge_and_restored_refusal_headers() {
+        let config = format!(
+            "{HYBRID_EXTRACT_MODEL}\nrouting:\n  policy: fallback\n  fallback_profile: remote\n"
+        );
+        for local in ["cold", "loading", "loaded"] {
+            for fail in [false, true] {
+                let gateway = TestGateway::new(&[&config]).await;
+                gateway
+                    .add_verified_worker("remote-1", REMOTE_LANE, &[])
+                    .await;
+                if local != "cold" {
+                    gateway
+                        .add_verified_worker(
+                            "local-1",
+                            LOCAL_LANE,
+                            if local == "loaded" {
+                                &["acme/extract"]
+                            } else {
+                                &[]
+                            },
+                        )
+                        .await;
+                }
+                if fail {
+                    gateway.dispatcher.refuse_work();
+                }
+                let (content_type, body) =
+                    multipart_body(&[("model", "acme/extract")], "clip.wav", b"RIFFtest");
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))
+                    .unwrap();
+                let response =
+                    proxy_openai_transcription(State(Arc::clone(&gateway.state)), request).await;
+                if fail && local != "loaded" {
+                    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(
+                        response.headers()["retry-after"],
+                        if local == "cold" { "60" } else { "5" }
+                    );
+                    assert_eq!(response.headers()["x-sie-served-by"], "local");
+                    assert_eq!(
+                        response.headers()["x-sie-fallback-error"],
+                        "INFERENCE_ERROR"
+                    );
+                } else if !fail {
+                    assert_eq!(response.status(), StatusCode::OK, "{local}");
+                    assert_eq!(
+                        response.headers()["x-sie-served-by"],
+                        if local == "loaded" { "local" } else { "remote" }
+                    );
+                    if local != "loaded" {
+                        assert_eq!(
+                            response.headers()["x-sie-fallback-reason"],
+                            if local == "cold" {
+                                "provisioning"
+                            } else {
+                                "model_loading"
+                            }
+                        );
+                    }
+                    let body = to_bytes(response.into_body(), 8192).await.unwrap();
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&body).unwrap()["text"],
+                        "hello world"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_cluster_fallback_restores_refusal_until_requested_format_is_ready() {
+        let config = format!(
+            "{HYBRID_EXTRACT_MODEL}\nrouting:\n  policy: fallback\n  fallback_profile: remote\n"
+        );
+        for loading in [false, true] {
+            for (format, data) in [
+                ("json", json!({"unexpected":true})),
+                ("srt", json!({"text":"hello", "duration_ms":1000})),
+                ("vtt", json!({"text":"hello", "duration_ms":1000})),
+            ] {
+                let gateway = TestGateway::new(&[&config]).await;
+                gateway
+                    .add_verified_worker("remote-1", REMOTE_LANE, &[])
+                    .await;
+                if loading {
+                    gateway
+                        .add_verified_worker("local-1", LOCAL_LANE, &[])
+                        .await;
+                }
+                gateway.dispatcher.return_extract_data(data);
+                let (content_type, body) = multipart_body(
+                    &[("model", "acme/extract"), ("response_format", format)],
+                    "clip.wav",
+                    b"RIFFtest",
+                );
+                let request = Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/audio/transcriptions")
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from(body))
+                    .unwrap();
+                let response =
+                    proxy_openai_transcription(State(Arc::clone(&gateway.state)), request).await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(
+                    response.headers()["retry-after"],
+                    if loading { "5" } else { "60" }
+                );
+                assert_eq!(response.headers()["x-sie-served-by"], "local");
+                assert_eq!(
+                    response.headers()["x-sie-fallback-error"],
+                    "INFERENCE_ERROR"
+                );
+                assert!(!response.headers().contains_key("x-sie-upstream"));
+                assert_eq!(
+                    gateway.dispatcher.dispatched().len(),
+                    if loading { 2 } else { 1 }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_translation_fault_keeps_settlement_marker_when_no_bridge_is_active() {
+        let gateway = TestGateway::new(&[HYBRID_EXTRACT_MODEL]).await;
+        gateway
+            .add_verified_worker("local-1", LOCAL_LANE, &["acme/extract"])
+            .await;
+        gateway
+            .dispatcher
+            .return_extract_data(json!({"unexpected":true}));
+        let (content_type, body) =
+            multipart_body(&[("model", "acme/extract")], "clip.wav", b"RIFFtest");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/audio/transcriptions")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap();
+        let response = proxy_openai_transcription(State(Arc::clone(&gateway.state)), request).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.extensions().get::<GatewayOwnedFault>().is_some());
+        assert_eq!(response.headers()["x-sie-served-by"], "local");
+        assert!(!response.headers().contains_key("x-sie-fallback-reason"));
+        assert_eq!(gateway.dispatcher.dispatched().len(), 1);
+    }
+
+    #[tokio::test]
     async fn formats_json_and_subtitles_from_native_extract_data() {
         let data = json!({
             "text": "hello world",
@@ -997,5 +1181,43 @@ mod tests {
         let srt = format_transcription_response(data, &form).unwrap();
         let body = to_bytes(srt.into_body(), 4096).await.unwrap();
         assert_eq!(body, "1\n00:00:00,000 --> 00:00:01,000\nhello world\n");
+    }
+    #[tokio::test]
+    async fn audio_threshold_remote_creates_no_local_demand_or_warmup() {
+        use crate::handlers::test_support::ThresholdBroker;
+        use crate::state::threshold_coordinator::ThresholdSampler;
+        let Some(broker) = ThresholdBroker::start().await else {
+            return;
+        };
+        let config = format!("{HYBRID_EXTRACT_MODEL}\nrouting:\n  policy: threshold\n  fallback_profile: remote\n  wake_above: 1\n  sleep_below: 0.5\n  window_s: 1\n  cooldown_s: 1\n");
+        let gateway = TestGateway::with_threshold_routing(&[&config], true).await;
+        gateway
+            .add_verified_worker("remote-1", REMOTE_LANE, &[])
+            .await;
+        let binding = broker.bind(&gateway).await;
+        let mut sampler = ThresholdSampler::default();
+        binding.coordinator.sample(&mut sampler).await.unwrap();
+        for _ in 0..2 {
+            tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+            binding.coordinator.sample(&mut sampler).await.unwrap();
+        }
+        let (content_type, body) =
+            multipart_body(&[("model", "acme/extract")], "clip.wav", b"RIFFtest");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/audio/transcriptions")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body))
+            .unwrap();
+        let response = proxy_openai_transcription(State(Arc::clone(&gateway.state)), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-sie-served-by"], "remote");
+        assert!(!response.headers().contains_key("x-sie-fallback-reason"));
+        assert!(gateway.state.demand_tracker.active_lanes().is_empty());
+        let work = gateway.dispatcher.dispatched();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].model, "acme/extract:remote");
+        assert_eq!(work[0].bundle, "remote");
+        assert_eq!(gateway.dispatcher.execution_authority(), vec![true]);
     }
 }

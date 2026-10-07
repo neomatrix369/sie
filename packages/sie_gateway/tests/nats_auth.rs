@@ -54,6 +54,10 @@ fn nats_server_binary() -> Option<PathBuf> {
 }
 
 async fn start_nats() -> Option<NatsServer> {
+    start_nats_fixture("sie-cluster-nats.conf").await
+}
+
+async fn start_nats_fixture(fixture: &str) -> Option<NatsServer> {
     let Some(binary) = nats_server_binary() else {
         assert!(
             std::env::var_os("NATS_URL").is_none(),
@@ -62,8 +66,9 @@ async fn start_nats() -> Option<NatsServer> {
         eprintln!("skipping: nats-server not on PATH");
         return None;
     };
-    let config =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ci/fixtures/sie-cluster-nats.conf");
+    let config = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/ci/fixtures")
+        .join(fixture);
     let dir = tempfile::tempdir().expect("tempdir");
     let log = std::fs::File::create(dir.path().join("nats.log")).expect("log file");
     let passwords = Passwords {
@@ -104,6 +109,30 @@ async fn start_nats() -> Option<NatsServer> {
     }
     let log = std::fs::read_to_string(server.dir.path().join("nats.log")).unwrap_or_default();
     panic!("nats-server did not start:\n{log}");
+}
+
+// Broker expiry is asynchronous; elapsed gateway time alone does not prove
+// that its leader API has stopped exposing the five-second lease.
+async fn wait_for_threshold_lease_expiry(leases: &jetstream::kv::Store) {
+    tokio::time::timeout(Duration::from_secs(7), async {
+        loop {
+            match leases
+                .stream
+                .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+                .await
+            {
+                Err(error)
+                    if error.kind() == jetstream::stream::RawMessageErrorKind::NoMessageFound =>
+                {
+                    return;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                Err(error) => panic!("failed to observe threshold lease expiry: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("threshold broker must expire the lease within five seconds plus scheduling margin");
 }
 
 /// The client URL from the `*.ports` file nats-server writes once it listens.
@@ -430,4 +459,580 @@ async fn dlq_forwards_only_advisories_the_server_emits() {
         1,
         "the republished advisory is not forwarded"
     );
+}
+
+#[tokio::test]
+async fn threshold_decisions_share_demand_and_require_current_sampler_authority() {
+    use sha2::{Digest, Sha256};
+    use sie_gateway::state::threshold_coordinator::{
+        ThresholdCoordinator, ThresholdDecision, ThresholdError, ThresholdSampler, ThresholdTarget,
+    };
+
+    let Some(mut nats) = start_nats_fixture("sie-threshold-nats.conf").await else {
+        return;
+    };
+    let gateway = connect_as(&nats.url, "sie-gateway", &nats.passwords.gateway).await;
+    let context = jetstream::new(gateway.clone());
+    let policy = serde_json::from_value(serde_json::json!({
+        "policy":"threshold", "fallback_profile":"remote", "wake_above":1,
+        "sleep_below":0.5, "window_s":1, "cooldown_s":1
+    }))
+    .unwrap();
+    let target = ThresholdTarget::new("acme/chat", 1, &"a".repeat(64), &policy).unwrap();
+    let first = Arc::new(
+        ThresholdCoordinator::connect(&context, 1, vec![target.clone()])
+            .await
+            .unwrap(),
+    );
+    let second = Arc::new(
+        ThresholdCoordinator::connect(&context, 1, vec![target])
+            .await
+            .unwrap(),
+    );
+    let mut owner = ThresholdSampler::default();
+    let mut standby = ThresholdSampler::default();
+    first.sample(&mut owner).await.unwrap();
+    assert_eq!(
+        second.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+
+    let mut tasks = Vec::new();
+    for replica in [first.clone(), second.clone()] {
+        for _ in 0..4 {
+            let replica = replica.clone();
+            tasks.push(tokio::spawn(
+                async move { replica.record_request("acme/chat") },
+            ));
+        }
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let key = Sha256::digest(b"acme/chat")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let subject = format!("$KV.SIE_THRESHOLD_COUNTS.{key}");
+    let stream = context.get_stream("KV_SIE_THRESHOLD_COUNTS").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    first.sample(&mut owner).await.unwrap();
+    let counter = stream
+        .get_last_raw_message_by_subject(&subject)
+        .await
+        .unwrap();
+    let counter: serde_json::Value = serde_json::from_slice(&counter.payload).unwrap();
+    assert_eq!(
+        counter["total"], 8,
+        "standby and owner flush each local ingress once into the aggregate"
+    );
+    assert_eq!(
+        second.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+    for replica in [&first, &second] {
+        replica.record_request("acme/chat").unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    first.sample(&mut owner).await.unwrap();
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        first.decision("acme/chat").unwrap(),
+        ThresholdDecision::WakeLocal
+    );
+    assert_eq!(
+        second.decision("acme/chat").unwrap(),
+        ThresholdDecision::WakeLocal
+    );
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        first.sample(&mut owner).await.unwrap();
+    }
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        second.decision("acme/chat").unwrap(),
+        ThresholdDecision::Remote
+    );
+
+    // First sight provides no clock-free bound on the age of a lease.
+    let newcomer = ThresholdCoordinator::connect(
+        &context,
+        1,
+        vec![ThresholdTarget::new("acme/chat", 1, &"a".repeat(64), &policy).unwrap()],
+    )
+    .await
+    .unwrap();
+    let mut newcomer_sampler = ThresholdSampler::default();
+    assert_eq!(
+        newcomer.sample(&mut newcomer_sampler).await,
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        newcomer.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+    first.sample(&mut owner).await.unwrap();
+    assert_eq!(
+        newcomer.sample(&mut newcomer_sampler).await,
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        newcomer.decision("acme/chat").unwrap(),
+        ThresholdDecision::Remote
+    );
+
+    // A normal renewal keeps the acquisition term and accepts its earlier
+    // decision even before the sampler publishes the next model decision.
+    let leases = context.get_key_value("SIE_THRESHOLD_LEASE").await.unwrap();
+    let old = leases
+        .stream
+        .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+        .await
+        .unwrap();
+    let old_lease: serde_json::Value = serde_json::from_slice(&old.payload).unwrap();
+    leases
+        .update("sampler", old.payload, old.sequence)
+        .await
+        .unwrap();
+    let renewed_at = tokio::time::Instant::now();
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        second.decision("acme/chat").unwrap(),
+        ThresholdDecision::Remote
+    );
+    let renewed = leases
+        .stream
+        .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+        .await
+        .unwrap();
+    let renewed: serde_json::Value = serde_json::from_slice(&renewed.payload).unwrap();
+    assert_eq!(old_lease["term"], renewed["term"]);
+    tokio::time::sleep_until(renewed_at + Duration::from_millis(1050)).await;
+    assert_eq!(
+        second.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+
+    // Refreshing near expiry cannot extend the lease with another cache TTL.
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    tokio::time::sleep_until(renewed_at + Duration::from_millis(2500)).await;
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    tokio::time::sleep_until(renewed_at + Duration::from_millis(4250)).await;
+    assert!(
+        (renewed_at + Duration::from_secs(5))
+            .saturating_duration_since(tokio::time::Instant::now())
+            > Duration::from_millis(500),
+        "near-expiry refresh requires a safe margin before broker lease expiry"
+    );
+    assert_eq!(
+        second.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        second.decision("acme/chat").unwrap(),
+        ThresholdDecision::Remote
+    );
+    tokio::time::sleep_until(renewed_at + Duration::from_millis(5100)).await;
+    assert_eq!(
+        second.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+
+    // The broker, rather than either replica's wall clock, expires ownership.
+    assert_eq!(
+        first.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+    wait_for_threshold_lease_expiry(&leases).await;
+    second.sample(&mut standby).await.unwrap();
+    assert_eq!(
+        first.sample(&mut owner).await,
+        Err(ThresholdError::Unavailable)
+    );
+    assert_eq!(
+        first.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+
+    let next = ThresholdTarget::new("acme/chat", 2, &"b".repeat(64), &policy).unwrap();
+    let changed = ThresholdCoordinator::connect(&context, 1, vec![next])
+        .await
+        .unwrap();
+    // A new generation takes over even when the model receives no request.
+    changed.sample(&mut standby).await.unwrap();
+    assert_eq!(
+        first.sample(&mut owner).await,
+        Err(ThresholdError::Generation)
+    );
+    assert_eq!(
+        first.sample(&mut owner).await,
+        Err(ThresholdError::Generation)
+    );
+    // Request recording is local even on a stale replica. Its flush refuses
+    // the newer authority and cannot add this demand to the new generation.
+    first.record_request("acme/chat").unwrap();
+    assert_eq!(
+        first.sample(&mut owner).await,
+        Err(ThresholdError::Generation)
+    );
+    assert_eq!(
+        first.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+    let reset = stream
+        .get_last_raw_message_by_subject(&subject)
+        .await
+        .unwrap();
+    let reset: serde_json::Value = serde_json::from_slice(&reset.payload).unwrap();
+    assert_eq!(reset["generation"], 2);
+    assert_eq!(
+        reset["total"], 0,
+        "sampling does not manufacture ingress demand"
+    );
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        changed.sample(&mut standby).await.unwrap();
+    }
+    assert_eq!(
+        changed.decision("acme/chat").unwrap(),
+        ThresholdDecision::Remote
+    );
+
+    // Broker errors discard sustained-window evidence and prevent renewal.
+    let mut newest_target = ThresholdTarget::new("acme/chat", 3, &"c".repeat(64), &policy).unwrap();
+    let newest = ThresholdCoordinator::connect(&context, 1, vec![newest_target.clone()])
+        .await
+        .unwrap();
+    newest.sample(&mut standby).await.unwrap();
+    for _ in 0..4 {
+        newest.record_request("acme/chat").unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1050)).await;
+    newest.sample(&mut standby).await.unwrap();
+    let counts = context.get_key_value("SIE_THRESHOLD_COUNTS").await.unwrap();
+    counts
+        .put(&key, bytes::Bytes::from_static(b"invalid"))
+        .await
+        .unwrap();
+    assert_eq!(
+        newest.sample(&mut standby).await,
+        Err(ThresholdError::Untrusted)
+    );
+    assert_eq!(
+        newest.sample(&mut standby).await,
+        Err(ThresholdError::Untrusted)
+    );
+    let failed_lease = leases
+        .stream
+        .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+        .await
+        .unwrap();
+    let restored = serde_json::json!({"generation":2,"contract":"obsolete","total":0,
+        "incarnation":uuid::Uuid::new_v4().to_string()});
+    counts
+        .put(&key, serde_json::to_vec(&restored).unwrap().into())
+        .await
+        .unwrap();
+    // Repairing storage cannot restore the failed sampler's old ownership.
+    // Until actual broker expiry it must refuse to renew, even with valid data.
+    assert_eq!(
+        newest.sample(&mut standby).await,
+        Err(ThresholdError::Unavailable)
+    );
+    let refused_lease = leases
+        .stream
+        .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+        .await
+        .unwrap();
+    assert_eq!(
+        refused_lease.sequence, failed_lease.sequence,
+        "failed sampler must leave the existing lease revision unchanged"
+    );
+    wait_for_threshold_lease_expiry(&leases).await;
+    // A single recovery call must succeed once the leader confirms expiry;
+    // timeouts or unavailable storage remain test failures, not retry cases.
+    newest.sample(&mut standby).await.unwrap();
+    assert_eq!(
+        newest.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+    for tick in 0..2 {
+        for _ in 0..4 {
+            newest.record_request("acme/chat").unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(1050)).await;
+        newest.sample(&mut standby).await.unwrap();
+        if tick == 0 {
+            assert_eq!(
+                newest.decision("acme/chat"),
+                Err(ThresholdError::Unavailable)
+            );
+        }
+    }
+    assert_eq!(
+        newest.decision("acme/chat").unwrap(),
+        ThresholdDecision::WakeLocal
+    );
+
+    // DEL and PURGE preserve their broker revisions for the next CAS.
+    // Lease recreation also changes the UUID term, fencing old decisions.
+    let before = leases
+        .stream
+        .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+        .await
+        .unwrap();
+    let before: serde_json::Value = serde_json::from_slice(&before.payload).unwrap();
+    for purge in [false, true] {
+        if purge {
+            counts.purge(&key).await.unwrap();
+            leases.purge("sampler").await.unwrap();
+        } else {
+            counts.delete(&key).await.unwrap();
+            leases.delete("sampler").await.unwrap();
+        }
+        newest.sample(&mut standby).await.unwrap();
+        let reset = counts
+            .stream
+            .get_last_raw_message_by_subject(&subject)
+            .await
+            .unwrap();
+        let reset: serde_json::Value = serde_json::from_slice(&reset.payload).unwrap();
+        assert_eq!(reset["total"], 0);
+        assert_eq!(
+            newest.decision("acme/chat"),
+            Err(ThresholdError::Unavailable)
+        );
+        let recreated = leases
+            .stream
+            .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+            .await
+            .unwrap();
+        let recreated: serde_json::Value = serde_json::from_slice(&recreated.payload).unwrap();
+        assert_ne!(before["term"], recreated["term"]);
+    }
+
+    // A long publication gap discards accumulated demand and window evidence.
+    for _ in 0..100 {
+        newest.record_request("acme/chat").unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(2600)).await;
+    newest.sample(&mut standby).await.unwrap();
+    let reset = counts
+        .stream
+        .get_last_raw_message_by_subject(&subject)
+        .await
+        .unwrap();
+    let reset: serde_json::Value = serde_json::from_slice(&reset.payload).unwrap();
+    assert_eq!(
+        reset["total"], 0,
+        "late demand is never presented as a fresh burst"
+    );
+    assert_eq!(
+        newest.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+
+    // Ingress racing an asynchronous drain stays in exactly one batch.
+    let ((), sampled) = tokio::join!(
+        async {
+            for _ in 0..1000 {
+                newest.record_request("acme/chat").unwrap();
+                tokio::task::yield_now().await;
+            }
+        },
+        newest.sample(&mut standby)
+    );
+    sampled.unwrap();
+    newest.sample(&mut standby).await.unwrap();
+    let total = counts
+        .stream
+        .get_last_raw_message_by_subject(&subject)
+        .await
+        .unwrap();
+    let total: serde_json::Value = serde_json::from_slice(&total.payload).unwrap();
+    assert_eq!(
+        total["total"], 1000,
+        "racing ingress is neither lost nor doubled"
+    );
+
+    // Duplicate, oversized or mixed-generation configurations never reach I/O.
+    assert!(matches!(
+        ThresholdCoordinator::connect(&context, 1, vec![]).await,
+        Err(ThresholdError::Configuration)
+    ));
+    assert!(matches!(
+        ThresholdCoordinator::connect(
+            &context,
+            1,
+            vec![newest_target.clone(), newest_target.clone()]
+        )
+        .await,
+        Err(ThresholdError::Configuration)
+    ));
+    assert!(matches!(
+        ThresholdCoordinator::connect(&context, 1, vec![newest_target.clone(); 257]).await,
+        Err(ThresholdError::Configuration)
+    ));
+    newest_target = ThresholdTarget::new("acme/other", 4, &"c".repeat(64), &policy).unwrap();
+    assert!(matches!(
+        ThresholdCoordinator::connect(
+            &context,
+            1,
+            vec![
+                ThresholdTarget::new("acme/chat", 3, &"c".repeat(64), &policy).unwrap(),
+                newest_target
+            ]
+        )
+        .await,
+        Err(ThresholdError::Configuration)
+    ));
+
+    // Inference-component credentials have no authority on this endpoint.
+    for (user, password) in [
+        ("sie-worker", &nats.passwords.worker),
+        ("sie-config", &nats.passwords.config),
+    ] {
+        assert!(async_nats::ConnectOptions::new()
+            .user_and_password(user.into(), password.clone())
+            .connect(&nats.url)
+            .await
+            .is_err());
+    }
+    // Local request handling remains available with the control broker down.
+    nats.child.kill().unwrap();
+    nats.child.wait().unwrap();
+    newest.record_request("acme/chat").unwrap();
+    assert_eq!(
+        newest.decision("acme/chat"),
+        Err(ThresholdError::Unavailable)
+    );
+    assert!(newest.sample(&mut standby).await.is_err());
+}
+
+#[tokio::test]
+async fn threshold_counter_recreation_discards_evidence_even_when_totals_increase() {
+    use sha2::{Digest, Sha256};
+    use sie_gateway::state::threshold_coordinator::{
+        ThresholdCoordinator, ThresholdDecision, ThresholdError, ThresholdSampler, ThresholdTarget,
+    };
+    let Some(nats) = start_nats_fixture("sie-threshold-nats.conf").await else {
+        return;
+    };
+    let gateway = connect_as(&nats.url, "sie-gateway", &nats.passwords.gateway).await;
+    let context = jetstream::new(gateway);
+    let policy = serde_json::from_value(serde_json::json!({
+        "policy":"threshold", "fallback_profile":"remote", "wake_above":5,
+        "sleep_below":2, "window_s":1, "cooldown_s":1
+    }))
+    .unwrap();
+    let target = ThresholdTarget::new("acme/chat", 1, &"a".repeat(64), &policy).unwrap();
+    let owner = ThresholdCoordinator::connect(&context, 1, vec![target.clone()])
+        .await
+        .unwrap();
+    let standby = ThresholdCoordinator::connect(&context, 1, vec![target])
+        .await
+        .unwrap();
+    let mut owner_sampler = ThresholdSampler::default();
+    let mut standby_sampler = ThresholdSampler::default();
+    owner.sample(&mut owner_sampler).await.unwrap();
+    assert_eq!(
+        standby.sample(&mut standby_sampler).await,
+        Err(ThresholdError::Unavailable)
+    );
+    let key = Sha256::digest(b"acme/chat")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let subject = format!("$KV.SIE_THRESHOLD_COUNTS.{key}");
+    let counts = context.get_key_value("SIE_THRESHOLD_COUNTS").await.unwrap();
+    let leases = context.get_key_value("SIE_THRESHOLD_LEASE").await.unwrap();
+    for purge in [false, true] {
+        for _ in 0..2 {
+            for _ in 0..500 {
+                owner.record_request("acme/chat").unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+            owner.sample(&mut owner_sampler).await.unwrap();
+        }
+        assert_eq!(
+            owner.decision("acme/chat").unwrap(),
+            ThresholdDecision::WakeLocal
+        );
+        let prior = counts
+            .stream
+            .get_last_raw_message_by_subject(&subject)
+            .await
+            .unwrap();
+        let prior: serde_json::Value = serde_json::from_slice(&prior.payload).unwrap();
+        let lease = leases
+            .stream
+            .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+            .await
+            .unwrap();
+        let lease: serde_json::Value = serde_json::from_slice(&lease.payload).unwrap();
+        if purge {
+            counts.purge(&key).await.unwrap();
+        } else {
+            counts.delete(&key).await.unwrap();
+        }
+        // The new counter can already exceed the previous cumulative total.
+        // Total rollback and a continuity integer alone cannot detect this.
+        for _ in 0..=prior["total"].as_u64().unwrap() {
+            standby.record_request("acme/chat").unwrap();
+        }
+        assert_eq!(
+            standby.sample(&mut standby_sampler).await,
+            Err(ThresholdError::Unavailable)
+        );
+        owner.sample(&mut owner_sampler).await.unwrap();
+        assert_eq!(
+            owner.decision("acme/chat"),
+            Err(ThresholdError::Unavailable)
+        );
+        let recreated = counts
+            .stream
+            .get_last_raw_message_by_subject(&subject)
+            .await
+            .unwrap();
+        let recreated: serde_json::Value = serde_json::from_slice(&recreated.payload).unwrap();
+        assert!(recreated["total"].as_u64().unwrap() > prior["total"].as_u64().unwrap());
+        assert_ne!(recreated["incarnation"], prior["incarnation"]);
+        let renewed = leases
+            .stream
+            .get_last_raw_message_by_subject("$KV.SIE_THRESHOLD_LEASE.sampler")
+            .await
+            .unwrap();
+        let renewed: serde_json::Value = serde_json::from_slice(&renewed.payload).unwrap();
+        assert_eq!(
+            renewed["term"], lease["term"],
+            "counter recreation does not replace the lease"
+        );
+    }
 }

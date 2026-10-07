@@ -20,6 +20,9 @@ pub const METHOD_PROCESS_GENERATE: &str = "ProcessGenerate";
 pub const METHOD_WORKER_CAPABILITIES: &str = "WorkerCapabilities";
 pub const METHOD_SIGNAL_GENERATE_CANCEL: &str = "SignalGenerateCancel";
 pub const METHOD_RUN_BATCH: &str = "RunBatch";
+pub const METHOD_RUN_BATCH_WITH_EXECUTION_AUTHORITY_V1: &str = "RunBatchWithExecutionAuthorityV1";
+pub const METHOD_PROCESS_GENERATE_WITH_EXECUTION_AUTHORITY_V1: &str =
+    "ProcessGenerateWithExecutionAuthorityV1";
 pub const METHOD_APPLY_MODEL_CONFIG: &str = "ApplyModelConfig";
 pub const METHOD_REPLACE_MODEL_CONFIGS: &str = "ReplaceModelConfigs";
 pub const METHOD_SET_PINNED_MODELS: &str = "SetPinnedModels";
@@ -193,6 +196,8 @@ pub struct WorkerCapabilitiesRequest {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerCapabilitiesResponse {
     #[serde(default)]
+    pub supports_execution_authority_v1: bool,
+    #[serde(default)]
     pub has_generation_models: bool,
     #[serde(default)]
     pub generation_models: Vec<String>,
@@ -277,6 +282,8 @@ pub struct ScoreBatchItem {
     pub options: Option<serde_json::Value>,
     #[serde(default)]
     pub profile_id: Option<String>,
+    #[serde(default)]
+    pub bundle_config_hash: Option<String>,
     #[serde(default)]
     pub payload_fetch_ms: f64,
     /// Optional sidecar-prepared tokens ordered as query followed by score
@@ -650,6 +657,7 @@ mod tests {
             instruction: None,
             options: None,
             profile_id: Some("candle".to_string()),
+            bundle_config_hash: None,
             payload_fetch_ms: 0.0,
             prepared_tokens: Some(PreparedTokens {
                 input_ids: vec![vec![1, 2], vec![3, 4, 5]],

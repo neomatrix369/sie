@@ -2587,6 +2587,177 @@
         ],
         "type": "object"
       },
+      "NumericalAdmissionObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "expires_at_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "local_identities": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "model_contract_sha256": {
+            "type": "string"
+          },
+          "outputs": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sha256",
+          "kind",
+          "local_identities",
+          "model_contract_sha256",
+          "outputs",
+          "expires_at_unix_ms"
+        ],
+        "type": "object"
+      },
+      "NumericalProcessInventory": {
+        "additionalProperties": false,
+        "properties": {
+          "children": {
+            "items": {
+              "$ref": "#/components/schemas/NumericalProcessObservation"
+            },
+            "type": "array"
+          },
+          "observed_at_unix_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "observed_at_unix_ms",
+          "children"
+        ],
+        "type": "object"
+      },
+      "NumericalProcessObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "child_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "snapshot": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NumericalProfileSnapshot"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/NumericalSnapshotStatus"
+          }
+        },
+        "required": [
+          "child_index",
+          "status"
+        ],
+        "type": "object"
+      },
+      "NumericalProfileObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "admission": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NumericalAdmissionObservation",
+                "description": "The local execution identities current evidence covers for the remote profile."
+              }
+            ]
+          },
+          "local_identity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_contract_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "remote_contract_sha256": {
+            "description": "The contract of the model's remote profile on this process's upstream.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remote_execution_sha256": {
+            "description": "The serving code that runs the remote profile in this process.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "model_id"
+        ],
+        "type": "object"
+      },
+      "NumericalProfileSnapshot": {
+        "additionalProperties": false,
+        "properties": {
+          "complete": {
+            "type": "boolean"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/NumericalProfileObservation"
+            },
+            "type": "array"
+          },
+          "runtime_instance_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "complete",
+          "profiles"
+        ],
+        "type": "object"
+      },
+      "NumericalSnapshotStatus": {
+        "enum": [
+          "observed",
+          "incomplete",
+          "unavailable",
+          "invalid"
+        ],
+        "type": "string"
+      },
       "OpenAIEmbeddingDataEntry": {
         "properties": {
           "embedding": {
@@ -3392,13 +3563,20 @@
             "type": "array"
           },
           "usage": {
-            "$ref": "#/components/schemas/ScoreUsage"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ScoreUsage",
+                "description": "Omitted when the serving path could not count, as on `/v1/score`."
+              }
+            ]
           }
         },
         "required": [
           "model",
-          "results",
-          "usage"
+          "results"
         ],
         "type": "object"
       },
@@ -3995,6 +4173,17 @@
           "name": {
             "type": "string"
           },
+          "numerical_process_inventory": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NumericalProcessInventory",
+                "description": "Most recent process diagnostics, including unavailable children.\nHealth and observation time must be checked independently."
+              }
+            ]
+          },
           "pending_cost": {
             "format": "int64",
             "type": "integer"
@@ -4270,6 +4459,18 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
             }
           }
         ],
@@ -4568,6 +4769,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -4783,6 +4996,20 @@
       "post": {
         "description": "OpenAI-compatible legacy Completions. Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. `stream: true` is supported (SSE `text_completion`). Known-rejected fields: `echo`, `suffix`, `logprobs`, `best_of`, `n > 1`, batched array `prompt` — each rejects with 400 `unsupported_field`. The response body no longer carries the always-null `logprobs` field.",
         "operationId": "proxy_completions",
+        "parameters": [
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -5366,6 +5593,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -5681,6 +5920,18 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
             }
           }
         ],
@@ -6029,6 +6280,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -6375,6 +6638,18 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
             }
           }
         ],
@@ -7136,6 +7411,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -7266,6 +7553,20 @@
       "post": {
         "description": "OpenAI Responses API (MVP). Strict allow-list parser: unknown top-level fields reject with 400 `unsupported_field`. `input` is either a string prompt OR an array of `{role, content}` messages. Known-rejected fields: `tools`, `tool_choice`, `previous_response_id`, `reasoning`, `background`, `metadata`, `instructions` — each rejects with 400 `unsupported_field`. `stream: true` is rejected (Responses SSE is deferred). Multimodal image content parts reject with 400 `unsupported_field` on the array form.",
         "operationId": "proxy_responses",
+        "parameters": [
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -7648,6 +7949,18 @@
                 "null"
               ]
             }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -7985,6 +8298,18 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "description": "Require local serving through a current worker execution fence. A selected remote profile returns 400; no verified local worker returns retryable 503. Duplicate or other values return 400.",
+            "in": "header",
+            "name": "X-SIE-Remote",
+            "required": false,
+            "schema": {
+              "enum": [
+                "forbid"
+              ],
+              "type": "string"
             }
           }
         ],

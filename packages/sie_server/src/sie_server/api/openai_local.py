@@ -8,7 +8,9 @@ directly in either the Apple-Silicon or CUDA image.
   Apple Silicon and SGLang on CUDA. Chat templating, streaming, tool parsing,
   and structured output remain owned by that already-loaded child. The proxy
   pins the request to the child's loopback URL and served model identity; a
-  client cannot select another upstream.
+  client cannot select another upstream. Remote generation profiles use their
+  adapter's normalized chat methods instead; the operator-configured upstream
+  owns chat rendering, and the worker retains validation and output policy.
 - ``/v1/rerank`` wraps the in-process score adapter in the Cohere/OpenAI rerank
   shape (``{query, documents, top_n}`` -> ``{results: [{index, relevance_score}]}``).
 
@@ -34,9 +36,12 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError
 from sie_sdk.queue_types import denormalize_model_id
 
 from sie_server.adapters._generation_base import (
+    GenerationAdapter,
+    GenerationError,
     GenerationUnsupportedFieldError,
     ReasoningFormat,
     ThinkingBlockStripper,
@@ -46,7 +51,14 @@ from sie_server.adapters._generation_base import (
 )
 from sie_server.adapters.errors import InputTooLongError, UpstreamUnavailableError
 from sie_server.adapters.mlx.generation import MLXGenerationAdapter, normalize_mlx_seed
+from sie_server.adapters.remote._http import RemoteUpstreamError
 from sie_server.adapters.sglang.generation import SGLangGenerationAdapter
+from sie_server.api.generate import (
+    _generation_http_exception,
+    _validate_logit_bias,
+    _validate_logprobs,
+    _validate_schema_shape,
+)
 from sie_server.api.helpers import (
     ModelStateChecker,
     ensure_finite_scores,
@@ -56,11 +68,14 @@ from sie_server.api.helpers import (
 from sie_server.api.options import resolve_runtime_options
 from sie_server.api.routing import error_code, fallback_refusal, remote_routing, route_request
 from sie_server.api.score import score_usage_from_output
+from sie_server.api.streaming_response import prefetched_sse_response
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
 from sie_server.config.model import validate_chat_template_kwargs
+from sie_server.config.upstreams import RemoteServingDisabledError
 from sie_server.core.grammar_routing import resolve_grammar_serving_model
 from sie_server.core.inference_output import ScoreOutput
-from sie_server.core.runtime_options import grammar_default_sampling
+from sie_server.core.loader import serves_remotely
+from sie_server.core.runtime_options import GenerationTimeoutError, grammar_default_sampling
 from sie_server.core.score_cost import MAX_SCORE_ITEMS, build_score_prepared_items
 from sie_server.core.timing import RequestTiming
 from sie_server.core.video_frames import (
@@ -70,6 +85,7 @@ from sie_server.core.video_frames import (
     sniff_video_container,
 )
 from sie_server.observability.tracing import tracer
+from sie_server.processors.remote_chat_prompt import collect_rendered_chat, prepare_rendered_chat
 from sie_server.processors.streaming import _decode_data_uri_image
 from sie_server.processors.strict_grammar import (
     MODEL_OUTPUT_PARSE_ERROR,
@@ -96,6 +112,7 @@ _MAX_BODY_BYTES = int(os.environ.get("SIE_CHAT_MAX_BODY_BYTES", str(8 * 1024 * 1
 # token cap below remains authoritative for normal output; this is a final byte
 # fence for malformed/non-token responses.
 _MAX_CHAT_RESPONSE_BYTES = int(os.environ.get("SIE_CHAT_MAX_RESPONSE_BYTES", str(32 * 1024 * 1024)))
+_MAX_CHAT_TOOLS = 64
 _MAX_CHAT_MESSAGES = 4096
 _MAX_CHAT_CHOICES = 128
 _MAX_CHAT_VIDEOS = 1
@@ -447,6 +464,13 @@ def _validate_cuda_chat_body(body: dict[str, Any]) -> None:
         unknown = sorted(unknown_fields)[0]
         raise _bad_request(f"field '{unknown}' is not supported", param=unknown, code="unsupported_field")
 
+    _validate_common_chat_body(body)
+
+
+def _validate_common_chat_body(body: dict[str, Any]) -> None:
+    response_format = body.get("response_format")
+    if response_format is not None and not isinstance(response_format, dict):
+        raise _bad_request("'response_format' must be an object", param="response_format")
     n = body.get("n")
     if n is not None and (isinstance(n, bool) or not isinstance(n, int) or not (1 <= n <= _MAX_CHAT_CHOICES)):
         raise _bad_request(f"'n' must be an integer in [1, {_MAX_CHAT_CHOICES}]", param="n")
@@ -482,12 +506,88 @@ def _validate_cuda_chat_body(body: dict[str, Any]) -> None:
     if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1):
         raise _bad_request("'top_k' must be an integer >= 1", param="top_k")
 
+    _validate_logprobs(body.get("logprobs"), body.get("top_logprobs"))
+    try:
+        _validate_logit_bias(body.get("logit_bias"))
+    except OverflowError:
+        raise _bad_request("'logit_bias' values must be finite numbers", param="logit_bias") from None
+    stop = body.get("stop")
+    if stop is not None and not (
+        isinstance(stop, str) or (isinstance(stop, list) and all(isinstance(value, str) for value in stop))
+    ):
+        raise _bad_request("'stop' must be a string or array of strings", param="stop")
+    for field in ("parallel_tool_calls",):
+        if body.get(field) is not None and not isinstance(body[field], bool):
+            raise _bad_request(f"'{field}' must be a boolean", param=field)
+    for field in ("user", "safety_identifier"):
+        if body.get(field) is not None and not isinstance(body[field], str):
+            raise _bad_request(f"'{field}' must be a string", param=field)
+    _validate_chat_tools(body)
+
+
+def _validate_chat_tools(body: dict[str, Any]) -> None:
+    tools = body.get("tools")
+    names: set[str] = set()
+    if tools is not None:
+        if not isinstance(tools, list) or len(tools) > _MAX_CHAT_TOOLS:
+            raise _bad_request("'tools' must be an array of at most 64 functions", param="tools")
+        for tool in tools:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if not isinstance(function, dict) or tool.get("type") != "function":
+                raise _bad_request("'tools' entries must declare a function object", param="tools")
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                raise _bad_request("tool function names must be non-empty strings", param="tools")
+            names.add(name)
+            if function.get("description") is not None and not isinstance(function["description"], str):
+                raise _bad_request("tool descriptions must be strings", param="tools")
+            if function.get("strict") is not None and not isinstance(function["strict"], bool):
+                raise _bad_request("tool strict must be a boolean", param="tools")
+            parameters = function.get("parameters")
+            if parameters is not None:
+                if not isinstance(parameters, dict):
+                    raise _bad_request("tool parameters must be a JSON Schema object", param="tools")
+                try:
+                    _validate_schema_shape(parameters)
+                    Draft202012Validator.check_schema(parameters)
+                except (HTTPException, SchemaError):
+                    raise _bad_request("tool parameters must be a supported JSON Schema", param="tools") from None
+    choice = body.get("tool_choice")
+    if choice is None or choice in ("auto", "none"):
+        return
+    if choice == "required":
+        if not names:
+            raise _bad_request("required tool_choice needs tools", param="tool_choice")
+        return
+    function = choice.get("function") if isinstance(choice, dict) else None
+    if (
+        not isinstance(function, dict)
+        or choice.get("type") != "function"
+        or not isinstance(function.get("name"), str)
+        or function["name"] not in names
+    ):
+        raise _bad_request("'tool_choice' must name a declared function", param="tool_choice")
+
 
 def _validate_mlx_chat_body(body: dict[str, Any]) -> None:
     unknown_fields = body.keys() - _MLX_CHAT_FIELDS
     if unknown_fields:
         unknown = sorted(unknown_fields)[0]
         raise _bad_request(f"field '{unknown}' is not supported", param=unknown, code="unsupported_field")
+
+    _validate_common_chat_body(body)
+
+    min_p = body.get("min_p")
+    if min_p is not None and (isinstance(min_p, bool) or not isinstance(min_p, int | float) or not 0 <= min_p <= 1):
+        raise _bad_request("'min_p' must be a number in [0, 1]", param="min_p")
+    context_size = body.get("repetition_context_size")
+    if context_size is not None and (isinstance(context_size, bool) or not isinstance(context_size, int)):
+        raise _bad_request("'repetition_context_size' must be an integer", param="repetition_context_size")
+    mapping = body.get("role_mapping")
+    if mapping is not None and (
+        not isinstance(mapping, dict) or any(not isinstance(value, str) for value in mapping.values())
+    ):
+        raise _bad_request("'role_mapping' must be an object of strings", param="role_mapping")
 
 
 def _decode_data_uri_video(url: str) -> tuple[bytes, str]:
@@ -628,20 +728,20 @@ def _merge_stops(request_stop: Any, configured: Any) -> Any:
     return merged
 
 
-def _prepare_sglang_body(
+def _prepare_chat_body(
     body: dict[str, Any],
     *,
     config: Any,
-    adapter: SGLangGenerationAdapter,
     max_completion_tokens: int | None,
     max_tokens: int | None,
     seed: int | None,
 ) -> dict[str, Any]:
     proxied = dict(body)
-    proxied["model"] = adapter.served_model_name
     # SIE owns these edge-only identifiers; do not send unknown metadata into
     # the engine process.
     proxied.pop("safety_identifier", None)
+    if proxied.get("parallel_tool_calls") is None:
+        proxied.pop("parallel_tool_calls", None)
 
     cap = config.tasks.generate.max_output_tokens
     requested_cap = max_completion_tokens if max_completion_tokens is not None else max_tokens
@@ -658,6 +758,7 @@ def _prepare_sglang_body(
         proxied.pop("max_tokens", None)
         effective_cap = max_completion_tokens
     else:
+        proxied.pop("max_completion_tokens", None)
         proxied["max_tokens"] = max_tokens if max_tokens is not None else cap
         effective_cap = proxied["max_tokens"]
     if seed is not None:
@@ -695,6 +796,26 @@ def _prepare_sglang_body(
     if merged_template_kwargs:
         proxied["chat_template_kwargs"] = merged_template_kwargs
 
+    return proxied
+
+
+def _prepare_sglang_body(
+    body: dict[str, Any],
+    *,
+    config: Any,
+    adapter: SGLangGenerationAdapter,
+    max_completion_tokens: int | None,
+    max_tokens: int | None,
+    seed: int | None,
+) -> dict[str, Any]:
+    proxied = _prepare_chat_body(
+        body,
+        config=config,
+        max_completion_tokens=max_completion_tokens,
+        max_tokens=max_tokens,
+        seed=seed,
+    )
+    proxied["model"] = adapter.served_model_name
     # The public contract is final-answer-only. Ask the child parser to split
     # reasoning from visible content, then strip that private field again on
     # both response paths below. Raw-tag fallback covers models with no parser.
@@ -792,6 +913,8 @@ def _sanitize_chat_payload(
         reasoning_was_present = (reasoning_content is not None and reasoning_content != "") or (
             reasoning is not None and reasoning != ""
         )
+        if reasoning_was_present and "logprobs" in choice_obj:
+            choice_obj["logprobs"] = None
 
         if not hide_thinking_blocks:
             continue
@@ -810,7 +933,7 @@ def _sanitize_chat_payload(
             visible += stripper.finish()
         if isinstance(raw_content, str) or visible:
             container["content"] = visible
-        if (reasoning_was_present or visible != content) and "logprobs" in choice_obj:
+        if visible != content and "logprobs" in choice_obj:
             choice_obj["logprobs"] = None
     return payload
 
@@ -969,7 +1092,167 @@ async def _stream_strict_violation(
     return await _strict_output_violation(grammar, completed)
 
 
-# -- /v1/chat/completions (proxy to the managed generation child) ------------
+def _check_remote_chat_usage(payload: dict[str, Any], body: dict[str, Any], config: Any) -> None:
+    usage = payload.get("usage")
+    if usage is None:
+        return  # The adapter requires exact usage before clean exhaustion.
+    cap = body.get("max_completion_tokens", body.get("max_tokens"))
+    choices = body.get("n") or 1
+    prompt = usage["prompt_tokens"]
+    completion = usage["completion_tokens"]
+    context = config.tasks.generate.context_length
+    if prompt > context or completion > min(cap, context - prompt) * choices:
+        raise RemoteUpstreamError("upstream chat usage exceeded the configured token bounds")
+
+
+async def _remote_chat_events(
+    iterator: AsyncIterator[dict[str, Any]],
+    *,
+    body: dict[str, Any],
+    requested_model: str,
+    config: Any,
+    adapter: GenerationAdapter,
+    strict_grammar: GrammarSpec | None,
+) -> AsyncIterator[bytes]:
+    states: dict[int, ThinkingBlockStripper] = {}
+    strict_contents: dict[int, list[str]] = {}
+    strict_tool_choices: set[int] = set()
+    delivered = False
+    received = 0
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
+    try:
+        async for payload in iterator:
+            _check_remote_chat_usage(payload, body, config)
+            sanitized = _sanitize_chat_payload(
+                payload,
+                requested_model=requested_model,
+                hide_thinking_blocks=thinking_blocks_must_be_hidden(config),
+                initial_inside_thinking=False,
+                reasoning_format=resolve_reasoning_format(config, adapter),
+                states=states,
+                terminal=False,
+            )
+            if strict_grammar is not None:
+                violation = await _stream_strict_violation(
+                    sanitized, strict_grammar, contents=strict_contents, tool_choices=strict_tool_choices
+                )
+                if violation is not None:
+                    if not delivered:
+                        raise HTTPException(
+                            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail={"code": MODEL_OUTPUT_PARSE_ERROR, "message": violation},
+                        )
+                    yield _upstream_error_event(violation, code=MODEL_OUTPUT_PARSE_ERROR, error_type="server_error")
+                    return
+            if not include_usage:
+                sanitized.pop("usage", None)
+                if not sanitized["choices"]:
+                    continue
+            encoded = json.dumps(sanitized, separators=(",", ":"), ensure_ascii=False).encode()
+            received += len(encoded)
+            if received > _MAX_CHAT_RESPONSE_BYTES:
+                raise RemoteUpstreamError("upstream chat response exceeded the byte limit")
+            delivered = True
+            yield b"data: " + encoded + b"\n\n"
+        yield b"data: [DONE]\n\n"
+    except (RemoteUpstreamError, UpstreamUnavailableError, GenerationError, GenerationTimeoutError):
+        if not delivered:
+            raise
+        yield _upstream_error_event()
+    finally:
+        await aclose_with_error_precedence(iterator, outcome_selected=True, context="remote chat adapter")
+
+
+def _validate_remote_chat_media(messages: list[dict[str, Any]]) -> None:
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(part.get("type") not in {"text", "input_text"} for part in content):
+            raise _bad_request(
+                "remote chat does not support media messages", param="messages", code="unsupported_field"
+            )
+
+
+async def _remote_chat_response(
+    adapter: GenerationAdapter,
+    body: dict[str, Any],
+    *,
+    requested_model: str,
+    config: Any,
+    stream: bool,
+    headers: dict[str, str],
+    strict_grammar: GrammarSpec | None,
+) -> Response:
+    try:
+        rendered = await prepare_rendered_chat(
+            adapter, body, config=config, requested_model=requested_model, max_response_bytes=_MAX_CHAT_RESPONSE_BYTES
+        )
+        if stream:
+            iterator = _remote_chat_events(
+                rendered
+                if rendered is not None
+                else adapter.chat_completion_stream(
+                    body, requested_model=requested_model, max_response_bytes=_MAX_CHAT_RESPONSE_BYTES
+                ),
+                body=body,
+                requested_model=requested_model,
+                config=config,
+                adapter=adapter,
+                strict_grammar=strict_grammar,
+            )
+            # Decide a pre-output refusal before committing the HTTP 200.
+            return await prefetched_sse_response(
+                iterator, headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **headers}
+            )
+        payload = (
+            await collect_rendered_chat(rendered)
+            if rendered is not None
+            else await adapter.chat_completion(
+                body, requested_model=requested_model, max_response_bytes=_MAX_CHAT_RESPONSE_BYTES
+            )
+        )
+        _check_remote_chat_usage(payload, body, config)
+        payload = _sanitize_chat_payload(
+            payload,
+            requested_model=requested_model,
+            hide_thinking_blocks=thinking_blocks_must_be_hidden(config),
+            initial_inside_thinking=False,
+            reasoning_format=resolve_reasoning_format(config, adapter),
+            terminal=True,
+        )
+        if len(json.dumps(payload, ensure_ascii=False).encode()) > _MAX_CHAT_RESPONSE_BYTES:
+            raise RemoteUpstreamError("upstream chat response exceeded the byte limit")
+        if strict_grammar is not None:
+            violation = await _strict_output_violation(strict_grammar, _completed_choice_contents(payload))
+            if violation is not None:
+                return _strict_output_error_response(violation)
+        return JSONResponse(content=payload, headers=headers)
+    except GenerationError as exc:
+        raise _generation_http_exception(exc) from exc
+    except GenerationTimeoutError:
+        raise HTTPException(
+            status_code=504, detail={"code": "generation_timeout", "message": "remote generation timed out"}
+        ) from None
+    except UpstreamUnavailableError as exc:
+        raise upstream_unavailable_exception(exc, requested_model) from exc
+    except (InputTooLongError, InvalidInputError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": ErrorCode.INPUT_TOO_LONG.value if isinstance(exc, InputTooLongError) else "invalid_request",
+                "message": "the upstream refused the chat input",
+            },
+        ) from exc
+    except RemoteServingDisabledError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": ErrorCode.QUEUE_FULL.value, "message": "remote serving is unavailable"},
+            headers={"Retry-After": "1"},
+        ) from exc
+    except RemoteUpstreamError:
+        return _upstream_error_response()
+
+
+# -- /v1/chat/completions (managed child or remote generation adapter) -------
 
 
 @router.post("/chat/completions", response_model=None)
@@ -987,7 +1270,14 @@ async def chat_completions(
     (never FastAPI's ``{"detail": ...}`` wrapper), matching ``/v1/completions``.
     """
     try:
-        return await _chat_completions(http_request, x_machine_profile)
+        response = await _chat_completions(http_request, x_machine_profile)
+        if isinstance(response, JSONResponse) and response.status_code >= status.HTTP_400_BAD_REQUEST:
+            payload = json.loads(bytes(response.body))
+            code = payload.get("error", {}).get("code")
+            refusal = fallback_refusal(http_request, response.status_code, code)
+            if refusal is not None:
+                return openai_error_response(refusal)
+        return response
     except HTTPException as exc:
         return openai_error_response(fallback_refusal(http_request, exc.status_code, error_code(exc)) or exc)
 
@@ -1073,15 +1363,42 @@ async def _chat_completions(
                 )
             # The child decodes video on its event loop; bound that work here.
             await asyncio.to_thread(_probe_chat_videos, videos)
-        if str(device).startswith("cuda"):
+        remote_chat = serves_remotely(config)
+        if str(device).startswith("cuda") or remote_chat:
             _validate_cuda_chat_body(body)
         else:
             _validate_mlx_chat_body(body)
+        options = body.get("stream_options")
+        if options is not None and (
+            not isinstance(options, dict)
+            or bool(options.keys() - {"include_usage"})
+            or ("include_usage" in options and not isinstance(options["include_usage"], bool))
+        ):
+            raise _bad_request("'stream_options' must contain only boolean 'include_usage'", param="stream_options")
+        if remote_chat:
+            _validate_remote_chat_media(messages)
+
+        # Normalize and reject client errors before the bridge owns a local
+        # refusal; otherwise a caller error could be rewritten as that refusal.
+        prepared_chat = _prepare_chat_body(
+            body, config=config, max_completion_tokens=max_completion_tokens, max_tokens=max_tokens, seed=seed
+        )
 
         route = await route_request(http_request, requested_key, span, serving_key=registry_key)
 
         adapter = registry.get(route.key)
         registry.touch_lru(route.key)
+        if serves_remotely(registry.get_config(route.key)) and isinstance(adapter, GenerationAdapter):
+            _validate_remote_chat_media(messages)
+            return await _remote_chat_response(
+                adapter,
+                prepared_chat,
+                requested_model=model,
+                config=config,
+                stream=bool(stream_opt),
+                headers=route.headers(),
+                strict_grammar=strict_grammar,
+            )
         slot: asyncio.Semaphore | None = None
         reasoning_parser: str | None = None
         if isinstance(adapter, MLXGenerationAdapter) and not str(device).startswith("cuda"):
@@ -1248,8 +1565,9 @@ async def rerank(
     """Cohere/OpenAI-style reranking backed by the in-process score adapter.
 
     Request: ``{model, query, documents: [str], top_n?, return_documents?}``.
-    Response: ``{model, results: [{index, relevance_score, document?}], usage}``
-    sorted by descending relevance.
+    Response: ``{model, results: [{index, relevance_score, document?}], usage?}``
+    sorted by descending relevance. ``usage`` is omitted when the score output
+    carries no counts, as on ``/v1/score``.
 
     Errors are emitted as top-level OpenAI ``{"error": {...}}`` envelopes
     (never FastAPI's ``{"detail": ...}`` wrapper), matching ``/v1/completions``.
@@ -1323,6 +1641,7 @@ async def _rerank(
             span,
             profile=options_raw.get("profile") if options_raw else None,
             queued_items=len(doc_items),
+            request_options=options_raw,
         )
 
         timing = RequestTiming()
@@ -1367,11 +1686,6 @@ async def _rerank(
         # the HTTPException is re-emitted as the OpenAI error envelope by rerank().
         ensure_finite_scores(scores, model)
         usage = score_usage_from_output(score_output)
-        if usage is None:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={"code": "inference_error", "message": "score response missing authoritative usage"},
-            )
 
     ranked = sorted(enumerate(scores), key=lambda pair: pair[1], reverse=True)
     if top_n is not None:
@@ -1383,11 +1697,7 @@ async def _rerank(
             entry["document"] = {"text": documents[index]}
         results.append(entry)
 
-    return JSONResponse(
-        content={
-            "model": getattr(config, "name", None) or registry_key,
-            "results": results,
-            "usage": usage,
-        },
-        headers=route.headers(),
-    )
+    content: dict[str, Any] = {"model": getattr(config, "name", None) or registry_key, "results": results}
+    if usage is not None:
+        content["usage"] = usage
+    return JSONResponse(content=content, headers=route.headers())

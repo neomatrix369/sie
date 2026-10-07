@@ -54,6 +54,7 @@ METHOD_PROCESS_SCORE_BATCH = "ProcessScoreBatch"
 METHOD_PROCESS_EXTRACT_BATCH = "ProcessExtractBatch"
 METHOD_PROCESS_GENERATE = "ProcessGenerate"
 METHOD_WORKER_CAPABILITIES = "WorkerCapabilities"
+METHOD_NUMERICAL_PROFILE_SNAPSHOT = "NumericalProfileSnapshot"
 METHOD_SIGNAL_GENERATE_CANCEL = "SignalGenerateCancel"
 # RPC that accepts a whole pre-formed batch (single-op, mixed items)
 # and returns ``BatchOutcome`` unchanged.
@@ -62,6 +63,12 @@ METHOD_SIGNAL_GENERATE_CANCEL = "SignalGenerateCancel"
 # contract for focused IPC parity tests and Python-framed callers.
 # Direct ``sie-server`` HTTP execution does not use this IPC boundary.
 METHOD_RUN_BATCH = "RunBatch"
+# These distinct methods require live configuration authority. Older backends
+# reject the method before processing inputs, even after a child restart.
+METHOD_RUN_BATCH_WITH_EXECUTION_AUTHORITY_V1 = "RunBatchWithExecutionAuthorityV1"
+METHOD_PROCESS_GENERATE_WITH_EXECUTION_AUTHORITY_V1 = "ProcessGenerateWithExecutionAuthorityV1"
+# Execution authority plus the numerical admission that every item names.
+METHOD_RUN_BATCH_WITH_NUMERICAL_ADMISSION_V1 = "RunBatchWithNumericalAdmissionV1"
 METHOD_APPLY_MODEL_CONFIG = "ApplyModelConfig"
 METHOD_REPLACE_MODEL_CONFIGS = "ReplaceModelConfigs"
 METHOD_SET_PINNED_MODELS = "SetPinnedModels"
@@ -262,7 +269,37 @@ class WorkerCapabilitiesRequest(msgspec.Struct):
     pass
 
 
+class NumericalProfileSnapshotRequest(msgspec.Struct):
+    pass
+
+
+class NumericalAdmissionObservation(msgspec.Struct):
+    sha256: str
+    kind: str
+    local_identities: list[str]
+    model_contract_sha256: str
+    outputs: list[str]
+    expires_at_unix_ms: int
+
+
+class NumericalProfileObservation(msgspec.Struct, omit_defaults=True):
+    model_id: str
+    local_identity: str | None = None
+    model_contract_sha256: str | None = None
+    remote_contract_sha256: str | None = None
+    remote_execution_sha256: str | None = None
+    admission: NumericalAdmissionObservation | None = None
+
+
+class NumericalProfileSnapshotResponse(msgspec.Struct):
+    runtime_instance_id: str | None = None
+    profiles: list[NumericalProfileObservation] = msgspec.field(default_factory=list)
+    complete: bool = False
+
+
 class WorkerCapabilitiesResponse(msgspec.Struct):
+    supports_execution_authority_v1: bool = False
+    supports_numerical_admission_v1: bool = False
     has_generation_models: bool = False
     generation_models: list[str] = msgspec.field(default_factory=list)
     supported_models: list[str] = msgspec.field(default_factory=list)
@@ -338,6 +375,7 @@ class EncodeBatchItem(msgspec.Struct):
     options: dict[str, Any] | None = None
     profile_id: str | None = None
     bundle_config_hash: str | None = None
+    numerical_admission_sha256: str | None = None
     payload_fetch_ms: float = 0.0
     # Optional pre-tokenised payload populated by the worker-sidecar
     # (see ``PreparedTokens`` above). When present and the tokenizer
@@ -370,6 +408,8 @@ class ScoreBatchItem(msgspec.Struct):
     instruction: str | None = None
     options: dict[str, Any] | None = None
     profile_id: str | None = None
+    bundle_config_hash: str | None = None
+    numerical_admission_sha256: str | None = None
     payload_fetch_ms: float = 0.0
     # Rust-side fast-path tokenisation. Wire layout matches the Rust
     # dispatcher: ``input_ids[0]`` is the query, ``input_ids[1..]`` are
@@ -574,6 +614,9 @@ class ItemOutcome(msgspec.Struct):
     # that don't know the key (older Rust sidecars) ignore it and older
     # producers simply omit it — the NATS wire contract is unchanged.
     units: UnitCounts | None = None
+    # Seconds after which a retryable error may succeed; the sidecar passes it
+    # onto ``WorkResult.retry_after_s`` and the gateway's ``Retry-After``.
+    retry_after_s: int | None = None
 
 
 class BatchedF16MultivectorItem(msgspec.Struct):

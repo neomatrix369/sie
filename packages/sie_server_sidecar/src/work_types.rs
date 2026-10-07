@@ -99,6 +99,20 @@ pub struct WorkItem {
         skip_serializing_if = "Option::is_none"
     )]
     pub deadline: Option<f64>,
+    /// Set by the gateway when it sent the item to a remote profile in place
+    /// of a local route that refused it; names the refusal. Someone is
+    /// waiting to answer with that local refusal, so backend NakRetry outcomes
+    /// are published as refusals and ACKed after successful publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    /// Set by the gateway on an encode or score item it sent to a remote
+    /// profile on the strength of a numerical admission; names that
+    /// admission's digest. Such an item runs only through the numerical
+    /// admission method, whose backend re-verifies the digest first, and a
+    /// NakRetry outcome is published as a refusal like a fallback attempt's,
+    /// because redelivery to the pinned worker cannot restore the admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numerical_admission_sha256: Option<String>,
 }
 
 fn deserialize_lenient_seconds<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -213,6 +227,11 @@ pub struct WorkResult {
     /// The gateway uses it as post-execution provenance evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executed_bundle_config_hash: Option<String>,
+    /// Seconds after which a retryable error may succeed, passed through from
+    /// the engine's `ItemOutcome.retry_after_s`. Absent on success and when
+    /// the engine gave no hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_s: Option<u32>,
 }
 
 /// One bounded chunk of a serialized [`WorkResult`].
@@ -280,6 +299,8 @@ mod tests {
             tracestate: None,
             timestamp: 1_700_000_000.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         }
     }
 
@@ -472,6 +493,7 @@ mod tests {
             units: None,
             worker_direct: true,
             executed_bundle_config_hash: None,
+            retry_after_s: None,
         };
         let bytes = rmp_serde::to_vec_named(&result).unwrap();
         let back: WorkResult = rmp_serde::from_slice(&bytes).unwrap();

@@ -69,6 +69,25 @@ Message settlement:
 - Malformed subjects and bad msgpack payloads are NAKed.
 - Unknown operations publish per-item error outcomes when reply publication
   succeeds.
+- A `load` work item carries no input. It goes through the same admission,
+  config and readiness checks as other work for that model. Once
+  `EnsureModelReady` reports ready, it is ACKed without inference or a result.
+  This is the NATS worker-side warm-up primitive; the gateway publishes one
+  before a `model_loading` bridge. Local-ingest `publish_work` rejects `load` before
+  dispatch because that request/response lane requires a result.
+- The gateway sets `fallback_reason` on a remote attempt that stands in for a
+  local refusal it holds: every fallback bridge, and a threshold bridge while
+  local capacity wakes. If the backend returns `nak_retry` for such an item,
+  the sidecar publishes an error result with the outcome's `error_code`
+  (`QUEUE_FULL` when absent) and `retry_after_s` (the NAK delay rounded up to
+  seconds when absent), then ACKs after successful publication, so the gateway
+  restores its local refusal at once. Ordinary items retain NAK behavior.
+  Admission, config/readiness barriers and failed result publication retain
+  their existing retry behavior.
+- An outcome's optional `retry_after_s` is published on the `WorkResult`
+  unchanged. For a `QUEUE_FULL`, `MODEL_LOADING` or `RESOURCE_EXHAUSTED`
+  answer the gateway uses a hint of 1 to 60 seconds as `Retry-After`; without
+  one, or with a hint outside that range, it uses five seconds.
 - Active local model loads are held with JetStream progress ACKs until
   `EnsureModelReady` returns ready; this preserves the delivery budget during
   cold starts. The progress delay is clamped below the pool consumer `ack_wait`
@@ -306,14 +325,165 @@ The Rust and Python protocol copies define the same method names:
 - `ProcessExtractBatch`
 - `ProcessGenerate`
 - `WorkerCapabilities`
+- `NumericalProfileSnapshot`
 - `SignalGenerateCancel`
 - `RunBatch`
+- `RunBatchWithExecutionAuthorityV1`
+- `RunBatchWithNumericalAdmissionV1`
+- `ProcessGenerateWithExecutionAuthorityV1`
 - `ApplyModelConfig`
 - `ReplaceModelConfigs`
 - `Drain`
 
 `tools/check_ipc_types_parity.py` checks the Rust protocol schema against
 `packages/sie_server/src/sie_server/ipc_types.py`.
+
+### Numerical process observations (#415)
+
+`NumericalProfileSnapshot` is an optional, on-demand diagnostic RPC. The Python
+backend returns its process incarnation, registered model contract digests, and
+available local numerical profile identities under one configuration execution
+lease. It does not load model weights or run inference. Unsupported profiles
+retain an absent identity; failures return an incomplete snapshot without error
+details. A roster contains at most 1,024 models, with each model ID limited to
+1,024 UTF-8 bytes. Truncation or an invalid configuration makes it incomplete.
+
+A process that holds the upstream of a model's remote profile also reports, on
+the bare model, that profile's `remote_contract_sha256` and the
+`remote_execution_sha256` of its serving code. For a model with `encode` or
+`score` tasks and a hybrid routing policy it adds the current `admission`: the
+local execution identities that passing, fresh evidence covers (at most eight),
+the model contract, the admitted outputs, the expiry and an admission digest.
+An SIE upstream's identity is refreshed in the background, so a snapshot never
+waits on the upstream. Empty fields are omitted, so a process without a remote
+profile reports the same shape as before.
+
+The adapter pool retains one observation for every configured child, including
+unavailable and legacy backends. Missing fields are incomplete, malformed
+digests or admissions are invalid, and a duplicated process incarnation invalidates both
+children. Each call refreshes the observations so a replacement process does
+not inherit the previous incarnation. The Candle backend does not implement
+this optional method and is reported as unavailable.
+
+These observations do not change readiness, execution authority, or routing.
+Admitting a numerical bridge from them also requires the identity of every live
+local process and an execution fence at the remote process.
+
+### Execution authority protocol amendment (#415)
+
+Verified execution uses the two `WithExecutionAuthorityV1` methods. They
+require a nonempty configuration hash for every batch item or generation work
+item and retain the live Python execution lease described above. An old backend
+rejects these unknown methods before inference. The backend capability
+`supports_execution_authority_v1` defaults to false when absent; the Python
+backend advertises support, while Candle remains closed until it implements
+the same contract. Capability discovery cannot replace the method fence: a
+backend child can restart after its last positive capability response.
+
+Authority work uses the worker-direct subject with an eighth token,
+`execution-authority-v1`. The sidecar creates `WORK_AUTHORITY_V1_<worker>` and
+`authority-v1-<worker>` separately from its ordinary pool/direct stream and
+consumer. The stream retains the existing bounded age, message and delivery
+limits. Older six-token pool and seven-token direct filters cannot receive this
+work or change the authority consumer when reconciling their own streams.
+Redelivery preserves the subject and rechecks the live configuration hash.
+Verified subject and payload model ids must match exactly before any subject
+rewrite, readiness check or offloaded payload retrieval. This refuses lossy
+`__`/`_dot_` normalization collisions instead of retargeting another model
+covered by the same configuration hash.
+
+The sidecar derives the required contract from that subject. Before readiness
+or fetching offloaded inputs, it requires a nonempty matching hash, live config
+authority, and positively verified backend support. Numeric work also requires
+the complete scheduler lifecycle; its scheduler batches are partitioned by
+execution contract so older empty-hash work cannot invalidate verified work.
+Batch and generation dispatch use the updated-only IPC methods, preserving the
+final locked execution checks. The sidecar's health capability requires every
+ready backend child to report support and the authority pull consumer to run.
+Missing or unavailable children close that admission signal. The method fence
+still applies independently if a backend changes after the last health probe.
+
+Current gateway producers use the existing queue subjects. Gateway activation
+must select positively capable workers and publish only on the versioned
+subject for verified work.
+Every publish and retry must retain both fences, with no legacy pool or IPC
+fallback. A missing, stale, unsupported, or unavailable authority refuses work
+before inputs execute. This extends the queue contract while preserving the
+gateway's queue-only ownership and worker-owned inference.
+
+### Numerical admission fence (#415)
+
+A remote attempt for an `encode` or `score` item may carry
+`numerical_admission_sha256`, the digest of the remote process's `admission`
+that the producer relied on. Such admitted work uses the worker-direct subject
+with the eighth token `numerical-admission-v1`. Only a sidecar with this fence
+creates `WORK_ADMISSION_V1_<worker>` and `admission-v1-<worker>`, with the same
+bounds as the authority stream. No consumer of a sidecar without the fence
+matches that subject, including its authority consumer. A rollback therefore
+cannot hand such a sidecar admitted work that is already queued, and until a
+fenced sidecar has created the stream, admitted work cannot be published at
+all. The contract comes from the subject, never from the payload field, which
+an older sidecar would ignore. Every worker therefore runs a fourth stream,
+durable consumer and pull loop, including lanes that never receive admitted
+work.
+
+Admitted work also runs under execution authority. Before readiness or
+offloaded input retrieval, the sidecar answers an item with `INFERENCE_ERROR`
+and ACKs it, whether or not the answer could be published, when the item and
+its subject disagree: the field on any other subject, an item without the field
+on the admission subject, an operation other than `encode` or `score`, a
+payload model other than the subject's, or an admitted item without a
+configuration hash. It does the same for an `encode` or `score` item that
+carries `fallback_reason` without the field, because every numerical remote
+attempt that stands in for a local refusal is admitted work. Such an item can
+never become valid, and a NAK could hand an item on a pool subject to a worker
+without the fence. An admitted item whose configuration hash this worker does
+not hold is also answered with `INFERENCE_ERROR` at once, at receipt, at the
+model group's check and at the scheduler's barrier, because its bridged caller
+waits with a local refusal. Only an admitted item that arrives before every
+backend child supports the method is NAKed on the worker's own admission
+stream, like other authority work. An admitted item past its gateway deadline
+is ACK-dropped before the backend call even when `SIE_WORK_DEADLINE_ENFORCE` is
+off, because its caller has stopped waiting. The local-ingest lane rejects the
+field, and `fallback_reason` on `encode` or `score`.
+
+Admitted items keep their own scheduler partition and run only through
+`RunBatchWithNumericalAdmissionV1`, which an older backend rejects. A sidecar
+without the scheduler answers them instead of sending them through
+`ProcessEncodeBatch` or `ProcessScoreBatch`, and the Python backend refuses the
+field on every method other than the admission method. Under the same
+execution lease as the authority checks, the Python backend derives its own
+current admission for the bare model whose fallback profile the batch targets,
+without contacting an SIE upstream. It runs an item only when the item names
+that digest, requests only admitted outputs and keeps the measured runtime
+options. Any other item gets `nak_retry` with `INFERENCE_ERROR` before the
+upstream is called, as does every item when the check itself fails or when the
+configuration barrier refuses an admitted batch. Redelivery to the pinned
+worker cannot restore an admission, so the sidecar publishes a `nak_retry` for
+an admitted item as its refusal at once and ACKs it, as it does for a fallback
+attempt. A bridged caller then receives its local refusal with
+`X-SIE-Fallback-Error: INFERENCE_ERROR`.
+
+The check covers batches that start after a change. A replaced, expired or
+removed record refuses every later batch without waiting for the next
+heartbeat, while a batch that has already passed the check completes its
+upstream calls. An SIE upstream's identity comes from a cache that is trusted
+for up to 30 seconds.
+
+The backend capability `supports_numerical_admission_v1` defaults to false. The
+heartbeat reports `supports_numerical_admission_v1` when it reports
+`supports_execution_authority_v1` and every backend child supports the method.
+It reports `supports_numerical_admission_subject_v1` only when, in addition,
+the admission pull consumer runs. Builds that predate the admission subject
+never send that field, so the gateway selects on it alone. A sidecar rolled
+back below this version does not run admitted work still queued for that
+worker, and its callers time out. A fenced sidecar that later consumes such an
+item drops it once its deadline has passed. The gateway stops selecting the
+worker once its heartbeat no longer reports the capability. The gateway
+produces these items only for an `encode` or `score` bridge or threshold route
+whose numerical admission it has checked, and only toward a worker that
+reports `supports_numerical_admission_subject_v1`. The gateway architecture
+guide's "Numerical bridges" section describes that decision.
 
 Non-streaming backend responses use one physical frame while the serialized
 response is at most 32 MiB. For a larger response, the sidecar explicitly sets
@@ -551,6 +721,33 @@ not consult the list. These NAKs are counted with reason `model_unsupported`.
 Successful non-streaming results echo that stable
 execution hash so the gateway can bind response provenance to the exact worker
 execution. Empty hashes remain accepted only for legacy, non-attested traffic.
+
+A non-empty hash also requires an installed `ConfigApplyState`; custom
+dispatchers without that authority refuse pinned work before backend execution.
+The Python IPC receiver independently checks the live bundle configuration
+view, including control-plane adapter scope and unsupported models. Its shared
+registry execution lease permits concurrent inference while blocking
+filesystem reload and asynchronous add/remove/replace until the batch or
+generation stream finishes. Synchronous configuration mutation refuses while
+the lease is held and must run on the registry's lifecycle loop once bound.
+The lease is separate from model-load locks so a pinned request can load its
+model while a configuration writer waits.
+
+Configuration writers wait for existing executions within the registry's drain
+timeout. If a long generation stream exceeds that wait, the update fails with
+a retryable timeout and reopens reader admission; the old configuration remains
+pinned until the stream ends. Identity and evidence validation run off the
+lifecycle event loop during asynchronous configuration updates.
+
+Hashed generation retains the gateway-selected model/profile. If the Python
+grammar resolver would rewrite that target, the receiver NAKs before loading
+or prewarming a model: grammar-routing declarations are not covered by the
+bundle hash. An unavailable grammar profile is settled as a terminal
+`unsupported_field` refusal by the streaming processor under the same lease.
+Score IPC items carry the same optional hash as encode and
+extract items, including scheduler batches. Deploy matching updated Python
+workers and sidecars together to obtain this execution authority; legacy
+empty-hash traffic and older IPC producers do not provide the guarantee.
 
 Live config apply updates model configuration in the colocated backend registry/catalog.
 It does not update adapter code or bundle definitions inside the running worker

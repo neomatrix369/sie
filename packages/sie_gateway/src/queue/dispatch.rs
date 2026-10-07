@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, oneshot};
 use tracing::warn;
 
+use super::lane_admission::LaneKey;
 use super::publisher::WorkPublisher;
 // Re-exports for future consumers of the dispatch seam (also serve as
 // this module's own imports for the trait signatures below).
@@ -174,6 +175,43 @@ impl From<String> for DispatchError {
 /// full behavioural documentation.
 #[async_trait]
 pub trait WorkDispatcher: Send + Sync {
+    /// Opt in only when every initial dispatch and internal retry preserves
+    /// VerifiedWorker and its nonempty hash through the versioned worker fence.
+    /// Custom transports and wrappers remain closed until they implement it.
+    fn supports_execution_authority_v1(&self) -> bool {
+        false
+    }
+
+    /// Non-publishing pressure hint. Actual dispatch must recheck admission;
+    /// errors after dispatch starts cannot be used to retry through a bridge.
+    fn pre_dispatch_backpressure(&self, _lane: &LaneKey) -> Result<(), DispatchBackpressure> {
+        Ok(())
+    }
+
+    /// Non-publishing capacity hint: `true` when this transport observes that
+    /// the lane serving `model` has no capacity ready to accept work, although
+    /// the registry may still list workers for it. The gateway reads it only to
+    /// decide a `provisioning` bridge before dispatch, then wakes the lane
+    /// through [`Self::publish_model_load`] with the lane's pool target. A
+    /// transport that reports cold lanes must accept such a pool-target wake.
+    fn lane_provisioning(&self, _lane: &LaneKey, _model: &str) -> bool {
+        false
+    }
+
+    /// Request readiness without inference. Only transports whose worker
+    /// settlement supports no-result load items may implement this operation.
+    #[allow(dead_code)] // Called by the subsequent cluster fallback routing delivery.
+    async fn publish_model_load(
+        &self,
+        _target: PublishTarget,
+        _engine: &str,
+        _bundle_config_hash: &str,
+    ) -> Result<(String, DispatchDurability), DispatchError> {
+        Err(DispatchError::Other(
+            "load-only dispatch is not supported by this transport".to_string(),
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// `model` is the route the work runs on. `display_model` is the model id
     /// the caller asked for, which logs and accounting downstream report;
@@ -345,6 +383,25 @@ pub trait WorkDispatcher: Send + Sync {
 
 #[async_trait]
 impl WorkDispatcher for WorkPublisher {
+    fn supports_execution_authority_v1(&self) -> bool {
+        true
+    }
+
+    fn pre_dispatch_backpressure(&self, lane: &LaneKey) -> Result<(), DispatchBackpressure> {
+        WorkPublisher::pre_dispatch_backpressure(self, lane).map_err(DispatchBackpressure::from)
+    }
+
+    async fn publish_model_load(
+        &self,
+        target: PublishTarget,
+        engine: &str,
+        bundle_config_hash: &str,
+    ) -> Result<(String, DispatchDurability), DispatchError> {
+        WorkPublisher::publish_model_load(self, target, engine, bundle_config_hash)
+            .await
+            .map_err(DispatchError::from)
+    }
+
     async fn publish_work(
         self: Arc<Self>,
         target: PublishTarget,
@@ -776,6 +833,23 @@ mod performance_tests {
             drop(result_receiver);
             durability.wait().await.expect("benchmark durability");
         }
+    }
+
+    #[tokio::test]
+    async fn load_only_dispatch_refuses_transports_without_no_result_settlement() {
+        let dispatcher = AckCompletingDispatcher::default();
+        let target = PublishTarget::Pool {
+            pool: "local".into(),
+            machine_profile: "l4".into(),
+            bundle: "default".into(),
+            model: "acme/warm".into(),
+        };
+        let result = dispatcher
+            .publish_model_load(target, "pytorch", "exact-hash")
+            .await;
+        assert!(matches!(result, Err(DispatchError::Other(message))
+            if message == "load-only dispatch is not supported by this transport"));
+        assert_eq!(dispatcher.cancel_calls.load(Ordering::SeqCst), 0);
     }
 
     fn demand_tracker_with_lanes(

@@ -39,9 +39,11 @@ from sie_server.adapters._generation_base import (
     suppress_thinking_blocks,
     thinking_blocks_must_be_hidden,
 )
+from sie_server.adapters.remote.sie import SieUpstreamAdapter
 from sie_server.api.generate import _generation_http_exception
 from sie_server.api.helpers import ModelStateChecker, check_sdk_version
 from sie_server.api.routing import fallback_refusal, remote_routing, route_request
+from sie_server.api.streaming_response import prefetched_sse_response
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
 from sie_server.core.runtime_options import (
     GenerationTimeoutError,
@@ -410,8 +412,10 @@ async def _stream_completion(
     model: str,
     include_usage: bool,
     registry: Any,
+    pre_output_errors: bool = False,
 ) -> AsyncIterator[str]:
     terminal: GenerationChunk | None = None
+    delivered = False
     terminal_outcome_selected = False
     cleanup_failed = False
     try:
@@ -422,6 +426,16 @@ async def _stream_completion(
             errored = chunk.done and (
                 chunk.finish_reason == "error" or chunk.error_code is not None or chunk.error_message is not None
             )
+            if pre_output_errors and not delivered and (cancelled or errored):
+                raise _CompletionError(
+                    "generation was cancelled before completion"
+                    if cancelled
+                    else client_safe_generation_error_message(chunk.error_code, chunk.error_message),
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE
+                    if cancelled
+                    else status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    code="generation_cancelled" if cancelled else client_safe_generation_error_code(chunk.error_code),
+                )
             body = _chunk_body(
                 completion_id=completion_id,
                 created=created,
@@ -445,12 +459,15 @@ async def _stream_completion(
                     "param": None,
                     "code": client_safe_generation_error_code(chunk.error_code),
                 }
+            delivered = True
             yield f"data: {json.dumps(body)}\n\n"
             if chunk.done:
                 break
-    except Exception as exc:  # noqa: BLE001 - the stream must terminate in-band after headers are committed
+    except Exception as exc:  # noqa: BLE001 - turn untrusted failures into fixed errors after output
         terminal_outcome_selected = True
-        if isinstance(exc, GenerationError):
+        if isinstance(exc, _CompletionError):
+            error = exc
+        elif isinstance(exc, GenerationError):
             error = _from_generation_error(exc, registry)
             logger.info("OpenAI completion received typed generation refusal mid-stream: %s", error.code)
         else:
@@ -460,6 +477,8 @@ async def _stream_completion(
                 code="inference_error",
             )
             logger.warning("OpenAI completion failed mid-stream", exc_info=True)
+        if pre_output_errors and not delivered:
+            raise error from None
         body = _chunk_body(
             completion_id=completion_id,
             created=created,
@@ -490,6 +509,12 @@ async def _stream_completion(
             cleanup_failed = True
             logger.warning("OpenAI completion iterator cleanup failed", exc_info=True)
 
+    if pre_output_errors and not delivered and (cleanup_failed or terminal is None):
+        raise _CompletionError(
+            "generation stream ended without valid output",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            code="inference_error",
+        )
     if cleanup_failed:
         body = _chunk_body(
             completion_id=completion_id,
@@ -719,22 +744,24 @@ async def completions(
                 reasoning_format = resolve_reasoning_format(config, adapter)
                 chunks = suppress_thinking_blocks(
                     chunks,
-                    start_inside=reasoning_starts_in_prompt(params.prompt, reasoning_format),
+                    start_inside=not isinstance(adapter, SieUpstreamAdapter)
+                    and reasoning_starts_in_prompt(params.prompt, reasoning_format),
                     reasoning_format=reasoning_format,
                 )
             if params.stream:
-                return StreamingResponse(
-                    _stream_completion(
-                        chunks,
-                        completion_id=completion_id,
-                        created=created,
-                        model=canonical_model,
-                        include_usage=params.include_usage,
-                        registry=registry,
-                    ),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **route.headers()},
+                iterator = _stream_completion(
+                    chunks,
+                    completion_id=completion_id,
+                    created=created,
+                    model=canonical_model,
+                    include_usage=params.include_usage,
+                    registry=registry,
+                    pre_output_errors=route.upstream is not None,
                 )
+                headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **route.headers()}
+                if route.upstream is not None:
+                    return await prefetched_sse_response(iterator, headers=headers)
+                return StreamingResponse(iterator, media_type="text/event-stream", headers=headers)
 
             try:
                 text, terminal = await _collect_completion(

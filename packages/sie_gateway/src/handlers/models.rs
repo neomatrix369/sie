@@ -66,7 +66,7 @@ pub async fn get_models(
             let worker_urls = model_workers.get(name).cloned().unwrap_or_default();
             let loaded = !worker_urls.is_empty();
             let mut body = match state.model_registry.get_model_info(name) {
-                Some(entry) => entry.to_model_info_value(loaded),
+                Some(entry) => model_info_for_caller(state.as_ref(), &entry, loaded, ext),
                 None => worker_only_model_info(name, loaded),
             };
             attach_model_revision(&mut body, state.as_ref(), name);
@@ -95,6 +95,73 @@ pub async fn get_models(
         })),
     )
         .into_response()
+}
+
+/// A model as the caller in `ext` may see it. When the caller may not see the
+/// remote profile that the model's routing names, the model is shown without
+/// that profile and without the routing, like a model that has no remote
+/// route.
+fn model_info_for_caller(
+    state: &AppState,
+    entry: &ModelEntry,
+    loaded: bool,
+    ext: &axum::http::Extensions,
+) -> Value {
+    let mut body = entry.to_model_info_value(loaded);
+    let Some((remote_model, profile)) = entry.routed_remote_profile() else {
+        return body;
+    };
+    let hidden = state
+        .model_access_policy
+        .as_ref()
+        .is_some_and(|policy| !policy.visible(&remote_model, ext));
+    if hidden {
+        body["routing"] = ModelEntry::no_routing_value();
+        leave_out_profile(&mut body, profile);
+    }
+    body
+}
+
+/// Leave `profile` out of a model's JSON: its entry in `profiles`, its LoRA
+/// adapters, and every adapter name in the union that no other profile
+/// declares. An emptied map or union becomes `null`, as for a model that
+/// declares none.
+fn leave_out_profile(body: &mut Value, profile: &str) {
+    if let Some(profiles) = body["profiles"].as_object_mut() {
+        profiles.remove(profile);
+    }
+    let capabilities = &mut body["capabilities"];
+    let (retained, emptied) = {
+        let Some(per_profile) = capabilities["profile_lora_adapters"].as_object_mut() else {
+            return;
+        };
+        if per_profile.remove(profile).is_none() {
+            return;
+        }
+        let retained: HashSet<String> = per_profile
+            .values()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        (retained, per_profile.is_empty())
+    };
+    if emptied {
+        capabilities["profile_lora_adapters"] = Value::Null;
+    }
+    let union: Vec<Value> = capabilities["lora_adapters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|name| name.as_str().is_some_and(|name| retained.contains(name)))
+        .cloned()
+        .collect();
+    capabilities["lora_adapters"] = if union.is_empty() {
+        Value::Null
+    } else {
+        Value::Array(union)
+    };
 }
 
 /// Detail counterpart to `get_models`.
@@ -162,7 +229,7 @@ pub async fn get_model(
 
     let loaded = !worker_urls.is_empty();
     let mut body = match model_entry {
-        Some(entry) => entry.to_model_info_value(loaded),
+        Some(entry) => model_info_for_caller(state.as_ref(), &entry, loaded, req.extensions()),
         None => worker_only_model_info(&model, loaded),
     };
 
@@ -284,6 +351,7 @@ fn worker_only_model_info(name: &str, loaded: bool) -> Value {
             dims: HashMap::new(),
             max_sequence_length: None,
             revision: None,
+            routing: None,
             max_output_tokens: None,
             profile_max_output_tokens: HashMap::new(),
             grammar_capabilities: None,
@@ -347,6 +415,7 @@ mod route_tests {
             watch_polling: false,
             multi_router: false,
             request_timeout: 30.0,
+            max_item_text_bytes: 2 * 1024 * 1024,
             max_stream_pending: 50_000,
             max_lane_in_flight_items:
                 crate::queue::lane_admission::DEFAULT_MAX_LANE_IN_FLIGHT_ITEMS,
@@ -445,6 +514,7 @@ mod route_tests {
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -493,6 +563,7 @@ mod route_tests {
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -527,6 +598,7 @@ mod route_tests {
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -663,6 +735,7 @@ mod route_tests {
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -676,6 +749,9 @@ mod route_tests {
 
     fn worker_msg(name: &str, loaded_models: Vec<String>) -> WorkerStatusMessage {
         WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: name.into(),
             gpu_count: 1,
             total_gpu_slots: None,
@@ -695,6 +771,7 @@ mod route_tests {
             pool_name: String::new(),
             saturated: false,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         }
     }
@@ -1272,6 +1349,7 @@ mod route_tests {
             .add_model_config(ModelConfig {
                 name: model_id.to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,

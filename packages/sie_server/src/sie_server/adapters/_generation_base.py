@@ -91,9 +91,16 @@ class GenerationInputTooLongError(GenerationError):
 
 
 class GenerationCapacityError(GenerationError):
-    """The generation backend is temporarily at bounded capacity."""
+    """The generation backend is temporarily at bounded capacity.
+
+    ``retry_after_s`` is the backend's own wait, when it gave one.
+    """
 
     code = "RESOURCE_EXHAUSTED"
+
+    def __init__(self, message: str = "", *, retry_after_s: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
 
 
 class GenerationDrainingError(GenerationCapacityError):
@@ -922,6 +929,29 @@ class GenerationAdapter(ModelAdapter):
         gc.collect()
 
     # -- Contract ------------------------------------------------------------
+
+    async def chat_completion(
+        self, body: dict[str, Any], *, requested_model: str, max_response_bytes: int = 32 << 20
+    ) -> dict[str, Any]:
+        """Return a normalized chat answer when this adapter owns chat rendering.
+
+        The ingress validates and bounds ``body`` before dispatch. Remote
+        adapters pin the upstream model independently from ``requested_model``.
+        ``max_response_bytes`` bounds raw upstream bytes, including discarded
+        metadata. Local adapters continue through their existing rendering path.
+        """
+        raise GenerationUnsupportedFieldError("messages", "this generation adapter does not accept chat messages")
+
+    def chat_completion_stream(
+        self, body: dict[str, Any], *, requested_model: str, max_response_bytes: int = 32 << 20
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream normalized chat events, including exact final usage.
+
+        Closing the iterator cancels upstream work. Clean exhaustion certifies
+        every choice, final usage and the upstream's terminal event. The byte
+        bound applies to the complete raw stream, including discarded metadata.
+        """
+        raise GenerationUnsupportedFieldError("messages", "this generation adapter does not accept chat messages")
 
     def preflight_generate(
         self,

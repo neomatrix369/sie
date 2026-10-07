@@ -1593,6 +1593,9 @@ the upstream's Secret.
 {{- $_ := set $entry $field . -}}
 {{- end -}}
 {{- end -}}
+{{- with $upstream.equivalence -}}
+{{- $_ := set $entry "equivalence" (dict "max_age_s" (int64 .max_age_s) "record_files" .record_files) -}}
+{{- end -}}
 {{- if $upstream.api_key_secret -}}
 {{- $_ := set $entry "api_key_secret" (include "sie-cluster.upstream.keyEnvName" $name) -}}
 {{- end -}}
@@ -1669,6 +1672,53 @@ Args (dict): url, field, requireTls.
 {{- $loopback := or (eq (lower $host) "localhost") (eq $host "::1") (regexMatch (printf "^127\\.%s\\.%s\\.%s$" $octet $octet $octet) $host) -}}
 {{- if and .requireTls (hasPrefix "http://" $url) (not $loopback) -}}
 {{- fail (printf "%s must use https outside loopback" .field) -}}
+{{- end -}}
+{{- end }}
+
+{{/* The ConfigMap of equivalence evidence mounted into remote lanes, or "". */}}
+{{- define "sie-cluster.upstreams.evidenceConfigMap" -}}
+{{- $evidence := dig "remote" "equivalence" dict .Values.workers -}}
+{{- if kindIs "map" $evidence -}}
+{{- $name := dig "configMap" "" $evidence -}}
+{{- if kindIs "string" $name -}}{{- $name -}}{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/* Validate the worker-owned proof policy without repeating artifact paths. */}}
+{{- define "sie-cluster.upstreams.validateEquivalence" -}}
+{{- $policy := .upstream.equivalence -}}
+{{- $path := printf "%s.equivalence" .path -}}
+{{- if not (kindIs "invalid" $policy) -}}
+{{- if ne .upstream.kind "openai" -}}
+{{- fail (printf "%s requires kind openai" $path) -}}
+{{- end -}}
+{{- if not (kindIs "map" $policy) -}}
+{{- fail (printf "%s must map max_age_s and record_files" $path) -}}
+{{- end -}}
+{{- range $field, $_ := $policy -}}
+{{- if not (has $field (list "max_age_s" "record_files")) -}}
+{{- fail (printf "%s takes only max_age_s and record_files" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- $age := $policy.max_age_s -}}
+{{- if not (and (or (kindIs "int" $age) (kindIs "int64" $age) (kindIs "float64" $age)) (eq (float64 $age) (floor (float64 $age))) (gt (float64 $age) 0.0) (le (float64 $age) 604800.0)) -}}
+{{- fail (printf "%s.max_age_s must be an integer from 1 to 604800" $path) -}}
+{{- end -}}
+{{- $records := $policy.record_files -}}
+{{- if not (and (kindIs "map" $records) (ge (len $records) 1) (le (len $records) 256)) -}}
+{{- fail (printf "%s.record_files must map 1 to 256 model names to absolute file paths" $path) -}}
+{{- end -}}
+{{- range $name, $file := $records -}}
+{{- if not (and (kindIs "string" $name) (gt (len $name) 0) (le (len (splitList "" $name)) 256) (kindIs "string" $file) (gt (len $file) 0) (le (len (splitList "" $file)) 4096) (hasPrefix "/" $file)) -}}
+{{- fail (printf "%s record names must be bounded; file paths must be bounded and absolute" $path) -}}
+{{- end -}}
+{{- if $.evidenceMounted -}}
+{{- $key := trimPrefix "/etc/sie/equivalence/" $file -}}
+{{- if not (and (hasPrefix "/etc/sie/equivalence/" $file) (regexMatch "^[-._a-zA-Z0-9]{1,253}$" $key) (ne $key ".") (ne $key "..")) -}}
+{{- fail (printf "%s record files must be keys of workers.remote.equivalence.configMap, named /etc/sie/equivalence/<key>" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 
@@ -1769,6 +1819,22 @@ credential pasted as a key would otherwise be printed.
 {{- if not (kindIs "bool" $serving) -}}
 {{- fail "workers.remote.serving must be a boolean" -}}
 {{- end -}}
+{{- $evidence := dig "remote" "equivalence" dict $root.Values.workers -}}
+{{- if not (kindIs "map" $evidence) -}}
+{{- fail "workers.remote.equivalence must be a map with a configMap name" -}}
+{{- end -}}
+{{- range $field, $_ := $evidence -}}
+{{- if ne $field "configMap" -}}
+{{- fail "workers.remote.equivalence takes only configMap" -}}
+{{- end -}}
+{{- end -}}
+{{- $evidenceConfigMap := dig "configMap" "" $evidence -}}
+{{- if not (kindIs "string" $evidenceConfigMap) -}}
+{{- fail "workers.remote.equivalence.configMap must be a ConfigMap name" -}}
+{{- end -}}
+{{- if and $evidenceConfigMap (not (and (le (len $evidenceConfigMap) 253) (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" $evidenceConfigMap))) -}}
+{{- fail "workers.remote.equivalence.configMap must be a valid ConfigMap name" -}}
+{{- end -}}
 {{- $chartSecretKeys := list -}}
 {{- $hfCache := $root.Values.workers.common.hfCache | default dict -}}
 {{- with $hfCache.tokenSecret -}}
@@ -1861,14 +1927,15 @@ credential pasted as a key would otherwise be printed.
 {{- $fieldPosition := 0 -}}
 {{- range $field, $_ := $upstream -}}
 {{- $fieldPosition = add1 $fieldPosition -}}
-{{- if not (has $field (list "kind" "base_url" "api_key_secret" "rate_cap" "proxy_url" "endpoints" "set_params" "strip_params" "breaker")) -}}
-{{- fail (printf "%s: field %d, counting in name order, is not an upstream field; use kind, base_url, api_key_secret, rate_cap, proxy_url, endpoints, set_params, strip_params and breaker" $path $fieldPosition) -}}
+{{- if not (has $field (list "kind" "base_url" "api_key_secret" "rate_cap" "proxy_url" "endpoints" "set_params" "strip_params" "breaker" "equivalence")) -}}
+{{- fail (printf "%s: field %d, counting in name order, is not an upstream field; use kind, base_url, api_key_secret, rate_cap, proxy_url, endpoints, set_params, strip_params, breaker and equivalence" $path $fieldPosition) -}}
 {{- end -}}
 {{- end -}}
 {{- if not (has $upstream.kind (list "sie" "openai")) -}}
 {{- fail (printf "%s.kind must be sie or openai" $path) -}}
 {{- end -}}
 {{- include "sie-cluster.upstreams.validateOpenaiFields" (dict "upstream" $upstream "path" $path) -}}
+{{- include "sie-cluster.upstreams.validateEquivalence" (dict "upstream" $upstream "path" $path "evidenceMounted" (ne (include "sie-cluster.upstreams.evidenceConfigMap" $root) "")) -}}
 {{- include "sie-cluster.upstreams.validateUrl" (dict "url" $upstream.base_url "field" (printf "%s.base_url" $path) "requireTls" true) -}}
 {{- if not (kindIs "invalid" $upstream.proxy_url) -}}
 {{- include "sie-cluster.upstreams.validateUrl" (dict "url" $upstream.proxy_url "field" (printf "%s.proxy_url" $path) "requireTls" false) -}}

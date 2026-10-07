@@ -10,15 +10,19 @@ request off every remote profile.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import asyncio
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Header, HTTPException, Request, status
 
 from sie_server.api.helpers import SERVED_BY_HEADER, UPSTREAM_HEADER, ModelStateChecker, queue_full_exception
+from sie_server.config.hybrid_admission import hybrid_request_refusal
+from sie_server.config.routing import numerical_evidence_refusal
 from sie_server.config.upstreams import remote_serving_enabled
 from sie_server.core.loader import serves_remotely
+from sie_server.core.profile_identity import runtime_instance_id
 from sie_server.types.responses import ErrorCode
 
 if TYPE_CHECKING:
@@ -38,6 +42,8 @@ _OPENAI_ERROR_CODES = {
     "server_overloaded": ErrorCode.QUEUE_FULL.value,
     "invalid_request": ErrorCode.INVALID_INPUT.value,
 }
+# A remote route whose capacity is still starting gave no answer.
+_UNANSWERED_ERROR_CODES = {"PROVISIONING": ErrorCode.QUEUE_FULL.value}
 _TRIGGER_BY_REFUSAL: dict[str, FallbackTrigger] = {
     ErrorCode.MODEL_LOADING.value: "model_loading",
     ErrorCode.MODEL_NOT_LOADED.value: "model_loading",
@@ -92,6 +98,8 @@ def _fallback_error(status_code: int, code: object) -> str:
             return code.upper()
         if code in _OPENAI_ERROR_CODES:
             return _OPENAI_ERROR_CODES[code]
+        if code in _UNANSWERED_ERROR_CODES:
+            return _UNANSWERED_ERROR_CODES[code]
     if status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
         return ErrorCode.INFERENCE_ERROR.value
     return ErrorCode.INVALID_INPUT.value
@@ -136,6 +144,7 @@ async def remote_routing(
     try:
         yield
     except HTTPException as error:
+        error.headers = {**(error.headers or {}), "X-SIE-Runtime-Instance": runtime_instance_id()}
         refusal = fallback_refusal(request, error.status_code, error_code(error))
         if refusal is None:
             raise
@@ -150,6 +159,8 @@ async def route_request(
     serving_key: str | None = None,
     profile: object = None,
     queued_items: int | None = None,
+    request_options: Mapping[str, object] | None = None,
+    instruction: str | None = None,
 ) -> ServingRoute:
     """Choose the registry entry that serves a request for ``model``, and make it ready to serve.
 
@@ -159,8 +170,8 @@ async def route_request(
         span: Span for error attributes.
         serving_key: The entry that serves ``model`` locally when it is not
             ``model`` itself, such as a grammar-safe profile.
-        profile: The profile the request names in its options. A named
-            profile other than ``default`` is served as written.
+        profile: The profile the request explicitly names in its options.
+            Every named profile, including ``default``, is served as written.
         queued_items: Items the request adds to the model's queue. With it,
             the ``saturated`` trigger sees a full queue before submission.
 
@@ -170,7 +181,7 @@ async def route_request(
     registry: ModelRegistry = request.app.state.registry
     forbid = _remote_forbidden(request)
     ModelStateChecker(registry, model, span).check_exists()
-    routing = None if isinstance(profile, str) and profile != "default" else registry.get_config(model).routing
+    routing = None if isinstance(profile, str) else registry.get_config(model).routing
     key = serving_key or model
     config = registry.get_config(key)
     if serves_remotely(config):
@@ -195,15 +206,17 @@ async def route_request(
         trigger = _TRIGGER_BY_REFUSAL.get(error_code(refusal) or "")
         if trigger is None or trigger not in triggers:
             raise
-        return await _bridge(request, registry, model, key, routing, trigger, refusal, span)
+        return await _bridge(
+            request, registry, model, key, routing, trigger, refusal, span, request_options, instruction
+        )
     return ServingRoute(key=key)
 
 
 def _remote_forbidden(request: Request) -> bool:
-    value = request.headers.get(REMOTE_HEADER)
-    if value is None:
+    values = request.headers.getlist(REMOTE_HEADER)
+    if not values:
         return False
-    if value == _FORBID:
+    if values == [_FORBID]:
         return True
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
@@ -254,6 +267,8 @@ async def _bridge(
     trigger: FallbackTrigger,
     refusal: HTTPException,
     span: Span,
+    request_options: Mapping[str, object] | None = None,
+    instruction: str | None = None,
 ) -> ServingRoute:
     await registry.start_load_async(key, registry.device)
     remote_key = f"{model}:{routing.fallback_profile}"
@@ -266,6 +281,24 @@ async def _bridge(
         local_refusal=refusal,
     )
     span.set_attribute("fallback_reason", trigger)
+    config = registry.get_config(model)
+    if config.tasks.encode is not None or config.tasks.score is not None:
+        try:
+            if hybrid_request_refusal(config, request_options, instruction=instruction) is not None:
+                raise ValueError("hybrid request differs from its measured contract")
+            reason = await asyncio.to_thread(
+                numerical_evidence_refusal,
+                config,
+                device=registry.profile_execution_device(config.sie_id),
+                engine_config=registry.engine_config,
+            )
+            if reason is not None:
+                raise ValueError(reason)
+        except ValueError:
+            replacement = route.refusal_after(status.HTTP_503_SERVICE_UNAVAILABLE, ErrorCode.INFERENCE_ERROR.value)
+            if replacement is not None:
+                raise replacement from None
+            raise refusal from None
     try:
         await _ready_remote(registry, remote_key, span)
     except HTTPException as error:

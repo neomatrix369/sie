@@ -91,7 +91,7 @@ _IMMUTABLE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 def is_immutable_revision(revision: str | None) -> bool:
     """Return True when ``revision`` is a full 40-char git commit SHA (immutable)."""
-    return revision is not None and _IMMUTABLE_REVISION_RE.match(revision) is not None
+    return revision is not None and _IMMUTABLE_REVISION_RE.fullmatch(revision) is not None
 
 
 def lora_entry_ref(value: Any) -> tuple[str, str | None]:
@@ -1171,13 +1171,39 @@ class ModelConfig(BaseModel):
                 raise ValueError(msg)
 
         # KV-budget admission control. For models declaring
-        # ``tasks.generate``, every profile (after parent merge) must
-        # provide a positive ``kv_budget_tokens``. The actual
+        # ``tasks.generate``, every local profile (after parent merge) must
+        # provide a positive ``kv_budget_tokens``. Remote profiles hold no local KV cache. The actual
         # calibrated value lands in the calibration follow-up; until then operators may
         # carry a placeholder in YAML but missing/non-positive values
         # are a hard error pointing at the calibration deliverable.
         if self.tasks.generate is not None:
             for name, profile in self.profiles.items():
+                parent = self.profiles[profile.extends] if profile.extends is not None else None
+                effective_output_cap = (
+                    profile.max_output_tokens
+                    if profile.max_output_tokens is not None
+                    else parent.max_output_tokens
+                    if parent is not None
+                    else None
+                )
+                if effective_output_cap is not None:
+                    effective_loadtime = profile.adapter_options.loadtime or (
+                        parent.adapter_options.loadtime if parent is not None else {}
+                    )
+                    effective_context = effective_loadtime.get(
+                        "max_seq_length",
+                        self.tasks.generate.context_length,
+                    )
+                    if effective_output_cap > effective_context:
+                        msg = (
+                            f"Profile '{name}' on generation model '{self.sie_id}' sets "
+                            f"max_output_tokens={effective_output_cap}, exceeding its "
+                            f"context_length={effective_context}"
+                        )
+                        raise ValueError(msg)
+
+                if is_remote_adapter_path(self._declared_adapter_path(name)):
+                    continue
                 effective_budget: int | None
                 if profile.extends is not None:
                     parent = self.profiles[profile.extends]
@@ -1215,29 +1241,6 @@ class ModelConfig(BaseModel):
                     parent=self.profiles[profile.extends] if profile.extends is not None else None,
                 )
 
-                parent = self.profiles[profile.extends] if profile.extends is not None else None
-                effective_output_cap = (
-                    profile.max_output_tokens
-                    if profile.max_output_tokens is not None
-                    else parent.max_output_tokens
-                    if parent is not None
-                    else None
-                )
-                if effective_output_cap is not None:
-                    effective_loadtime = profile.adapter_options.loadtime or (
-                        parent.adapter_options.loadtime if parent is not None else {}
-                    )
-                    effective_context = effective_loadtime.get(
-                        "max_seq_length",
-                        self.tasks.generate.context_length,
-                    )
-                    if effective_output_cap > effective_context:
-                        msg = (
-                            f"Profile '{name}' on generation model '{self.sie_id}' sets "
-                            f"max_output_tokens={effective_output_cap}, exceeding its "
-                            f"context_length={effective_context}"
-                        )
-                        raise ValueError(msg)
         return self
 
     @model_validator(mode="after")

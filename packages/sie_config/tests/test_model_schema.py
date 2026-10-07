@@ -109,7 +109,8 @@ def test_partial_append_body_passes() -> None:
         "cyclic_parent",
     ],
 )
-def test_routing_guard_agrees_with_worker(case: str) -> None:
+def test_routing_guard_agrees_with_worker(case: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("SIE_IPC_SOCKET_PATH", str(tmp_path / "ipc.sock"))
     remote = {
         "adapter_path": "sie_server.adapters.remote.sie:SieUpstreamAdapter",
         "max_batch_tokens": 8192,
@@ -293,7 +294,7 @@ class TestConfigApiRejectsWorkerInvalidBodies:
         assert client.get("/v1/configs/models/acme/bert").status_code == 404
 
 
-def test_config_service_refuses_generation_fallback_before_remote_token_support() -> None:
+def test_config_service_accepts_generation_fallback_with_pre_output_handling() -> None:
     config = _model(
         hf_id="acme/bert",
         tasks={"generate": {"context_length": 8192, "max_output_tokens": 64}},
@@ -308,7 +309,5 @@ def test_config_service_refuses_generation_fallback_before_remote_token_support(
         },
         routing={"policy": "fallback", "fallback_profile": "remote"},
     )
-    with pytest.raises(ValueError, match="tokens"):
-        validate_model_routing(ModelConfig.model_validate(config))
-    with pytest.raises(ValueError, match=r"routing.*generate"):
-        validate_routing_config(config)
+    validate_model_routing(ModelConfig.model_validate(config))
+    validate_routing_config(config)

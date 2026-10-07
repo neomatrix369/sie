@@ -3,9 +3,11 @@ from typing import TYPE_CHECKING, Any, Literal
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from sie_server.config.equivalence import remote_profile_contract_digest
 from sie_server.config.model import ModelConfig, RoutingPolicy, is_remote_adapter_path
 from sie_server.config.upstreams import installed_upstreams
 from sie_server.core.model_suggestions import suggestion_suffix
+from sie_server.core.profile_identity import local_profile_identity, runtime_instance_id, serving_code_digest
 from sie_server.types.responses import ErrorCode
 
 if TYPE_CHECKING:
@@ -23,6 +25,14 @@ class ProfileInfo(BaseModel):
     """Information about a profile."""
 
     is_default: bool = False
+    identity: str | None = None
+    """Versioned immutable local-profile digest, or None when it cannot be identified."""
+    remote_contract_sha256: str | None = None
+    """Digest binding the model/profile to this server's operator-defined upstream."""
+    remote_execution_sha256: str | None = None
+    """Digest of the serving code that runs this remote profile in this process."""
+    runtime_instance_id: str | None = None
+    """Opaque identity of the serving process, for probe provenance."""
 
 
 class ModelLoadError(BaseModel):
@@ -194,6 +204,22 @@ def _resolve_capabilities(config: Any) -> ModelCapabilities | None:
     )
 
 
+def _profile_info(registry: "ModelRegistry | Any", name: str, config: ModelConfig, profile: str) -> ProfileInfo:
+    remote = is_remote_adapter_path(config.resolve_profile(profile).adapter_path)
+    return ProfileInfo(
+        is_default=(profile == "default"),
+        identity=local_profile_identity(
+            config,
+            profile,
+            device=registry.profile_execution_device(name if profile == "default" else f"{name}:{profile}") or "",
+            engine_config=registry.engine_config,
+        ),
+        remote_contract_sha256=remote_profile_contract_digest(config, profile, installed_upstreams()),
+        remote_execution_sha256=serving_code_digest() if remote else None,
+        runtime_instance_id=None if remote else runtime_instance_id(),
+    )
+
+
 class ModelsListResponse(BaseModel):
     """Response for listing models."""
 
@@ -215,12 +241,7 @@ async def list_models(http_request: Request) -> ModelsListResponse:
     models = []
     for name in registry.model_names:
         config = registry.get_config(name)
-        profiles = {
-            pname: ProfileInfo(
-                is_default=(pname == "default"),
-            )
-            for pname in config.profiles
-        }
+        profiles = {pname: _profile_info(registry, name, config, pname) for pname in config.profiles}
         state, last_error = _resolve_state_and_error(registry, name)
         models.append(
             ModelInfo(
@@ -271,12 +292,7 @@ async def get_model(model: str, http_request: Request) -> ModelInfo:
         )
 
     config = registry.get_config(model)
-    profiles = {
-        pname: ProfileInfo(
-            is_default=(pname == "default"),
-        )
-        for pname in config.profiles
-    }
+    profiles = {pname: _profile_info(registry, model, config, pname) for pname in config.profiles}
     state, last_error = _resolve_state_and_error(registry, model)
     return ModelInfo(
         name=config.sie_id,

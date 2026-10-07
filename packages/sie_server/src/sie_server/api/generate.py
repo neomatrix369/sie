@@ -78,8 +78,10 @@ from sie_server.adapters._generation_base import (
     suppress_thinking_blocks,
     thinking_blocks_must_be_hidden,
 )
+from sie_server.adapters.remote.sie import SieUpstreamAdapter
 from sie_server.api.helpers import ModelStateChecker, oom_retry_after_from_registry, read_bounded_request_body
 from sie_server.api.routing import remote_routing, route_request
+from sie_server.api.streaming_response import prefetched_sse_response
 from sie_server.api.validation import validate_machine_profile_header, validate_signed_i64
 from sie_server.core.grammar_routing import resolve_grammar_serving_model
 from sie_server.core.runtime_options import (
@@ -691,9 +693,12 @@ def _generation_http_exception(error: GenerationError, registry: ModelRegistry |
             code=client_safe_generation_error_code(error.code),
         )
     if isinstance(error, GenerationCapacityError):
-        retry_after = (
-            "5" if isinstance(error, GenerationDrainingError) else str(oom_retry_after_from_registry(registry))
-        )
+        if error.retry_after_s is not None:
+            retry_after = str(error.retry_after_s)
+        elif isinstance(error, GenerationDrainingError):
+            retry_after = "5"
+        else:
+            retry_after = str(oom_retry_after_from_registry(registry))
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
@@ -776,6 +781,7 @@ async def _stream_generate_events(
     generation_parameters: dict[str, Any] | None = None,
     preflight_result: GenerationPreflightResult | None = None,
     oom_retry_after_s: int = 5,
+    pre_output_errors: bool = False,
 ) -> AsyncIterator[str]:
     """Yield SIE-native ``GenerateChunk`` SSE lines for ``SIEClient.stream_generate``.
 
@@ -845,6 +851,8 @@ async def _stream_generate_events(
                         "code": client_safe_generation_error_code(chunk.error_code),
                         "message": client_safe_generation_error_message(chunk.error_code, chunk.error_message),
                     }
+                if pre_output_errors and seq == 0 and (terminal_error is not None or finish_reason == "cancelled"):
+                    break
                 if chunk.prompt_tokens is not None:
                     prompt_tokens = chunk.prompt_tokens
                 if chunk.completion_tokens is not None:
@@ -881,6 +889,8 @@ async def _stream_generate_events(
             yield f"data: {json.dumps(event)}\n\n"
     except GenerationError as exc:
         terminal_outcome_selected = True
+        if pre_output_errors and seq == 0:
+            raise _generation_http_exception(exc) from exc
         logger.info("stream_generate refused after preflight: %s", exc)
         error: dict[str, Any] = {
             "code": client_safe_generation_error_code(exc.code),
@@ -888,14 +898,17 @@ async def _stream_generate_events(
         }
         if (param := client_safe_generation_error_param(exc)) is not None:
             error["param"] = param
+        retry_after_s = exc.retry_after_s if isinstance(exc, GenerationCapacityError) else None
+        if retry_after_s is None:
+            retry_after_s = oom_retry_after_s
         if (
             isinstance(exc, GenerationCapacityError)
-            and not isinstance(exc, GenerationDrainingError)
-            and isinstance(oom_retry_after_s, int)
-            and not isinstance(oom_retry_after_s, bool)
-            and 1 <= oom_retry_after_s <= _MAX_RETRY_AFTER_S
+            and (not isinstance(exc, GenerationDrainingError) or exc.retry_after_s is not None)
+            and isinstance(retry_after_s, int)
+            and not isinstance(retry_after_s, bool)
+            and 1 <= retry_after_s <= _MAX_RETRY_AFTER_S
         ):
-            error["retry_after_s"] = oom_retry_after_s
+            error["retry_after_s"] = retry_after_s
         err = {
             "request_id": request_id,
             "seq": seq,
@@ -909,6 +922,11 @@ async def _stream_generate_events(
         return
     except Exception:  # noqa: BLE001 — surface as a terminal error chunk, never 500 mid-stream
         terminal_outcome_selected = True
+        if pre_output_errors and seq == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "inference_error", "message": "internal error during generation"},
+            ) from None
         logger.warning("stream_generate failed mid-stream", exc_info=True)
         err = {
             "request_id": request_id,
@@ -953,6 +971,15 @@ async def _stream_generate_events(
             "code": "inference_error",
             "message": "generation stream ended before a terminal event",
         }
+
+    if pre_output_errors and seq == 0:
+        if terminal_error is not None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=terminal_error)
+        if finish_reason == "cancelled":
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"code": "generation_cancelled", "message": "generation was cancelled before completion"},
+            )
 
     usage: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
@@ -1233,7 +1260,14 @@ async def generate(
 
         # Do not start a potentially expensive model load until the complete
         # request has passed validation.
-        route = await route_request(http_request, registry_key, span, serving_key=serving_key)
+        options = body.get("options")
+        route = await route_request(
+            http_request,
+            registry_key,
+            span,
+            serving_key=serving_key,
+            profile=options.get("profile") if isinstance(options, dict) else None,
+        )
         adapter = registry.get(route.key)
         registry.touch_lru(route.key)
         if not isinstance(adapter, GenerationAdapter):
@@ -1242,9 +1276,13 @@ async def generate(
                 code=ErrorCode.MODEL_NOT_FOUND.value,
             )
         reasoning_format = resolve_reasoning_format(config, adapter)
-        thinking_starts_in_prompt = suppress_thinking and reasoning_starts_in_prompt(
-            generation_prompt,
-            reasoning_format,
+        thinking_starts_in_prompt = (
+            suppress_thinking
+            and not isinstance(adapter, SieUpstreamAdapter)
+            and reasoning_starts_in_prompt(
+                generation_prompt,
+                reasoning_format,
+            )
         )
 
         generation_parameters = _native_adapter_generate_parameters(
@@ -1281,34 +1319,35 @@ async def generate(
             ) from exc
 
         if stream_raw:
-            return StreamingResponse(
-                _stream_generate_events(
-                    adapter,
-                    prompt=generation_prompt,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    frequency_penalty=frequency_penalty,
-                    presence_penalty=presence_penalty,
-                    seed=seed,
-                    logit_bias=logit_bias,
-                    top_k=top_k,
-                    min_new_tokens=min_new_tokens,
-                    grammar=grammar,
-                    logprobs=logprobs,
-                    top_logprobs=top_logprobs,
-                    suppress_thinking=suppress_thinking,
-                    thinking_starts_in_prompt=thinking_starts_in_prompt,
-                    reasoning_format=reasoning_format,
-                    images=images,
-                    generation_parameters=generation_parameters,
-                    preflight_result=preflight_result,
-                    oom_retry_after_s=oom_retry_after_from_registry(registry),
-                ),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **route.headers()},
+            iterator = _stream_generate_events(
+                adapter,
+                prompt=generation_prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                frequency_penalty=frequency_penalty,
+                presence_penalty=presence_penalty,
+                seed=seed,
+                logit_bias=logit_bias,
+                top_k=top_k,
+                min_new_tokens=min_new_tokens,
+                grammar=grammar,
+                logprobs=logprobs,
+                top_logprobs=top_logprobs,
+                suppress_thinking=suppress_thinking,
+                thinking_starts_in_prompt=thinking_starts_in_prompt,
+                reasoning_format=reasoning_format,
+                images=images,
+                generation_parameters=generation_parameters,
+                preflight_result=preflight_result,
+                oom_retry_after_s=oom_retry_after_from_registry(registry),
+                pre_output_errors=route.upstream is not None,
             )
+            headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **route.headers()}
+            if route.upstream is not None:
+                return await prefetched_sse_response(iterator, headers=headers)
+            return StreamingResponse(iterator, media_type="text/event-stream", headers=headers)
 
         try:
             # ``adapter.generate`` is an async iterator. The
