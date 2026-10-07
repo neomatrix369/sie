@@ -9,7 +9,7 @@ dashboard only — they never start SIE.
 ## Happy path — remote gateway (recommended)
 
 Finish [Getting started](./getting-started.md) first so `:8001` is up and
-`MONGODB_URI` is exported for the host CLI.
+`MONGODB_ATLAS_LOCAL_URI` is exported for the host CLI.
 
 In the project `.env`:
 
@@ -30,14 +30,14 @@ docker compose up -d --force-recreate server
 ```
 
 Load only SIE vars into the **current shell** before gateway curls (do not
-`source .env` wholesale — that overwrites the host CLI `MONGODB_URI` export
+`source .env` wholesale — that overwrites the host CLI `MONGODB_ATLAS_LOCAL_URI` export
 from [Getting started](./getting-started.md) with the Atlas placeholder):
 
 ```bash
 export SIE_ENABLED=true
 export SIE_ENDPOINT=https://your-sie-gateway.example.com
 export SIE_API_KEY=your_gateway_token
-# keep the earlier MONGODB_URI export for Atlas Local host CLI
+# keep the earlier MONGODB_ATLAS_LOCAL_URI export for Atlas Local host CLI
 ```
 
 ### Readiness checks
@@ -50,10 +50,12 @@ curl --connect-timeout 5 --max-time 15 \
 # → ok
 ```
 
-**2. Model can encode** — accept only HTTP **200**; retry **503** (warm-up);
+**2. Model can encode** — accept only HTTP **200**; retry **503** (warm-up) and
+**504** (gateway timeout, retryable with `Retry-After: 5`);
 stop on terminal failures (e.g. **502**, **401**):
 
 ```bash
+(
 attempts=0
 # 60 attempts × (up to 30s request + 10s sleep) ≈ 40 minutes worst case —
 # first-run model download/load can exceed a short 10-minute budget.
@@ -67,7 +69,7 @@ while true; do
     -d '{"items":[{"text":"readiness probe"}]}' || true)
   case "$code" in
     200) echo "SIE encode ready"; break ;;
-    503) echo "SIE warm-up ($attempts/$max_attempts) — waiting 10s..." ;;
+    503|504) echo "SIE warm-up ($attempts/$max_attempts) — waiting 10s..." ;;
     000) echo "SIE unreachable ($attempts/$max_attempts) — waiting 10s..." ;;
     *) echo "SIE encode failed with HTTP $code — abort"; exit 1 ;;
   esac
@@ -77,6 +79,7 @@ while true; do
   fi
   sleep 10
 done
+)
 ```
 
 **3. App sees SIE:**
@@ -114,9 +117,10 @@ Compare results in the dashboard at **http://localhost:5374**.
 
 ## Alternate — self-hosted Docker
 
-Use when you have no remote gateway. Needs Docker, disk for model weights, and
-**requires** `HF_TOKEN` on the **SIE container** for Hugging Face weight
-downloads during warm-up (not used for app routing).
+Use when you have no remote gateway. Needs Docker and disk for model weights.
+`HF_TOKEN` on the **SIE container** is optional for the models in
+`example-sie.yaml` (a token gets higher Hugging Face rate limits) and required
+for gated models such as `naver/splade-v3`. It is not used for app routing.
 
 Typical host endpoint:
 
