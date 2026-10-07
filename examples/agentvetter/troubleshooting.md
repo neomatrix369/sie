@@ -34,7 +34,7 @@ MVP Live only needs Supabase + Modal.
 ## Model Studio never runs (no Alibaba calls)
 
 Expected unless SIE escalates. Keys must still be present for route config; check
-`DASHSCOPE_*` / region endpoint in [model-studio-setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/model-studio-setup.md).
+`DASHSCOPE_*` / region endpoint in [Model Studio setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-b--alibaba-cloud-model-studio-escalation-only).
 
 ## Still stuck?
 
