@@ -54,7 +54,7 @@ Before the host CLI / SIE handoff, export the URI the startup script printed
 
 ```bash
 # value also printed by ./start-services.sh --mongodb-local
-export MONGODB_URI="mongodb://localhost:27017/rag_params_finder?directConnection=true"
+export MONGODB_ATLAS_LOCAL_URI="mongodb://localhost:27017/rag_params_finder?directConnection=true"
 ```
 
 Then wire SIE and run one sweep: [SIE integration](./sie-integration.md).
