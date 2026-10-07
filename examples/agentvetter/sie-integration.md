@@ -74,7 +74,7 @@ Look for pathway strips (Scan → SIE → …) and filters (**Escalated** / **SI
 ## Model Studio (required for route config; used on escalate)
 
 Follow Part B in
-[model-studio-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/model-studio-setup.md)
+[tiered-router-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-b--alibaba-cloud-model-studio-escalation-only)
 before expecting pathway strips (ignore any “optional” wording there for
 routing). Review billing/quotas first. Alibaba calls run only when SIE
 escalates; missing MS keys still cause auto-route to skip today.
