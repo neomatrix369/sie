@@ -2,8 +2,8 @@
 
 Short FAQ for gallery readers. Full guides (upstream may still call Model Studio
 “optional” — prefer [SIE integration](./sie-integration.md) for routing keys):
-[sie-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/sie-setup.md),
-[model-studio-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/model-studio-setup.md),
+[SIE setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-a--superlinked-sie-required-for-routing),
+[Model Studio setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-b--alibaba-cloud-model-studio-escalation-only),
 [setup-commands — when it fails](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/setup-commands.md#when-it-fails),
 [env-vars.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/env-vars.md).
 
