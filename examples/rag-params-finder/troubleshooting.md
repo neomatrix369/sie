@@ -16,7 +16,9 @@ Short FAQ for gallery readers. Full tables and recovery steps:
 - Gateway auth: set `SIE_API_KEY` and use `Authorization: Bearer …` on `/healthz`
 - Local Docker: SIE not running, still warming up, or server-in-Docker needs
   `http://host.docker.internal:8720`
-- Encode still returning **503** during model load — wait until encode returns **200**
+- Encode still returning **503** during model load: wait until encode returns **200**
+- Encode returning **502**: the model failed to load, so stop waiting and see
+  [502 Bad Gateway](https://github.com/neomatrix369/rag-params-finder/blob/main/docs/user-guide/sie-setup.md#encode-returns-502-bad-gateway)
 
 ## Sweep with `provider: sie` fails immediately
 
