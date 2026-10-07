@@ -34,7 +34,7 @@ hosted SIE → `agentvetter route` (or auto-route after scan).
 
 **Canonical docs in the project** (prefer gallery pages above for routing prereqs):
 [QUICKSTART](https://github.com/neomatrix369/AgentVetter/blob/main/QUICKSTART.md) ·
-[SIE setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/sie-setup.md) ·
+[SIE setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-a--superlinked-sie-required-for-routing) ·
 [docs hub](https://github.com/neomatrix369/AgentVetter/blob/main/docs/README.md)
 
 ## Ports cheat sheet
