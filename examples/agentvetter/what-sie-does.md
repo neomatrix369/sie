@@ -6,8 +6,8 @@ in one dashboard. **SIE is a post-scan tiered router**, not part of the core
 scan path.
 
 **Upstream deep-links:**
-[sie-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/sie-setup.md) ·
-[model-studio-setup.md](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/model-studio-setup.md) ·
+[SIE setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-a--superlinked-sie-required-for-routing) ·
+[Model Studio setup](https://github.com/neomatrix369/AgentVetter/blob/main/docs/user-guide/tiered-router-setup.md#part-b--alibaba-cloud-model-studio-escalation-only) ·
 [ADR-0016](https://github.com/neomatrix369/AgentVetter/blob/main/docs/adr/0016-tiered-router-sie-model-studio.md).
 Those setup pages may still label Model Studio as optional; for current CLI
 routing prerequisites use [SIE integration](./sie-integration.md).
