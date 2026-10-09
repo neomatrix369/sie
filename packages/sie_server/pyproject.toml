@@ -1,6 +1,6 @@
 [project]
 name = "sie-server"
-version = "0.9.0"
+version = "0.10.0"
 description = "Search Inference Engine - GPU inference server for search workloads"
 requires-python = ">=3.12,<3.13"
 license = { text = "Apache-2.0" }
@@ -116,6 +116,8 @@ dependencies = [
     # `sie_server.core.preprocessor.text.TextPreprocessor`.
     "blake3>=0.4,<1",
     "python-multipart>=0.0.20,<1",
+    "threadpoolctl>=3.6.0",
+    "httpcore>=1.0.7,<2",
 ]
 
 [project.optional-dependencies]

@@ -20,15 +20,20 @@ codes ``MODEL_LOAD_FAILED``, ``ACCOUNT_STATE_UNAVAILABLE`` and
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+import re
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 import httpx
 from sie_sdk._msgpack import unpackb
 
+from sie_server.adapters._generation_base import GenerationCapacityError, GenerationDrainingError, GenerationError
 from sie_server.adapters.errors import (
     RETRY_AFTER_MAX_S,
     RETRY_AFTER_MIN_S,
@@ -36,13 +41,13 @@ from sie_server.adapters.errors import (
     UpstreamUnavailableError,
 )
 from sie_server.adapters.remote._limits import upstream_limiter
-from sie_server.config.upstreams import UpstreamCredentialError
+from sie_server.config.upstreams import UpstreamCredentialError, upstream_for_serving
 from sie_server.core.upstream_client import UpstreamRedirectRefusedError
+from sie_server.core.upstream_deadline import DEADLINE_EXTENSION
 from sie_server.types.inputs import InvalidInputError
 
 DEFAULT_RETRY_AFTER_S = 5
 _ERROR_BODY_MAX_BYTES = 64 << 10
-
 _NOT_READY_CODES = frozenset({"MODEL_LOADING", "PROVISIONING", "LORA_LOADING"})
 _BUSY_CODES = frozenset({"QUEUE_FULL", "RESOURCE_EXHAUSTED", "BILLING_CAPACITY_UNAVAILABLE"})
 _BUSY_WITH_RETRY_AFTER_CODES = frozenset({"QUEUE_UNAVAILABLE", "transport_failure"})
@@ -97,6 +102,7 @@ def send_bounded(
 
 
 def _send(client: httpx.Client, request: httpx.Request, *, upstream: str, max_bytes: int, deadline: float) -> bytes:
+    request.extensions[DEADLINE_EXTENSION] = deadline
     try:
         response = client.send(request, stream=True)
     except UpstreamCredentialError:
@@ -149,8 +155,110 @@ def failure_for_transport_error(exc: httpx.HTTPError, *, upstream: str) -> Excep
     if isinstance(exc, httpx.TransportError) and not isinstance(
         exc, httpx.UnsupportedProtocol | httpx.LocalProtocolError
     ):
-        return UpstreamUnavailableError(upstream, "unavailable", retry_after_s=DEFAULT_RETRY_AFTER_S, reason=failed)
+        return UpstreamUnavailableError(
+            upstream,
+            "unavailable",
+            retry_after_s=DEFAULT_RETRY_AFTER_S,
+            reason=failed,
+        )
     return RemoteUpstreamError(f"upstream {failed}")
+
+
+@asynccontextmanager
+async def open_stream(
+    client: httpx.AsyncClient, request: httpx.Request, *, upstream: str, error_body_timeout_s: float
+) -> AsyncIterator[httpx.Response]:
+    """Send ``request`` to ``upstream`` and hold its streamed answer open for the block.
+
+    The call goes through the upstream's limiter, whose slot is held until the
+    block ends. The answer is a success with an uncompressed body, which the
+    block reads. Failures raise as :func:`send_bounded` describes, including a
+    connection lost while the block reads. Leaving the block closes the answer,
+    which cancels work still running upstream.
+    """
+    upstream_for_serving(upstream)
+    with upstream_limiter(upstream).call():
+        try:
+            timeouts = {**client.timeout.as_dict(), **request.extensions.get("timeout", {})}
+            # Include pool/connect/write allowances as well as the effective
+            # read override; acquire headers once under a finite envelope.
+            header_timeout = (
+                sum(value for value in timeouts.values() if value is not None) if timeouts["read"] is not None else None
+            )
+            async with asyncio.timeout(header_timeout):
+                response = await client.send(request, stream=True)
+        except TimeoutError:
+            raise failure_for_transport_error(
+                httpx.ReadTimeout("upstream response headers exceeded the deadline"), upstream=upstream
+            ) from None
+        except UpstreamCredentialError:
+            raise RemoteUpstreamError("the upstream credential is unavailable") from None
+        except httpx.HTTPError as exc:
+            raise failure_for_transport_error(exc, upstream=upstream) from None
+        try:
+            if response.status_code >= 400:
+                raise failure_for_status(
+                    response.status_code,
+                    upstream_error_code(
+                        response.headers, await _read_error_body_async(response, timeout_s=error_body_timeout_s)
+                    ),
+                    parse_retry_after(response.headers.get("retry-after")),
+                    upstream=upstream,
+                )
+            if _is_compressed(response):
+                raise RemoteUpstreamError("upstream sent a compressed body, which is refused")
+            yield response
+        except httpx.HTTPError as exc:
+            raise failure_for_transport_error(exc, upstream=upstream) from None
+        finally:
+            await response.aclose()
+
+
+async def sse_data(response: httpx.Response, *, max_event_bytes: int, max_total_bytes: int) -> AsyncIterator[bytes]:
+    """Read bounded SSE events, scanning new bytes once and dispatching CR immediately."""
+    pending = bytearray()
+    data: list[bytes] = []
+    event_bytes = received = 0
+    skip_lf = False
+    async for chunk in response.aiter_raw():
+        received += len(chunk)
+        if received > max_total_bytes:
+            raise RemoteUpstreamError("upstream stream exceeds the size limit")
+        start = 0
+        if skip_lf and chunk:
+            start = int(chunk[0] == 10)
+            skip_lf = False
+        origin = start
+        for ending in re.finditer(rb"\r\n?|\n", chunk[origin:]):
+            end = origin + ending.start()
+            # CRLF is one line ending, including when split across chunks.
+            pending.extend(chunk[start:end])
+            event_bytes += len(pending) + 1
+            if event_bytes > max_event_bytes:
+                raise RemoteUpstreamError("upstream sent an event over the size limit")
+            line = bytes(pending)
+            pending.clear()
+            next_start = origin + ending.end()
+            start = next_start
+            skip_lf = next_start == len(chunk) and chunk[next_start - 1] == 13
+            if not line:
+                if data:
+                    yield b"\n".join(data)
+                data, event_bytes = [], 0
+            else:
+                field, _, value = line.partition(b":")
+                if field == b"data":
+                    data.append(value.removeprefix(b" "))
+        pending.extend(chunk[start:])
+        if event_bytes + len(pending) > max_event_bytes:
+            raise RemoteUpstreamError("upstream sent an event over the size limit")
+
+
+def generation_error(error: UpstreamUnavailableError) -> GenerationError:
+    """Map an upstream failure before output to a retryable 503 with its wait."""
+    if error.kind == "not_ready":
+        return GenerationDrainingError("the upstream is not ready, please retry", retry_after_s=error.retry_after_s)
+    return GenerationCapacityError(f"the upstream is {error.kind}, please retry", retry_after_s=error.retry_after_s)
 
 
 def upstream_error_code(headers: httpx.Headers, body: bytes) -> str | None:
@@ -233,6 +341,23 @@ def _read_body(response: httpx.Response, *, upstream: str, max_bytes: int, deadl
                 reason="the response exceeded the deadline",
             )
         chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _read_error_body_async(response: httpx.Response, *, timeout_s: float) -> bytes:
+    if _is_compressed(response):
+        return b""
+    chunks: list[bytes] = []
+    size = 0
+    try:
+        async with asyncio.timeout(timeout_s):
+            async for chunk in response.aiter_raw():
+                size += len(chunk)
+                if size > _ERROR_BODY_MAX_BYTES:
+                    return b""
+                chunks.append(chunk)
+    except (httpx.HTTPError, TimeoutError):
+        return b""
     return b"".join(chunks)
 
 

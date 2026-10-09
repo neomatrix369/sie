@@ -92,6 +92,11 @@ export type {
   CapacityInfo,
   ClusterSummary,
   ClusterWorkerInfo,
+  NumericalProcessInventory,
+  NumericalProcessObservation,
+  NumericalProfileSnapshot,
+  NumericalProfileObservation,
+  NumericalAdmissionObservation,
   ModelSummary,
   ServerInfo,
   GPUMetrics,
@@ -157,6 +162,10 @@ export type {
   AppliedRate,
   RateIdentity,
   CostEstimate,
+  // Model recommendation (client.recommend)
+  RecommendOptions,
+  RecommendedChoice,
+  Recommendation,
 } from "./types.js";
 
 // Utility functions

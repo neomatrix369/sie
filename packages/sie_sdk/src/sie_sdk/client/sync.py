@@ -136,6 +136,7 @@ from ._shared import (
     base_url_accepts_origin_credentials,
     build_chat_body,
     build_estimate_envelope,
+    build_recommend_body,
     build_responses_body,
     cached_prompt_tokens_from_usage,
     check_version_skew,
@@ -294,6 +295,12 @@ def _close_transport(transport: httpx.Client) -> None:
         transport.close()
 
 
+def _confine_injected_client_origin(request: httpx.Request, *, base_url: str) -> None:
+    """Keep a configured transport's credentials on its intended origin."""
+    if not request_matches_base_url_origin(base_url, str(request.url)):
+        raise httpx.RequestError("configured HTTP client refused a different origin", request=request)
+
+
 def _attach_origin_scoped_headers(
     request: httpx.Request,
     *,
@@ -428,6 +435,15 @@ class SIEClient:
             while it loads, and a model served only remotely answers ``400``.
             ``None`` (default) leaves the choice to the model's routing policy.
             The setting applies to every call made with this client.
+        http_client: Optional configured synchronous HTTP client for custom
+            transports, proxy/TLS policy, or dynamic authentication. Its base
+            URL must match ``base_url`` exactly and redirects must be disabled.
+            SDK headers are added and requests stay confined to the gateway
+            origin; a control plane on another origin is unavailable with this
+            option. Existing hooks, authentication, and transport settings are
+            preserved. Pass ``api_key=""`` to avoid SDK environment credentials
+            when the HTTP client supplies its own authentication. The SDK owns
+            and closes this client; do not share it with another owner.
 
     Example:
         >>> client = SIEClient("http://localhost:8080")
@@ -469,6 +485,7 @@ class SIEClient:
         connect_timeout_s: float | None = None,
         read_timeout_s: float | None = None,
         remote: Literal["forbid"] | None = None,
+        http_client: httpx.Client | None = None,
     ) -> None:
         base_url = resolve_base_url(base_url)
         api_key = resolve_api_key(api_key, base_url, control_plane_url)
@@ -545,7 +562,21 @@ class SIEClient:
                 max_connections=max_connections,
                 max_keepalive_connections=max_connections,
             )
-        self._client = httpx.Client(**client_kwargs)
+        if http_client is None:
+            self._client = httpx.Client(**client_kwargs)
+        else:
+            if str(http_client.base_url).rstrip("/") != str(httpx.URL(self._base_url)).rstrip("/"):
+                raise ValueError("http_client base URL must match base_url")
+            if http_client.is_closed or http_client.follow_redirects:
+                raise ValueError("http_client must be open with redirects disabled")
+            if max_connections is not None:
+                raise ValueError("configure connection limits on http_client instead")
+            if self._control_plane_url and not request_matches_base_url_origin(self._base_url, self._control_plane_url):
+                raise ValueError("http_client cannot serve a control plane on another origin")
+            http_client.headers.update(headers)
+            http_client.event_hooks["request"].append(partial(_confine_injected_client_origin, base_url=self._base_url))
+            http_client.event_hooks["request"].extend(client_kwargs.get("event_hooks", {}).get("request", []))
+            self._client = http_client
         # Per-thread request evidence lets benchmark callers account for SDK
         # retries without changing normal response payloads.
         self._request_state = threading.local()
@@ -1216,7 +1247,7 @@ class SIEClient:
             is_query: Whether this is a query embedding (vs document). Affects some models
                      that use asymmetric encoding (e.g., BGE, E5). Default: None (model default).
             options: Runtime options dict. Can include "profile" to select a named profile,
-                    or individual options like "muvera", "normalize", etc.
+                    or individual options like "muvera", "smve", "normalize", etc.
             gpu: Target GPU type (e.g., "l4", "a100-80gb"). Routes request to workers
                 with matching GPU. Required when using the gateway with multiple GPU pools.
             wait_for_capacity: When True (default), auto-retry transient "not
@@ -1726,7 +1757,13 @@ class SIEClient:
 
         return cast("CostEstimate", response.json())
 
-    def recommend(self, task: str, *, timeout: float | None = None) -> Recommendation:
+    def recommend(
+        self,
+        task: str,
+        *,
+        target_language: str | None = None,
+        timeout: float | None = None,
+    ) -> Recommendation:
         """Ask which model to use for a task family (``POST /v1/recommend``).
 
         Read-only and non-billable: no dispatch, no reservation, no credits.
@@ -1745,6 +1782,13 @@ class SIEClient:
         Args:
             task: A catalog task family id, e.g. ``"rerank"``. A 404 names
                 every id this release recommends for.
+            target_language: Optional exact locale code of the language you
+                want output in, e.g. ``"ja_JP"``. When the release compared
+                the family's choices for that language, ``best`` is that
+                language's winner and the answer adds ``target_language`` and
+                ``language_evidence_ref``. Any other value, including another
+                spelling such as ``"ja-JP"``, returns the answer you would get
+                without it. Omit it for the language-independent answer.
             timeout: Per-call timeout override in seconds.
 
         Returns:
@@ -1755,8 +1799,9 @@ class SIEClient:
             200 with its evidence and no picks.
 
         Raises:
-            RequestError: 400 for an empty or malformed ``task``; 404 when the
-                task family is unknown to this release.
+            RequestError: 400 for an empty or malformed ``task`` or a
+                non-string ``target_language``; 404 when the task family is
+                unknown to this release.
             SIEConnectionError: If unable to connect to the server.
             ServerError: For other 5xx responses.
 
@@ -1766,6 +1811,9 @@ class SIEClient:
             'rerank-best'
             >>> pick["basis"]
             'ranked'
+            >>> pick = client.recommend("translation", target_language="ja_JP")
+            >>> pick["target_language"]
+            'ja_JP'
         """
         # Same reason every other public method opens with this: without it the
         # call inherits the previous call's retry/revision state on this thread.
@@ -1773,7 +1821,7 @@ class SIEClient:
         try:
             response = self._client.post(
                 RECOMMEND_PATH,
-                json={"task": task},
+                json=build_recommend_body(task, target_language),
                 headers={
                     "Accept": JSON_CONTENT_TYPE,
                     "Content-Type": JSON_CONTENT_TYPE,
@@ -2696,6 +2744,7 @@ class SIEClient:
                     status_code=response.status_code,
                     param=get_error_param(response),
                     request=parse_request_metadata(response.headers),
+                    retry_after=get_retry_after(response),
                 )
 
             if response.status_code >= HTTP_CLIENT_ERROR:

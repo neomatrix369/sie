@@ -19,7 +19,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Collection, Coroutine, Iterable
+from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +53,7 @@ from sie_server.core.memory import MemoryConfig, MemoryManager
 from sie_server.core.model_loader import DEFAULT_MAX_LORAS, LoadedModel, ModelLoader
 from sie_server.core.oom import is_oom_error
 from sie_server.core.pool_isolation import (
+    counts_toward_pool_isolation,
     validate_no_legacy_scalar_lora_id,
     validate_pool_isolation,
 )
@@ -331,6 +332,13 @@ class ModelRegistry:
         self._model_load_locks: dict[str, asyncio.Lock] = {}
         self._load_admission_lock: asyncio.Lock | None = None
         self._config_update_lock: asyncio.Lock | None = None
+        # Independent of the load locks: inference can lazily load a model
+        # while holding a shared lease. Config writers enter before taking
+        # any load/config lock, so they cannot deadlock those readers.
+        self._execution_condition = asyncio.Condition()
+        self._execution_readers = 0
+        self._execution_writer = False
+        self._execution_writers_waiting = 0
         self._unload_done: dict[str, asyncio.Event] = {}
         # Async lifecycle state is owned by one long-lived server event loop.
         # Legacy synchronous callers are serialized independently until that
@@ -547,6 +555,12 @@ class ModelRegistry:
         from sie_sdk.storage import is_cloud_path
 
         all_configs = load_model_configs(models_dir)
+        prospective = {
+            name: config
+            for name, config in all_configs.items()
+            if (self._model_filter is None or name in self._model_filter) and self.accepts_config_pool(config)
+        }
+        self._check_sync_config_replacement(prospective)
 
         # Apply model filter if specified
         if self._model_filter is not None:
@@ -583,7 +597,9 @@ class ModelRegistry:
         for name, config in self._configs.items():
             validate_no_legacy_scalar_lora_id(name=name, config=config)
             validate_profile_upstreams(config)
-            validate_model_routing(config)
+            validate_model_routing(
+                config, device=self.profile_execution_device(config.sie_id), engine_config=self._engine_config
+            )
 
         self._config_version += 1
 
@@ -626,6 +642,7 @@ class ModelRegistry:
         Returns:
             List of newly discovered model names.
         """
+        self._check_sync_config_mutation()
         if self._models_dir is None:
             return []
 
@@ -701,6 +718,24 @@ class ModelRegistry:
     def devices(self) -> list[str]:
         """Return concrete devices available for whole-model placement."""
         return list(self._devices)
+
+    def profile_execution_device(self, name: str) -> str | None:
+        """Return a stable concrete identity device, or refuse movable placement.
+
+        Hybrid proof currently supports one configured device. A loaded model
+        outside that placement cannot borrow the configured device's proof.
+        """
+        if len(self._devices) != 1:
+            return None
+        device = self._devices[0]
+        if self._resolve_load_device(self._device) != device:
+            return None
+        if _device_family(device) == "cuda" and (":" not in device or not device.partition(":")[2].isdigit()):
+            return None
+        loaded = self._loaded.get(name)
+        if loaded is not None and loaded.device != device:
+            return None
+        return device
 
     def _memory_manager_for_device(self, device: str) -> MemoryManager:
         manager = self._memory_managers.get(device)
@@ -1236,6 +1271,70 @@ class ModelRegistry:
         if self._config_update_lock is None:
             self._config_update_lock = asyncio.Lock()
         return self._config_update_lock
+
+    @contextlib.asynccontextmanager
+    async def execution_lease(self) -> AsyncIterator[None]:
+        """Pin configuration through an IPC execution, allowing concurrent readers.
+
+        Writers have priority once queued. Loading/eviction may proceed under
+        a lease, but the selected configuration cannot change until it ends.
+        """
+        self._bind_lifecycle_loop()
+        async with self._execution_condition:
+            await self._execution_condition.wait_for(
+                lambda: not self._execution_writer and self._execution_writers_waiting == 0
+            )
+            self._execution_readers += 1
+        try:
+            yield
+        finally:
+            async with self._execution_condition:
+                self._execution_readers -= 1
+                self._execution_condition.notify_all()
+
+    @contextlib.asynccontextmanager
+    async def _config_mutation_lease(self) -> AsyncIterator[None]:
+        """Wait within the drain budget before changing pinned configuration."""
+        self._bind_lifecycle_loop()
+        async with self._execution_condition:
+            self._execution_writers_waiting += 1
+            try:
+                try:
+                    async with asyncio.timeout(self._drain_timeout_s):
+                        await self._execution_condition.wait_for(
+                            lambda: not self._execution_writer and self._execution_readers == 0
+                        )
+                except TimeoutError:
+                    raise TimeoutError("configuration is in use; retry the asynchronous config update") from None
+                self._execution_writer = True
+            finally:
+                self._execution_writers_waiting -= 1
+                self._execution_condition.notify_all()
+        try:
+            yield
+        finally:
+            async with self._execution_condition:
+                self._execution_writer = False
+                self._execution_condition.notify_all()
+
+    def _check_sync_config_mutation(self) -> None:
+        """A synchronous writer cannot wait for an in-flight async execution."""
+        if self._lifecycle_loop is not None and self._lifecycle_loop.is_running():
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is not self._lifecycle_loop:
+                raise RuntimeError("configuration belongs to the lifecycle loop; await an asynchronous config update")
+        if self._execution_readers or self._execution_writer or self._execution_writers_waiting:
+            raise RuntimeError("configuration is in use; await an asynchronous config update")
+
+    def _check_sync_config_replacement(self, prospective: Mapping[str, ModelConfig]) -> None:
+        """A synchronous writer cannot drain an adapter bound to the old config."""
+        for model_id in self._loaded.keys() | self._loading | self._unloading:
+            candidate = prospective.get(model_id)
+            if candidate is None or not _model_configs_semantically_equal(self._configs.get(model_id), candidate):
+                raise RuntimeError("resident model configuration would change; await an asynchronous config update")
 
     def _check_model_loadable(self, name: str) -> tuple[ModelConfig, Path]:
         """Check if a model can be loaded (exists in registry).
@@ -2264,7 +2363,8 @@ class ModelRegistry:
         """Enforce pool isolation across currently-loaded configs.
 
         Buckets configs by task class (gen vs non-gen) in a single
-        O(n) pass and asserts at most one bucket is non-empty. Raises
+        O(n) pass, skipping configs this worker refuses to load, and
+        asserts at most one bucket is non-empty. Raises
         :class:`PoolIsolationError` naming the first incompatible pair
         when both buckets are non-empty.
 
@@ -2277,6 +2377,8 @@ class ModelRegistry:
         gen_names: list[str] = []
         non_gen_names: list[str] = []
         for name, config in self._configs.items():
+            if not counts_toward_pool_isolation(config):
+                continue
             if config.tasks.generate is not None:
                 gen_names.append(name)
             else:
@@ -2304,8 +2406,12 @@ class ModelRegistry:
             Concrete config ids considered by this update, including generated
             profile variants.
         """
+        self._check_sync_config_mutation()
         expanded, updated_ids, removed_ids = self._prepare_config_update(config)
         self._preflight_config_update(expanded, updated_ids, removed_ids)
+        self._check_sync_config_replacement(
+            {**{name: value for name, value in self._configs.items() if name not in removed_ids}, **expanded}
+        )
         if removed_ids:
             removed = ", ".join(sorted(removed_ids))
             msg = f"cannot synchronously remove model config(s): {removed}; use add_config_async"
@@ -2318,9 +2424,9 @@ class ModelRegistry:
     async def add_config_async(self, config: ModelConfig, model_dir: Path | None = None) -> set[str]:
         """Add a model config, draining removed loaded variants while no load is admitted."""
         update_lock = self._get_config_update_lock()
-        async with update_lock:
+        async with self._config_mutation_lease(), update_lock:
             expanded, updated_ids, removed_ids = self._prepare_config_update(config)
-            self._preflight_config_update(expanded, updated_ids, removed_ids)
+            await asyncio.to_thread(self._preflight_config_update, expanded, updated_ids, removed_ids)
             changed_ids = {
                 model_id
                 for model_id, candidate in expanded.items()
@@ -2348,7 +2454,7 @@ class ModelRegistry:
         and handles profile-only configs whose bare base id is not routable.
         """
         update_lock = self._get_config_update_lock()
-        async with update_lock:
+        async with self._config_mutation_lease(), update_lock:
             removed_ids = ({model_id} | self._synthetic_profile_variant_ids_for_base(model_id)) & set(self._configs)
             if not removed_ids:
                 return set()
@@ -2430,7 +2536,9 @@ class ModelRegistry:
         # Multi-LoRA generation (``loadtime.lora_paths``) is unaffected.
         validate_no_legacy_scalar_lora_id(name=config.sie_id, config=config)
         validate_profile_upstreams(config)
-        validate_model_routing(config)
+        validate_model_routing(
+            config, device=self.profile_execution_device(config.sie_id), engine_config=self._engine_config
+        )
 
     def _apply_config_entry(self, config: ModelConfig, model_dir: Path | None = None) -> None:
         base_id = (
@@ -2498,13 +2606,15 @@ class ModelRegistry:
             new_configs[config.sie_id] = config
 
         update_lock = self._get_config_update_lock()
-        async with update_lock:
+        async with self._config_mutation_lease(), update_lock:
+            retained_names: set[str] = set()
             if retained_models:
                 snapshot_bases = {_config_base_name(name, config) for name, config in new_configs.items()}
                 for name, config in self._configs.items():
                     base_name = _config_base_name(name, config)
                     if base_name in retained_models and base_name not in snapshot_bases and name not in new_configs:
                         new_configs[name] = config
+                        retained_names.add(name)
 
             if self._pool_name is not None:
                 accepted: dict[str, ModelConfig] = {}
@@ -2518,7 +2628,16 @@ class ModelRegistry:
                     accepted[name] = config
             for name, config in new_configs.items():
                 validate_no_legacy_scalar_lora_id(name=name, config=config)
-                validate_model_routing(config)
+                # These exact current entries were retained after an exported
+                # update was refused. Expiring admission must stop the bridge,
+                # not reject unrelated changes in the same snapshot.
+                if name not in retained_names:
+                    await asyncio.to_thread(
+                        validate_model_routing,
+                        config,
+                        device=self.profile_execution_device(config.sie_id),
+                        engine_config=self._engine_config,
+                    )
 
             async with self._get_load_admission_lock():
                 removed = set(self._configs) - set(new_configs)

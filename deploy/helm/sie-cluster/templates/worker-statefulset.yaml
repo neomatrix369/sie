@@ -33,7 +33,7 @@ fast at render time.
 {{- fail (printf "workers.common.modelReadyTimeoutSec=%d must be lower than the adapter worker liveness budget (%d * %d = %ds); increase workers.common.probes.liveness.failureThreshold/periodSeconds or lower modelReadyTimeoutSec" $modelReadyTimeoutS $workerLivenessFailures $workerLivenessPeriodS $workerLivenessBudgetS) }}
 {{- end }}
 {{- $reservedOtelEnv := include "sie-cluster.otel.reservedEnvNames" $root | fromJsonArray -}}
-{{- $reservedWorkerEnv := concat $reservedOtelEnv (list "SIE_BUNDLE" "SIE_GPU_TYPE" "SIE_MACHINE_PROFILE" "SIE_POOL" "SIE_REMOTE_SERVING" "SIE_SGLANG_KERNEL_CACHE_ROOT" "SIE_UPSTREAMS_FILE" "SIE_WORKER_ID") -}}
+{{- $reservedWorkerEnv := concat $reservedOtelEnv (list "SIE_BUNDLE" "SIE_GPU_TYPE" "SIE_MACHINE_PROFILE" "SIE_POOL" "SIE_REMOTE_SERVING" "SIE_SGLANG_KERNEL_CACHE_ROOT" "SIE_UPSTREAMS_FILE" "SIE_WORKER_ID" "SIE_THRESHOLD_ROUTING_ENABLED") -}}
 {{- range $upstreamName, $_ := (default dict $root.Values.upstreams) -}}
 {{- $reservedWorkerEnv = append $reservedWorkerEnv (include "sie-cluster.upstream.keyEnvName" $upstreamName) -}}
 {{- end -}}
@@ -147,7 +147,7 @@ fast at render time.
 {{- fail (printf "workers.pools.%s.bundles.remote: a remote lane holds upstream credentials and runs no model on an accelerator; set workers.pools.%s.gpu.count to 0" $poolName $poolName) }}
 {{- end }}
 {{- if and $remoteLane (eq $imageBundle "remote") }}
-{{- fail (printf "workers.pools.%s.bundles.remote: no remote worker image is published; set imageBundle: default to run the remote adapters on the %s-default image" $poolName $platform) }}
+{{- fail (printf "workers.pools.%s.bundles.remote: no remote worker image is published; set imageBundle: transformers5 to run the remote adapters on the %s-transformers5 image" $poolName $platform) }}
 {{- end }}
 {{- if $remoteLane }}
 {{- range $resourceKind := list "requests" "limits" }}
@@ -162,6 +162,7 @@ fast at render time.
 {{- end }}
 {{- end }}
 {{- $deliverUpstreams := and $remoteLane (dig "remote" "serving" true $root.Values.workers) }}
+{{- $evidenceConfigMap := include "sie-cluster.upstreams.evidenceConfigMap" $root }}
 {{- $poolSidecar := default dict $pool.sidecar }}
 {{- $emulatedChildCount := int (dig "emulatedChildCount" 0 $poolSidecar) }}
 {{- if and (gt $emulatedChildCount 0) (gt $gpuCount 0) }}
@@ -450,6 +451,8 @@ spec:
             - name: SIE_REMOTE_SERVING
               value: "0"
             {{- end }}
+            - name: SIE_THRESHOLD_ROUTING_ENABLED
+              value: {{ dig "thresholdRouting" "enabled" false $root.Values.gateway | quote }}
             {{- if $root.Values.workers.common.workerSidecar.enabled }}
             # worker-sidecar owns the NATS loop; the adapter process
             # exposes the IPC server over a shared Unix socket. The chart fails render
@@ -531,6 +534,11 @@ spec:
             - name: upstreams
               mountPath: /etc/sie/upstreams
               readOnly: true
+            {{- if $evidenceConfigMap }}
+            - name: equivalence
+              mountPath: /etc/sie/equivalence
+              readOnly: true
+            {{- end }}
             {{- end }}
         {{- end }}
         {{- if $root.Values.workers.common.workerSidecar.enabled }}
@@ -831,6 +839,13 @@ spec:
         - name: upstreams
           secret:
             secretName: {{ include "sie-cluster.upstreams.secretName" $root }}
+        {{- if $evidenceConfigMap }}
+        # Equivalence evidence the upstreams' record_files name. Remote lanes
+        # re-read it on use, so a replaced ConfigMap needs no restart.
+        - name: equivalence
+          configMap:
+            name: {{ $evidenceConfigMap | quote }}
+        {{- end }}
         {{- end }}
 {{- end }}
 {{- end }}

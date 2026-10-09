@@ -144,6 +144,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         dense_dim: int | None = None,
         startup_timeout_s: float | None = None,
         embed_concurrency: int | None = None,
+        max_concurrent_dispatch: int = 1,
         # Accepted for the same reason the generation adapter accepts it: the
         # width is a property of a load, not of a task. No embedding profile
         # needs it today, and one is the byte-identical single-device case.
@@ -188,6 +189,10 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             max_loras_per_batch: Maximum LoRA adapters per batch. Default 8.
             dense_dim: Configured dense embedding dimension.
             startup_timeout_s: SGLang startup-health timeout in seconds.
+            embed_concurrency: Concurrent POSTs one batch is sharded into.
+            max_concurrent_dispatch: Batches the worker may have in flight to
+                SGLang at once (see ``max_concurrent_dispatch()``). 1 keeps the
+                worker's one-batch-at-a-time dispatch.
             **kwargs: Additional arguments (ignored, for compatibility).
         """
         _ = kwargs  # Unused, but accepted for loader compatibility
@@ -207,6 +212,14 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._max_loras_per_batch = max_loras_per_batch
         self._startup_timeout_s = _server.resolve_startup_timeout(startup_timeout_s)
         self._embed_concurrency = _resolve_embed_concurrency(embed_concurrency)
+        if (
+            isinstance(max_concurrent_dispatch, bool)
+            or not isinstance(max_concurrent_dispatch, int)
+            or max_concurrent_dispatch < 1
+        ):
+            msg = "max_concurrent_dispatch must be a positive integer"
+            raise ValueError(msg)
+        self._max_concurrent_dispatch = max_concurrent_dispatch
         self._tensor_parallel_size = _server.validate_tensor_parallel_size(tensor_parallel_size)
         self._disable_piecewise_cuda_graph = (
             self._tensor_parallel_size > 1 if disable_piecewise_cuda_graph is None else disable_piecewise_cuda_graph
@@ -241,8 +254,8 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         self._output_file: tempfile._TemporaryFileWrapper | None = None
         # Lazy, weights-free tokenizer used ONLY for exact §7.3 input-token
         # metering (see ``_get_metering_tokenizer`` / ``_stamp_input_token_counts``).
-        # Loaded on first ``encode`` and cached; a load failure degrades to the
-        # meter's reserve estimate rather than failing inference.
+        # Loaded on first ``encode`` and cached; a load failure leaves the
+        # counts absent rather than failing inference.
         self._metering_tokenizer_obj: Any = None
         self._metering_tokenizer_loaded: bool = False
 
@@ -390,16 +403,18 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         # Concurrent-POST fan-out: a keep-alive session with a connection pool
         # sized to the concurrency and a matching thread pool, so a sharded
         # ``encode`` keeps ``embed_concurrency`` requests in flight against
-        # SGLang's continuous batcher (see ``_embed_texts``). Left as ``None``
-        # for concurrency==1 (legacy single blocking post).
+        # SGLang's continuous batcher (see ``_embed_texts``). Both are sized for
+        # every batch the worker may dispatch at once, so a second batch's
+        # shards do not queue behind the first's. Left as ``None`` for
+        # concurrency==1 (legacy single blocking post).
         if self._embed_concurrency > 1:
             self._session = requests.Session()
-            pool_size = max(self._embed_concurrency, 10)
+            pool_size = max(self._embed_concurrency * self._max_concurrent_dispatch, 10)
             http_adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
             self._session.mount("http://", http_adapter)
             self._session.mount("https://", http_adapter)
             self._post_executor = ThreadPoolExecutor(
-                max_workers=self._embed_concurrency,
+                max_workers=self._embed_concurrency * self._max_concurrent_dispatch,
                 thread_name_prefix="sglang-embed-post",
             )
 
@@ -612,12 +627,11 @@ class SGLangEmbeddingAdapter(BaseAdapter):
 
         SGLang runs the model in a subprocess, so this adapter has no
         in-process tokenizer for the base ``count_input_tokens`` seam and
-        ``units.input_tokens`` would otherwise stay 0 (the meter's reserve
-        fallback) for this promoted dense-SMARTEST tier. Loading the served
-        model's own tokenizer is tokenizer-only (no weights) and cheap; it is
-        cached after the first call. Best-effort: a load failure is logged once
-        and degrades metering to the reserve estimate rather than failing
-        inference (mirrors ``_resolve_eos_token``).
+        ``units.input_tokens`` would otherwise be absent for this promoted
+        dense-SMARTEST tier. Loading the served model's own tokenizer is
+        tokenizer-only (no weights) and cheap; it is cached after the first
+        call. Best-effort: a load failure is logged once and leaves the counts
+        absent rather than failing inference (mirrors ``_resolve_eos_token``).
         """
         if self._metering_tokenizer_loaded:
             return self._metering_tokenizer_obj
@@ -628,8 +642,7 @@ class SGLangEmbeddingAdapter(BaseAdapter):
             )
         except Exception:  # noqa: BLE001 — metering must never take the model down
             logger.warning(
-                "metering: could not load tokenizer for %s; units.input_tokens will "
-                "fall back to the meter's reserve estimate",
+                "metering: could not load tokenizer for %s; units.input_tokens will be absent",
                 self._model_name_or_path,
                 exc_info=True,
             )
@@ -646,8 +659,8 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         """Stamp exact per-item input-token counts (§7.3) onto ``output.extra``.
 
         SGLang is server-backed, so the base ``count_input_tokens`` seam has no
-        in-process tokenizer and ``units.input_tokens`` would fall to the
-        meter's reserve estimate — never exact for this promoted dense tier. We
+        in-process tokenizer and ``units.input_tokens`` would be absent for
+        this promoted dense tier. We
         count the EXACT strings POSTed to sglang (``non_empty_texts`` — already
         query/doc-template- and (when enabled) EOS-formatted by
         ``_format_texts``, and truncated at ``max_seq_length`` the same way
@@ -657,13 +670,16 @@ class SGLangEmbeddingAdapter(BaseAdapter):
         ``usage.prompt_tokens`` for the request. Mirrors the ``bert_flash`` /
         ``bge_m3_flash`` seam; ``_token_counts_or_none`` is the shared base
         helper. Best-effort: any tokenizer quirk (or a load failure) leaves
-        ``extra`` unstamped so the meter falls back to its reserve estimate
-        rather than billing an approximation.
+        ``extra`` unstamped, so the counts are absent rather than
+        approximated.
         """
-        tokenizer = self._get_metering_tokenizer()
-        if tokenizer is None:
-            return
-        counts = self._token_counts_or_none(tokenizer, non_empty_texts, expected_len=len(non_empty_texts))
+        # Batches can run concurrently (``max_concurrent_dispatch``), and a fast
+        # tokenizer is not re-entrant, so the lazy load and the count are serialised.
+        with self._tokenizer_guard():
+            tokenizer = self._get_metering_tokenizer()
+            if tokenizer is None:
+                return
+            counts = self._token_counts_or_none(tokenizer, non_empty_texts, expected_len=len(non_empty_texts))
         if counts is None:
             return
         per_item = [0] * total
@@ -883,6 +899,17 @@ class SGLangEmbeddingAdapter(BaseAdapter):
     # -------------------------------------------------------------------------
     # LoRA Support
     # -------------------------------------------------------------------------
+
+    def max_concurrent_dispatch(self) -> int:
+        """Batches the worker may have in flight to SGLang at once.
+
+        SGLang batches continuously, so while one batch waits on its HTTP
+        round trips (and the JSON decode of its embeddings) the next can
+        already be running on the GPU. With one batch at a time the GPU idles
+        through every round trip. The worker honours values above 1 only
+        when no LoRA adapters are configured.
+        """
+        return self._max_concurrent_dispatch
 
     def supports_lora(self) -> bool:
         """Return True if LoRA adapters are configured."""

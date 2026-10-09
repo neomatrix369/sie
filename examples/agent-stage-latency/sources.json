@@ -1,0 +1,665 @@
+{
+  "schema": 1,
+  "canonical_json": "UTF-8, sort_keys=true, compact separators, ensure_ascii=false, allow_nan=false, no newline",
+  "files": [
+    {
+      "path": "G/manifest.json",
+      "repository": "superlinked/sie-task-evidence",
+      "revision": "b45775c419e37212cef67f485610eda88ee29491",
+      "remote_path": "guardrails/manifest.json",
+      "url": "https://huggingface.co/datasets/superlinked/sie-task-evidence/resolve/b45775c419e37212cef67f485610eda88ee29491/guardrails/manifest.json",
+      "bytes": 9562,
+      "sha256": "0045cf212716365526d8fe9054401ed0ae1c8461b93660b6b2b5f3944c921f23",
+      "license": "Public evidence provenance metadata"
+    },
+    {
+      "path": "M/manifest.json",
+      "repository": "superlinked/sie-task-evidence",
+      "revision": "31383ae9986d9dc9edd4e3a06ee9fb40b223d6fb",
+      "remote_path": "redact/manifest.json",
+      "url": "https://huggingface.co/datasets/superlinked/sie-task-evidence/resolve/31383ae9986d9dc9edd4e3a06ee9fb40b223d6fb/redact/manifest.json",
+      "bytes": 7067,
+      "sha256": "8170519b9ad94c35dd53f2d22d96689d41e9c0e26d9c0fc25bba83230cbee4dc",
+      "license": "Public evidence provenance metadata"
+    },
+    {
+      "path": "M/gretel-main.jsonl",
+      "repository": "superlinked/sie-task-evidence",
+      "revision": "31383ae9986d9dc9edd4e3a06ee9fb40b223d6fb",
+      "remote_path": "redact/inputs/gretel-main.jsonl",
+      "url": "https://huggingface.co/datasets/superlinked/sie-task-evidence/resolve/31383ae9986d9dc9edd4e3a06ee9fb40b223d6fb/redact/inputs/gretel-main.jsonl",
+      "bytes": 1152633,
+      "sha256": "26a852c436e63adc7612870add49fe6afb24f9c4cf49d6233e57e59d0ccd7787",
+      "license": "Apache-2.0; gretelai/synthetic_pii_finance_multilingual, English test split"
+    },
+    {
+      "path": "E/manifest.json",
+      "repository": "superlinked/sie-task-evidence",
+      "revision": "b939e41046eef6a0c2a9ee60c152161fd3fb7e04",
+      "remote_path": "lookalike-search/manifest.json",
+      "url": "https://huggingface.co/datasets/superlinked/sie-task-evidence/resolve/b939e41046eef6a0c2a9ee60c152161fd3fb7e04/lookalike-search/manifest.json",
+      "bytes": 1445,
+      "sha256": "831c4a8e6d14596d0695c0dc2ab949288c7d9db5e542173e068e5eb31d8b9751",
+      "license": "Public evidence provenance metadata"
+    },
+    {
+      "path": "E/questions.json",
+      "repository": "superlinked/sie-task-evidence",
+      "revision": "b939e41046eef6a0c2a9ee60c152161fd3fb7e04",
+      "remote_path": "lookalike-search/inputs/questions.json",
+      "url": "https://huggingface.co/datasets/superlinked/sie-task-evidence/resolve/b939e41046eef6a0c2a9ee60c152161fd3fb7e04/lookalike-search/inputs/questions.json",
+      "bytes": 130139,
+      "sha256": "70b20ed7f9f43d6bc5d3d0d531b0d2557384c1f362b44fa17c49e68caa531c54",
+      "license": "Public held-out questions; see source publications at https://superlinked.com/reference/search/SOURCES.md for provenance and terms"
+    },
+    {
+      "path": "R/manifest.json",
+      "repository": "superlinked/sie-task-evidence",
+      "revision": "e5b19d7589fc3a982fcfeeabb071cf833c22455f",
+      "remote_path": "rerank-relevance-rules/manifest.json",
+      "url": "https://huggingface.co/datasets/superlinked/sie-task-evidence/resolve/e5b19d7589fc3a982fcfeeabb071cf833c22455f/rerank-relevance-rules/manifest.json",
+      "bytes": 2508,
+      "sha256": "8fe1d86a33ff633890780236387125f6002dde45853f6e7fa53815d6c1c306d4",
+      "license": "Apache-2.0; Federal Register source corpus public domain"
+    },
+    {
+      "path": "R/cases_test.json",
+      "repository": "superlinked/sie-task-evidence",
+      "revision": "e5b19d7589fc3a982fcfeeabb071cf833c22455f",
+      "remote_path": "rerank-relevance-rules/inputs/cases_test.json",
+      "url": "https://huggingface.co/datasets/superlinked/sie-task-evidence/resolve/e5b19d7589fc3a982fcfeeabb071cf833c22455f/rerank-relevance-rules/inputs/cases_test.json",
+      "bytes": 11667804,
+      "sha256": "1d32077e5679be1afa8ed40a0b1893ee8181225c02b7ff6aeafdf29d9ee0c203",
+      "license": "Apache-2.0; Federal Register source corpus public domain"
+    },
+    {
+      "path": "G/toxicchat.csv",
+      "repository": "lmsys/toxic-chat",
+      "revision": "29df8e4dba60e1f4af4b4075c0705c5b313548a8",
+      "remote_path": "data/0124/toxic-chat_annotation_test.csv",
+      "url": "https://huggingface.co/datasets/lmsys/toxic-chat/resolve/29df8e4dba60e1f4af4b4075c0705c5b313548a8/data/0124/toxic-chat_annotation_test.csv",
+      "bytes": 8090164,
+      "sha256": "3c2e49889626f7738dca0a29bface0ba0a0595b2ffdd17f0e02f19df7c3c4c9b",
+      "license": "CC-BY-NC-4.0"
+    },
+    {
+      "path": "G/aegis.json",
+      "repository": "nvidia/Aegis-AI-Content-Safety-Dataset-2.0",
+      "revision": "d86bb8bedff51d25ac834ab7838f1cc61acb7a2c",
+      "remote_path": "test.json",
+      "url": "https://huggingface.co/datasets/nvidia/Aegis-AI-Content-Safety-Dataset-2.0/resolve/d86bb8bedff51d25ac834ab7838f1cc61acb7a2c/test.json",
+      "bytes": 1731373,
+      "sha256": "b0a6d602260524866053cb34105194f074f2c2906e3691b68d43b9e6e9318f35",
+      "license": "CC-BY-4.0"
+    }
+  ],
+  "request_bindings": {
+    "G": {
+      "source_example": "guardrails",
+      "requests": {
+        "sie": {
+          "None": [
+            {
+              "method": "chat_completions",
+              "model": "Qwen/Qwen3Guard-Gen-4B",
+              "body": {
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "{source_text}"
+                  }
+                ],
+                "temperature": 0,
+                "max_tokens": 64
+              },
+              "request_digest": "0ed41436f97c1d4020d54893932bf6269246d22f1e1c53a51e3ef714f7d12c1a"
+            }
+          ]
+        },
+        "rival": {
+          "None": [
+            {
+              "method": "messages",
+              "provider": "anthropic",
+              "model": "claude-haiku-4-5",
+              "path": "/v1/messages",
+              "body": {
+                "model": "claude-haiku-4-5",
+                "temperature": 0,
+                "max_tokens": 10,
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Is the following user message harmful? Answer with exactly one word: harmful or unharmful.\n\nMessage:\n{source_text}"
+                  }
+                ]
+              },
+              "request_digest": "01ebd694ea1be7c761054d432444a3d93ff01fec3be5ffa9127afd66a70ae86d"
+            }
+          ]
+        }
+      }
+    },
+    "M": {
+      "source_example": "redact",
+      "requests": {
+        "sie": {
+          "None": [
+            {
+              "method": "extract",
+              "model": "urchade/gliner_multi_pii-v1",
+              "window": 0,
+              "offset": 0,
+              "body": {
+                "item": {
+                  "text": "{source_text}"
+                },
+                "labels": [
+                  "person",
+                  "street address",
+                  "city",
+                  "county",
+                  "postal code",
+                  "gps coordinates",
+                  "date of birth",
+                  "phone number",
+                  "fax number",
+                  "email address",
+                  "url",
+                  "ip address",
+                  "mac address",
+                  "social security number",
+                  "national id number",
+                  "tax id number",
+                  "medical record number",
+                  "health plan beneficiary number",
+                  "account number",
+                  "credit card number",
+                  "cvv",
+                  "pin",
+                  "password",
+                  "api key",
+                  "http cookie",
+                  "username",
+                  "customer id",
+                  "employee id",
+                  "certificate or license number",
+                  "license plate",
+                  "vehicle identification number",
+                  "device identifier",
+                  "biometric identifier",
+                  "unique identifier",
+                  "passport number",
+                  "driver's license number"
+                ]
+              },
+              "request_digest": "34e0fb4236a76aea2c142b0ebbb2b4cf40c8366dccf2989a3d6e3df22ed656ff"
+            },
+            {
+              "method": "extract",
+              "model": "numind/NuNER_Zero",
+              "window": 0,
+              "offset": 0,
+              "body": {
+                "item": {
+                  "text": "{source_text}"
+                },
+                "labels": [
+                  "person",
+                  "street address",
+                  "city",
+                  "county",
+                  "postal code",
+                  "gps coordinates",
+                  "date of birth",
+                  "phone number",
+                  "fax number",
+                  "email address",
+                  "url",
+                  "ip address",
+                  "mac address",
+                  "social security number",
+                  "national id number",
+                  "tax id number",
+                  "medical record number",
+                  "health plan beneficiary number",
+                  "account number",
+                  "credit card number",
+                  "cvv",
+                  "pin",
+                  "password",
+                  "api key",
+                  "http cookie",
+                  "username",
+                  "customer id",
+                  "employee id",
+                  "certificate or license number",
+                  "license plate",
+                  "vehicle identification number",
+                  "device identifier",
+                  "biometric identifier",
+                  "unique identifier",
+                  "passport number",
+                  "driver's license number"
+                ]
+              },
+              "request_digest": "ef6fe30c7d65f3ec148273b810f5ef7d66ab604d0668255f08962658422d0ad7"
+            }
+          ]
+        },
+        "rival": {
+          "None": [
+            {
+              "method": "messages",
+              "provider": "anthropic",
+              "model": "claude-haiku-4-5",
+              "path": "/v1/messages",
+              "body": {
+                "model": "claude-haiku-4-5",
+                "temperature": 0,
+                "max_tokens": 4096,
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "{source_text}"
+                  }
+                ],
+                "system": "Find every piece of personally identifiable information in the text. Use these types: person, street address, city, county, postal code, gps coordinates, date of birth, phone number, fax number, email address, url, ip address, mac address, social security number, national id number, tax id number, medical record number, health plan beneficiary number, account number, credit card number, cvv, pin, password, api key, http cookie, username, customer id, employee id, certificate or license number, license plate, vehicle identification number, device identifier, biometric identifier, unique identifier, passport number, driver's license number. Copy each mention exactly as it appears in the text. Return an empty list if there is none.",
+                "output_config": {
+                  "format": {
+                    "type": "json_schema",
+                    "schema": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "entities"
+                      ],
+                      "properties": {
+                        "entities": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "text",
+                              "type"
+                            ],
+                            "properties": {
+                              "text": {
+                                "type": "string"
+                              },
+                              "type": {
+                                "type": "string",
+                                "enum": [
+                                  "person",
+                                  "street address",
+                                  "city",
+                                  "county",
+                                  "postal code",
+                                  "gps coordinates",
+                                  "date of birth",
+                                  "phone number",
+                                  "fax number",
+                                  "email address",
+                                  "url",
+                                  "ip address",
+                                  "mac address",
+                                  "social security number",
+                                  "national id number",
+                                  "tax id number",
+                                  "medical record number",
+                                  "health plan beneficiary number",
+                                  "account number",
+                                  "credit card number",
+                                  "cvv",
+                                  "pin",
+                                  "password",
+                                  "api key",
+                                  "http cookie",
+                                  "username",
+                                  "customer id",
+                                  "employee id",
+                                  "certificate or license number",
+                                  "license plate",
+                                  "vehicle identification number",
+                                  "device identifier",
+                                  "biometric identifier",
+                                  "unique identifier",
+                                  "passport number",
+                                  "driver's license number"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "request_digest": "3443b024663b2f1ef58fad1a5ddd0496458dc30d18c71d3a3bbaebdf5c7311a7"
+            }
+          ]
+        }
+      },
+      "composition": {
+        "window_units": 300,
+        "overlap": 50,
+        "score_floor": 0.6,
+        "model_paths": 2,
+        "serial_windows": true
+      }
+    },
+    "E": {
+      "source_example": "lookalike-search",
+      "requests": {
+        "sie": {
+          "None": [
+            {
+              "method": "encode",
+              "model": "Qwen/Qwen3-Embedding-4B",
+              "body": {
+                "item": {
+                  "text": "{source_text}"
+                },
+                "is_query": true
+              },
+              "request_digest": "61dd8890dcd4f31947e94470d95bf95fe3617e2d31c18e35d8602fc5fdaa4d38"
+            }
+          ]
+        },
+        "rival": {
+          "None": [
+            {
+              "method": "embeddings",
+              "provider": "openai",
+              "model": "text-embedding-3-large",
+              "path": "/v1/embeddings",
+              "body": {
+                "model": "text-embedding-3-large",
+                "input": "{source_text}",
+                "dimensions": 3072,
+                "encoding_format": "float"
+              },
+              "request_digest": "c0a44db9987a091d19d2c3430caaea070e7190f1907f4efa8d27bad3355e5dea"
+            }
+          ]
+        }
+      }
+    },
+    "R": {
+      "source_example": "rerank",
+      "requests": {
+        "sie": {
+          "in-force": [
+            {
+              "method": "score",
+              "model": "Qwen/Qwen3-Reranker-4B",
+              "body": {
+                "query": {
+                  "text": "{source_query}"
+                },
+                "items": [
+                  {
+                    "id": "{candidate_0_id}",
+                    "text": "{candidate_0_text}"
+                  },
+                  {
+                    "id": "{candidate_1_id}",
+                    "text": "{candidate_1_text}"
+                  },
+                  {
+                    "id": "{candidate_2_id}",
+                    "text": "{candidate_2_text}"
+                  },
+                  {
+                    "id": "{candidate_3_id}",
+                    "text": "{candidate_3_text}"
+                  },
+                  {
+                    "id": "{candidate_4_id}",
+                    "text": "{candidate_4_text}"
+                  },
+                  {
+                    "id": "{candidate_5_id}",
+                    "text": "{candidate_5_text}"
+                  },
+                  {
+                    "id": "{candidate_6_id}",
+                    "text": "{candidate_6_text}"
+                  },
+                  {
+                    "id": "{candidate_7_id}",
+                    "text": "{candidate_7_text}"
+                  },
+                  {
+                    "id": "{candidate_8_id}",
+                    "text": "{candidate_8_text}"
+                  },
+                  {
+                    "id": "{candidate_9_id}",
+                    "text": "{candidate_9_text}"
+                  },
+                  {
+                    "id": "{candidate_10_id}",
+                    "text": "{candidate_10_text}"
+                  },
+                  {
+                    "id": "{candidate_11_id}",
+                    "text": "{candidate_11_text}"
+                  },
+                  {
+                    "id": "{candidate_12_id}",
+                    "text": "{candidate_12_text}"
+                  },
+                  {
+                    "id": "{candidate_13_id}",
+                    "text": "{candidate_13_text}"
+                  },
+                  {
+                    "id": "{candidate_14_id}",
+                    "text": "{candidate_14_text}"
+                  },
+                  {
+                    "id": "{candidate_15_id}",
+                    "text": "{candidate_15_text}"
+                  },
+                  {
+                    "id": "{candidate_16_id}",
+                    "text": "{candidate_16_text}"
+                  },
+                  {
+                    "id": "{candidate_17_id}",
+                    "text": "{candidate_17_text}"
+                  },
+                  {
+                    "id": "{candidate_18_id}",
+                    "text": "{candidate_18_text}"
+                  },
+                  {
+                    "id": "{candidate_19_id}",
+                    "text": "{candidate_19_text}"
+                  }
+                ],
+                "instruction": "Return the final rule the agency has adopted on this subject, not a proposed rule. A proposal that is still open for comment is not relevant."
+              },
+              "request_digest": "88c5d7d241ee58c06ff2220d919dc78ef8e242bf3be100f36ebcf837117c17df"
+            }
+          ],
+          "proposed": [
+            {
+              "method": "score",
+              "model": "Qwen/Qwen3-Reranker-4B",
+              "body": {
+                "query": {
+                  "text": "{source_query}"
+                },
+                "items": [
+                  {
+                    "id": "{candidate_0_id}",
+                    "text": "{candidate_0_text}"
+                  },
+                  {
+                    "id": "{candidate_1_id}",
+                    "text": "{candidate_1_text}"
+                  },
+                  {
+                    "id": "{candidate_2_id}",
+                    "text": "{candidate_2_text}"
+                  },
+                  {
+                    "id": "{candidate_3_id}",
+                    "text": "{candidate_3_text}"
+                  },
+                  {
+                    "id": "{candidate_4_id}",
+                    "text": "{candidate_4_text}"
+                  },
+                  {
+                    "id": "{candidate_5_id}",
+                    "text": "{candidate_5_text}"
+                  },
+                  {
+                    "id": "{candidate_6_id}",
+                    "text": "{candidate_6_text}"
+                  },
+                  {
+                    "id": "{candidate_7_id}",
+                    "text": "{candidate_7_text}"
+                  },
+                  {
+                    "id": "{candidate_8_id}",
+                    "text": "{candidate_8_text}"
+                  },
+                  {
+                    "id": "{candidate_9_id}",
+                    "text": "{candidate_9_text}"
+                  },
+                  {
+                    "id": "{candidate_10_id}",
+                    "text": "{candidate_10_text}"
+                  },
+                  {
+                    "id": "{candidate_11_id}",
+                    "text": "{candidate_11_text}"
+                  },
+                  {
+                    "id": "{candidate_12_id}",
+                    "text": "{candidate_12_text}"
+                  },
+                  {
+                    "id": "{candidate_13_id}",
+                    "text": "{candidate_13_text}"
+                  },
+                  {
+                    "id": "{candidate_14_id}",
+                    "text": "{candidate_14_text}"
+                  },
+                  {
+                    "id": "{candidate_15_id}",
+                    "text": "{candidate_15_text}"
+                  },
+                  {
+                    "id": "{candidate_16_id}",
+                    "text": "{candidate_16_text}"
+                  },
+                  {
+                    "id": "{candidate_17_id}",
+                    "text": "{candidate_17_text}"
+                  },
+                  {
+                    "id": "{candidate_18_id}",
+                    "text": "{candidate_18_text}"
+                  },
+                  {
+                    "id": "{candidate_19_id}",
+                    "text": "{candidate_19_text}"
+                  }
+                ],
+                "instruction": "Return the proposed rule the agency has published for comment on this subject, not a final rule. A rule already adopted is not relevant."
+              },
+              "request_digest": "20cd1146bbdf56ea36730d774af5f042fdff912ee382061838586b8820b01ba5"
+            }
+          ]
+        },
+        "rival": {
+          "in-force": [
+            {
+              "method": "rerank",
+              "provider": "cohere",
+              "model": "rerank-v4.0-pro",
+              "path": "/v2/rerank",
+              "body": {
+                "model": "rerank-v4.0-pro",
+                "query": "Instruction: Return the final rule the agency has adopted on this subject, not a proposed rule. A proposal that is still open for comment is not relevant.\nQuery: {source_query}",
+                "documents": [
+                  "{candidate_0_text}",
+                  "{candidate_1_text}",
+                  "{candidate_2_text}",
+                  "{candidate_3_text}",
+                  "{candidate_4_text}",
+                  "{candidate_5_text}",
+                  "{candidate_6_text}",
+                  "{candidate_7_text}",
+                  "{candidate_8_text}",
+                  "{candidate_9_text}",
+                  "{candidate_10_text}",
+                  "{candidate_11_text}",
+                  "{candidate_12_text}",
+                  "{candidate_13_text}",
+                  "{candidate_14_text}",
+                  "{candidate_15_text}",
+                  "{candidate_16_text}",
+                  "{candidate_17_text}",
+                  "{candidate_18_text}",
+                  "{candidate_19_text}"
+                ],
+                "top_n": 20,
+                "max_tokens_per_doc": 4096
+              },
+              "request_digest": "d8c36300a0713bf9113a77fbae5040cddcd694799ec4c5a9b819233b61e70d35"
+            }
+          ],
+          "proposed": [
+            {
+              "method": "rerank",
+              "provider": "cohere",
+              "model": "rerank-v4.0-pro",
+              "path": "/v2/rerank",
+              "body": {
+                "model": "rerank-v4.0-pro",
+                "query": "Instruction: Return the proposed rule the agency has published for comment on this subject, not a final rule. A rule already adopted is not relevant.\nQuery: {source_query}",
+                "documents": [
+                  "{candidate_0_text}",
+                  "{candidate_1_text}",
+                  "{candidate_2_text}",
+                  "{candidate_3_text}",
+                  "{candidate_4_text}",
+                  "{candidate_5_text}",
+                  "{candidate_6_text}",
+                  "{candidate_7_text}",
+                  "{candidate_8_text}",
+                  "{candidate_9_text}",
+                  "{candidate_10_text}",
+                  "{candidate_11_text}",
+                  "{candidate_12_text}",
+                  "{candidate_13_text}",
+                  "{candidate_14_text}",
+                  "{candidate_15_text}",
+                  "{candidate_16_text}",
+                  "{candidate_17_text}",
+                  "{candidate_18_text}",
+                  "{candidate_19_text}"
+                ],
+                "top_n": 20,
+                "max_tokens_per_doc": 4096
+              },
+              "request_digest": "64d8220eb638ddd7e54e2190d1e6ef271537479f4caa1791ffa7c9b760846552"
+            }
+          ]
+        }
+      },
+      "provider_settings_provenance": "New-trial documented Cohere v2 request; historical body and API version were not retained. https://docs.cohere.com/v2/reference/rerank"
+    }
+  }
+}

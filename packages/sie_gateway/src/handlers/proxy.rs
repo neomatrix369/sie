@@ -1,6 +1,6 @@
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
@@ -22,6 +22,7 @@ use crate::observability::metrics as telemetry;
 use crate::queue::dispatch::{
     DispatchDurability, DispatchError, PendingDispatchKind, WorkDispatcher, WorkDispatcherExt,
 };
+use crate::queue::lane_admission::LaneKey;
 use crate::queue::publisher;
 use crate::queue::streaming::{
     client_safe_worker_error_code, client_safe_worker_error_message,
@@ -30,17 +31,22 @@ use crate::queue::streaming::{
 };
 
 use crate::server::{
-    AppState, GenerationRequestIntent, GovernedGenerationRoute, ModelAccessPolicy,
+    AppState, GenerationRequestIntent, GenerationRoutePolicy, GovernedGenerationRoute,
+    ModelAccessPolicy, RemoteRouteReason,
 };
 use crate::state::demand_tracker::PhysicalLane;
 use crate::state::model_registry::{ModelRegistry, ResolveError};
 use crate::state::pool_manager::{normalize_pool_name, PoolManager, DEFAULT_POOL_NAME};
 use crate::state::worker_registry::{QueueRoute, WorkerRegistry};
+use crate::types::model::FallbackTrigger;
 use crate::types::AuditEntry;
 
 use crate::middleware::auth::{extract_bearer_token, mask_token};
 
-use super::serving_disclosure::ServingDisclosure;
+use super::serving_disclosure::{
+    remote_forbidden, DeferredFallbackFinish, FallbackAttempt, ServingDisclosure,
+    UnansweredBeforeDeadline,
+};
 
 const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -349,6 +355,7 @@ pub(crate) struct RetryAfter {
     pub model_loading: &'static str,
     pub resource_exhausted: &'static str,
     pub lora_loading: &'static str,
+    pub queue_full: &'static str,
 }
 
 impl RetryAfter {
@@ -362,6 +369,7 @@ impl RetryAfter {
         model_loading: "5",
         resource_exhausted: "5",
         lora_loading: "5",
+        queue_full: "5",
     };
 }
 
@@ -392,6 +400,14 @@ const RESOURCE_EXHAUSTED_RETRY_AFTER: &str = RetryAfter::DEFAULT.resource_exhaus
 /// see ``sie_sdk.client._shared.LORA_LOADING_*``.
 const LORA_LOADING_ERROR_CODE: &str = "LORA_LOADING";
 const LORA_LOADING_RETRY_AFTER: &str = RetryAfter::DEFAULT.lora_loading;
+/// A worker could not serve the item now, for example because a remote
+/// profile's upstream is busy, unreachable or rate capped. Retryable, with the
+/// worker's ``retry_after_s`` when it gave one.
+const QUEUE_FULL_ERROR_CODE: &str = "QUEUE_FULL";
+const QUEUE_FULL_RETRY_AFTER: &str = RetryAfter::DEFAULT.queue_full;
+/// The code a remote worker answers when its numerical admission check
+/// refuses an admitted item before calling the upstream.
+const INFERENCE_ERROR_ERROR_CODE: &str = "INFERENCE_ERROR";
 const INVALID_INPUT_ERROR_CODE: &str = "INVALID_INPUT";
 /// Worker-side input exceeds the model's context window (for example a label
 /// set that does not fit). Caller-fixable, so it maps to 400 like
@@ -1701,6 +1717,46 @@ fn governed_generation_route(
             "compiled physical model disagrees with registry intent rewrite",
         ));
     }
+    checked_governed_route(state, customer_model, intent, route).map(Some)
+}
+
+/// The governed route a bridged generation request dispatches on: the
+/// deployment's remote route, which must still agree with the admitted plan.
+#[allow(clippy::result_large_err)]
+fn governed_bridge_route(
+    state: &AppState,
+    ext: &axum::http::Extensions,
+    customer_model: &str,
+    intent: GenerationRequestIntent,
+    plan: &crate::state::model_registry::RemoteFallbackPlan,
+) -> Result<Option<GovernedGenerationRoute>, Response> {
+    if generation_route_policy(state).is_none() {
+        return Ok(None);
+    }
+    let Some(route) = governed_remote_route(state, ext, customer_model, intent) else {
+        return Err(governed_generation_route_failure(
+            customer_model,
+            intent,
+            "missing remote route for model/intent",
+        ));
+    };
+    if !remote_route_agrees(&route, plan) {
+        return Err(governed_generation_route_failure(
+            customer_model,
+            intent,
+            "remote route disagrees with the admitted bridge",
+        ));
+    }
+    checked_governed_route(state, customer_model, intent, route).map(Some)
+}
+
+#[allow(clippy::result_large_err)]
+fn checked_governed_route(
+    state: &AppState,
+    customer_model: &str,
+    intent: GenerationRequestIntent,
+    route: GovernedGenerationRoute,
+) -> Result<GovernedGenerationRoute, Response> {
     if route.bundle.trim().is_empty()
         || route.pool.trim().is_empty()
         || route.machine_profile.trim().is_empty()
@@ -1723,7 +1779,7 @@ fn governed_generation_route(
             "route machine profile is absent from the configured GPU catalog",
         ));
     }
-    Ok(Some(route))
+    Ok(route)
 }
 
 /// Validate caller overrides against one exact deployment-owned route.
@@ -1815,9 +1871,116 @@ fn governed_profile_and_pool(
     })
 }
 
+/// Keep caller profile intent before options normalization removes `default`.
+#[derive(Clone)]
+struct ExplicitProfileSelector;
+
+fn native_request_has_profile_selector(body: &[u8], msgpack: bool) -> bool {
+    if msgpack {
+        rmp_serde::from_slice::<rmpv::Value>(body)
+            .ok()
+            .and_then(|value| {
+                let map = value.as_map()?;
+                let nested = rmpv_map_get(map, "params")
+                    .and_then(rmpv::Value::as_map)
+                    .and_then(|params| rmpv_map_get(params, "options"));
+                Some(
+                    [rmpv_map_get(map, "options"), nested]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(rmpv::Value::as_map)
+                        .any(|options| rmpv_map_get(options, "profile").is_some()),
+                )
+            })
+            .unwrap_or(false)
+    } else {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .is_some_and(|value| {
+                [
+                    value.get("options"),
+                    value.get("params").and_then(|params| params.get("options")),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|options| options.get("profile").is_some())
+            })
+    }
+}
+
+/// A gateway-owned bridge selector; callers cannot create request extensions.
+#[derive(Clone)]
+struct RemoteFallbackOverride(crate::state::model_registry::RemoteFallbackPlan);
+
+/// A request's latest numerical admission decision. A threshold route and a
+/// later fallback trigger can both decide for one request, which counts once,
+/// with the decision that applied.
+#[derive(Clone, Default)]
+struct NumericalDecision(Arc<std::sync::Mutex<Option<NumericalDecisionRecord>>>);
+
+struct NumericalDecisionRecord {
+    model: String,
+    operation: String,
+    refusal: Option<crate::state::worker_registry::NumericalRefusal>,
+}
+
+impl NumericalDecision {
+    fn install(req: &mut Request) -> Self {
+        if let Some(existing) = req.extensions().get::<Self>() {
+            return existing.clone();
+        }
+        let decision = Self::default();
+        req.extensions_mut().insert(decision.clone());
+        decision
+    }
+
+    fn note(
+        ext: &axum::http::Extensions,
+        model: &str,
+        operation: &str,
+        refusal: Option<crate::state::worker_registry::NumericalRefusal>,
+    ) {
+        let Some(decision) = ext.get::<Self>() else {
+            crate::observability::metrics::record_numerical_admission(model, operation, refusal);
+            return;
+        };
+        *decision
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(NumericalDecisionRecord {
+            model: model.to_string(),
+            operation: operation.to_string(),
+            refusal,
+        });
+    }
+
+    fn record(&self) {
+        let latest = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(latest) = latest {
+            crate::observability::metrics::record_numerical_admission(
+                &latest.model,
+                &latest.operation,
+                latest.refusal,
+            );
+        }
+    }
+}
+
+/// The trigger a bridged remote attempt carries to its worker. A remote route
+/// with no held local refusal, such as a low-demand threshold route, has none.
+fn bridged_fallback_reason(ext: &axum::http::Extensions) -> Option<FallbackTrigger> {
+    ext.get::<RemoteFallbackOverride>()?;
+    ext.get::<FallbackAttempt>()?.trigger()
+}
+
 /// The routing decision for a request: canonical model name, serving bundle,
 /// and engine. Produced by [`resolve_routing`].
 struct RoutingResult {
+    caller_selected_route: bool,
     model_name: String,
     dispatch_model: String,
     bundle: String,
@@ -1879,6 +2042,7 @@ async fn resolve_routing(
         resolve_model_spec_with_aliases(&state.config.model_aliases, &model, |m| {
             state.model_registry.resolve_canonical_model_name(m)
         });
+    let caller_selected_route = !bundle_override.is_empty() || model_name.contains(':');
     // #1841 org-scoped visibility: a custom model hidden from this caller is
     // treated as ABSENT — the identical MODEL_NOT_FOUND 404 the dispatcher emits
     // for an unknown model — so there is no cross-org existence oracle. Decided on
@@ -1931,12 +2095,31 @@ async fn resolve_routing(
     {
         debug_assert_eq!(route.engine, "sealed");
         return Ok(RoutingResult {
+            caller_selected_route,
             dispatch_model: model_name.clone(),
             model_name,
             bundle: route.bundle,
             engine: route.engine,
             gpu: route.machine_profile,
             pool_name: route.pool,
+            gpu_configured: true,
+        });
+    }
+    if let Some(RemoteFallbackOverride(plan)) = ext.get::<RemoteFallbackOverride>() {
+        let governed = match generation_intent {
+            Some(intent) => {
+                governed_bridge_route(state, ext, &model_name, intent, plan).map_err(Box::new)?
+            }
+            None => None,
+        };
+        return Ok(RoutingResult {
+            caller_selected_route,
+            model_name,
+            dispatch_model: plan.model.clone(),
+            bundle: plan.bundle.clone(),
+            engine: plan.engine.clone(),
+            gpu: governed.map_or_else(String::new, |route| route.machine_profile),
+            pool_name: plan.pool.clone(),
             gpu_configured: true,
         });
     }
@@ -2143,6 +2326,7 @@ async fn resolve_routing(
     };
 
     Ok(RoutingResult {
+        caller_selected_route,
         model_name,
         dispatch_model,
         bundle,
@@ -2153,6 +2337,631 @@ async fn resolve_routing(
     })
 }
 
+/// Shared OSS admission for a bridge that never carries numerical outputs.
+/// Deployment-governed routes retain their own authority until they
+/// explicitly admit a remote physical route.
+#[allow(clippy::too_many_arguments)]
+fn fallback_plan_for_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    ext: &axum::http::Extensions,
+    model: &str,
+    allowed: bool,
+    explicit_bundle: &str,
+    trigger: FallbackTrigger,
+    intent: GenerationRequestIntent,
+) -> Option<crate::state::model_registry::RemoteFallbackPlan> {
+    fallback_plan_candidate(
+        state,
+        headers,
+        ext,
+        model,
+        allowed,
+        explicit_bundle,
+        trigger,
+        Some(intent),
+    )
+    .filter(|plan| plan.numerical.is_none())
+}
+
+/// The configured bridge for a request, numerical or not. A numerical plan
+/// must pass [`admit_numerical`] before the gateway commits to it.
+#[allow(clippy::too_many_arguments)]
+fn fallback_plan_candidate(
+    state: &AppState,
+    headers: &HeaderMap,
+    ext: &axum::http::Extensions,
+    model: &str,
+    allowed: bool,
+    explicit_bundle: &str,
+    trigger: FallbackTrigger,
+    generation: Option<GenerationRequestIntent>,
+) -> Option<crate::state::model_registry::RemoteFallbackPlan> {
+    let attempt = ext.get::<FallbackAttempt>()?;
+    if !allowed
+        || !explicit_bundle.is_empty()
+        || attempt.active()
+        || ext.get::<RemoteFallbackOverride>().is_some()
+        || ext.get::<ExplicitProfileSelector>().is_some()
+        || remote_forbidden(headers).unwrap_or(true)
+        || ["x-sie-machine-profile", "x-sie-pool", "x-sie-engine"]
+            .iter()
+            .any(|name| headers.contains_key(*name))
+        || !state
+            .work_publisher
+            .as_ref()
+            .is_some_and(|publisher| publisher.supports_execution_authority_v1())
+    {
+        return None;
+    }
+    state
+        .model_registry
+        .remote_fallback_plan(model, trigger)
+        .filter(|plan| {
+            generation
+                .is_none_or(|intent| governed_generation_plan(state, ext, model, intent, plan))
+        })
+        .filter(|plan| {
+            remote_route_admitted(state, ext, plan, RemoteRouteReason::Fallback(trigger))
+        })
+}
+
+/// A deployment policy decides each implicit remote route of a bare model,
+/// once per request. It is asked only about a remote profile the caller may
+/// see and the deployment serves.
+fn remote_route_admitted(
+    state: &AppState,
+    ext: &axum::http::Extensions,
+    plan: &crate::state::model_registry::RemoteFallbackPlan,
+    reason: RemoteRouteReason,
+) -> bool {
+    let Some(policy) = state.model_access_policy.as_deref() else {
+        return true;
+    };
+    FallbackAttempt::remote_route_decision(ext, &plan.model, reason, || {
+        policy.visible(&plan.model, ext)
+            && policy
+                .serving_refusal(&plan.model, &without_admission_outcome(ext))
+                .is_none()
+            && policy.remote_route_admitted(&plan.local_model, &plan.model, reason, ext)
+    })
+}
+
+/// The request's extensions for asking about a profile it may not use. A
+/// refusal recorded there must not become the request's own outcome.
+fn without_admission_outcome(ext: &axum::http::Extensions) -> axum::http::Extensions {
+    let mut probe = ext.clone();
+    probe.remove::<crate::observability::metrics::AdmissionOutcomeSlot>();
+    probe
+}
+
+fn generation_route_policy(state: &AppState) -> Option<&dyn GenerationRoutePolicy> {
+    state
+        .model_access_policy
+        .as_deref()
+        .and_then(ModelAccessPolicy::generation_route_policy)
+}
+
+/// The deployment's governed remote route for a generation request, the same
+/// for every question within one request.
+fn governed_remote_route(
+    state: &AppState,
+    ext: &axum::http::Extensions,
+    customer_model: &str,
+    intent: GenerationRequestIntent,
+) -> Option<GovernedGenerationRoute> {
+    let policy = generation_route_policy(state)?;
+    FallbackAttempt::governed_remote_route(ext, customer_model, intent, || {
+        policy.resolve_remote(customer_model, intent)
+    })
+}
+
+/// A deployment-governed generation request is bridged only to the remote
+/// route the deployment names for its model and intent.
+fn generation_bridge_allowed(
+    state: &AppState,
+    ext: &axum::http::Extensions,
+    customer_model: &str,
+    intent: GenerationRequestIntent,
+) -> bool {
+    generation_route_policy(state).is_none()
+        || governed_remote_route(state, ext, customer_model, intent).is_some()
+}
+
+/// A governed generation bridge must agree with the deployment's remote
+/// route, the same model, bundle and pool, and that route must be one the
+/// bridged request can dispatch on. It is checked before the deployment's
+/// admission hooks are asked.
+fn governed_generation_plan(
+    state: &AppState,
+    ext: &axum::http::Extensions,
+    customer_model: &str,
+    intent: GenerationRequestIntent,
+    plan: &crate::state::model_registry::RemoteFallbackPlan,
+) -> bool {
+    generation_route_policy(state).is_none()
+        || governed_remote_route(state, ext, customer_model, intent).is_some_and(|route| {
+            remote_route_agrees(&route, plan)
+                && checked_governed_route(state, customer_model, intent, route).is_ok()
+        })
+}
+
+fn remote_route_agrees(
+    route: &GovernedGenerationRoute,
+    plan: &crate::state::model_registry::RemoteFallbackPlan,
+) -> bool {
+    route.model == plan.model && route.bundle == plan.bundle && route.pool == plan.pool
+}
+
+/// The generation intent of a native request, as routing derives it.
+fn generation_intent_of(params: &publisher::WorkParams) -> GenerationRequestIntent {
+    if params
+        .generate
+        .as_ref()
+        .and_then(|generate| generate.grammar.as_ref())
+        .is_some()
+    {
+        GenerationRequestIntent::Grammar
+    } else {
+        GenerationRequestIntent::Default
+    }
+}
+
+/// A transport that manages its own capacity can report a cold lane that the
+/// registry still lists.
+fn transport_lane_provisioning(
+    state: &AppState,
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    model: &str,
+) -> bool {
+    state.work_publisher.as_ref().is_some_and(|publisher| {
+        publisher.lane_provisioning(&LaneKey::new(pool, machine_profile, bundle), model)
+    })
+}
+
+/// The lane a transport wakes for a `provisioning` bridge. No worker is
+/// pinned, because the transport reports that none is ready.
+fn lane_wake_target(
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    model: &str,
+) -> publisher::PublishTarget {
+    publisher::PublishTarget::Pool {
+        pool: pool.to_string(),
+        machine_profile: machine_profile.to_string(),
+        bundle: bundle.to_string(),
+        model: model.to_string(),
+    }
+}
+
+/// Threshold decisions are counted only after caller validation and before
+/// any local demand or work is published. Caller selectors retain authority.
+#[allow(clippy::too_many_arguments)]
+fn threshold_remote_plan_for_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    ext: &axum::http::Extensions,
+    model: &str,
+    operation: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    allowed: bool,
+    explicit_bundle: &str,
+    generation: Option<GenerationRequestIntent>,
+) -> Option<crate::state::model_registry::RemoteFallbackPlan> {
+    if !allowed
+        || !explicit_bundle.is_empty()
+        || ext.get::<RemoteFallbackOverride>().is_some()
+        || ext.get::<ExplicitProfileSelector>().is_some()
+        || ["x-sie-machine-profile", "x-sie-pool", "x-sie-engine"]
+            .iter()
+            .any(|name| headers.contains_key(*name))
+        || !state
+            .work_publisher
+            .as_ref()
+            .is_some_and(|publisher| publisher.supports_execution_authority_v1())
+    {
+        return None;
+    }
+    let epoch = state.config_epoch.get();
+    let governed = |plan: &crate::state::model_registry::RemoteFallbackPlan| {
+        generation.is_none_or(|intent| governed_generation_plan(state, ext, model, intent, plan))
+    };
+    let plan = state.model_registry.threshold_remote_route(
+        model,
+        epoch,
+        generation.is_some().then_some(
+            &governed as &dyn Fn(&crate::state::model_registry::RemoteFallbackPlan) -> bool,
+        ),
+    )?;
+    if state.config_epoch.get() != epoch
+        || remote_forbidden(headers).unwrap_or(true)
+        || (plan.numerical.is_some() && !matches!(operation, "encode" | "score"))
+        || !remote_route_admitted(state, ext, &plan, RemoteRouteReason::Threshold)
+    {
+        return None;
+    }
+    admit_numerical(state, plan, operation, parsed, ext)
+}
+
+/// Commit to a numerical plan only when a current admission covers every
+/// local process that could serve the model and the request stays within what
+/// the admission measured; note the decision. Other plans pass unchanged.
+fn admit_numerical(
+    state: &AppState,
+    mut plan: crate::state::model_registry::RemoteFallbackPlan,
+    operation: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    ext: &axum::http::Extensions,
+) -> Option<crate::state::model_registry::RemoteFallbackPlan> {
+    let Some(route) = plan.numerical.as_ref() else {
+        return Some(plan);
+    };
+    let decision = match numerical_request_outputs(operation, parsed, &route.outputs) {
+        None => Err(crate::state::worker_registry::NumericalRefusal::UnmeasuredRequest),
+        Some(outputs) => {
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| {
+                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+                });
+            state.registry.numerical_admission(
+                &crate::state::worker_registry::NumericalLanes {
+                    model: &route.model,
+                    local_bundles: &route.local_bundles,
+                    local_pool: &route.local_pool,
+                    remote_model: &plan.model,
+                    remote_bundle: &plan.bundle,
+                    remote_pool: &plan.pool,
+                    remote_hash: &plan.config_hash,
+                    outputs: &outputs,
+                },
+                now_unix_ms,
+            )
+        }
+    };
+    NumericalDecision::note(
+        ext,
+        &route.model,
+        operation,
+        decision.as_ref().err().copied(),
+    );
+    let admitted = Arc::new(decision.ok()?);
+    if let Some(route) = plan.numerical.as_mut() {
+        route.admitted = Some(admitted);
+    }
+    Some(plan)
+}
+
+/// The outputs a numerical request asks for, when it sets no instruction and
+/// no runtime option that a numerical admission could not have measured, and
+/// asks only for outputs the model declares. The remote process refuses an
+/// instruction and any option except `is_query` that differs from the
+/// measured defaults, so such a request stays local. A request for an
+/// undeclared output is invalid on either side.
+fn numerical_request_outputs(
+    operation: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    declared: &[String],
+) -> Option<Vec<String>> {
+    let (_, params) = parsed?;
+    let measured = params.instruction.is_none()
+        && match params.options.as_ref() {
+            None | Some(Value::Null) => true,
+            Some(Value::Object(options)) => options.keys().all(|key| key == "is_query"),
+            Some(_) => false,
+        };
+    if !measured {
+        return None;
+    }
+    let outputs = match operation {
+        "encode" => params
+            .output_types
+            .clone()
+            .unwrap_or_else(|| vec!["dense".to_string()]),
+        "score" => vec!["score".to_string()],
+        _ => return None,
+    };
+    outputs
+        .iter()
+        .all(|output| declared.contains(output))
+        .then_some(outputs)
+}
+
+/// The admitted remote workers a bridged numerical plan pins, for its bare
+/// model. A numerical plan the gateway has not admitted pins none.
+fn bridged_numerical_pin(
+    ext: &axum::http::Extensions,
+) -> Option<(String, Arc<crate::state::worker_registry::AdmittedWorkers>)> {
+    let RemoteFallbackOverride(plan) = ext.get::<RemoteFallbackOverride>()?;
+    let route = plan.numerical.as_ref()?;
+    Some((
+        route.model.clone(),
+        route.admitted.clone().unwrap_or_default(),
+    ))
+}
+
+/// The admission digest a bridged numerical item names: the one its pinned
+/// worker advertised when the gateway admitted the bridge.
+fn bridged_numerical_admission(
+    ext: &axum::http::Extensions,
+    target: Option<&publisher::PublishTarget>,
+) -> Option<String> {
+    let RemoteFallbackOverride(plan) = ext.get::<RemoteFallbackOverride>()?;
+    let admitted = plan.numerical.as_ref()?.admitted.as_ref()?;
+    let publisher::PublishTarget::VerifiedWorker {
+        worker_id,
+        numerical_admission: true,
+        ..
+    } = target?
+    else {
+        return None;
+    };
+    admitted.get(worker_id).cloned()
+}
+
+/// Refusal classification is scoped to the local route and admitted workers.
+/// It carries no dispatch authority and never accepts inference work.
+#[allow(clippy::too_many_arguments)]
+async fn local_spill_trigger(
+    state: &AppState,
+    model: &str,
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    hash: &str,
+    admission_pool: &str,
+) -> Option<FallbackTrigger> {
+    let admitted = state
+        .pool_manager
+        .admitted_worker_names_for_capped_lane(admission_pool, machine_profile, bundle)
+        .await;
+    if let Some(trigger) = state
+        .registry
+        .unavailable_lane_trigger(
+            model,
+            pool,
+            machine_profile,
+            bundle,
+            hash,
+            admitted.as_ref(),
+        )
+        .await
+    {
+        return Some(trigger);
+    }
+    state.work_publisher.as_ref().and_then(|publisher| {
+        publisher
+            .pre_dispatch_backpressure(&LaneKey::new(pool, machine_profile, bundle))
+            .err()
+            .map(|_| FallbackTrigger::Saturated)
+    })
+}
+
+/// A cold lookup may fan out over configured machine profiles. Classify each
+/// concrete admitted lane; an unassigned worker cannot choose its trigger.
+#[allow(clippy::too_many_arguments)]
+async fn cold_fallback_trigger(
+    state: &AppState,
+    model: &str,
+    pool: &str,
+    profiles: &[String],
+    bundle: &str,
+    hash: &str,
+    admission_pool: &str,
+) -> FallbackTrigger {
+    let mut all_unhealthy = true;
+    let mut configured_lane = false;
+    let mut saturated = false;
+    for profile in profiles {
+        if state
+            .demand_tracker
+            .resolve_lane(pool, profile, bundle)
+            .is_none()
+        {
+            continue;
+        }
+        configured_lane = true;
+        let admitted = state
+            .pool_manager
+            .admitted_worker_names_for_capped_lane(admission_pool, profile, bundle)
+            .await;
+        match state
+            .registry
+            .unavailable_lane_trigger(model, pool, profile, bundle, hash, admitted.as_ref())
+            .await
+        {
+            Some(FallbackTrigger::Saturated) => saturated = true,
+            Some(FallbackTrigger::Unhealthy) => {}
+            _ => all_unhealthy = false,
+        }
+    }
+    if saturated {
+        FallbackTrigger::Saturated
+    } else if configured_lane && all_unhealthy {
+        FallbackTrigger::Unhealthy
+    } else {
+        FallbackTrigger::Provisioning
+    }
+}
+
+fn local_spill_refusal(endpoint: &str, trigger: FallbackTrigger) -> Response {
+    let message = match trigger {
+        FallbackTrigger::Unhealthy => "Local workers are unhealthy",
+        _ => "backpressure: local capacity is saturated",
+    };
+    let mut response = endpoint_error_response(
+        endpoint,
+        StatusCode::SERVICE_UNAVAILABLE,
+        err_code::QUEUE_UNAVAILABLE,
+        oai_type::SERVER_ERROR,
+        oai_code::TRANSPORT_FAILURE,
+        None,
+        message,
+    );
+    let retry_after = if trigger == FallbackTrigger::Unhealthy {
+        PROVISIONING_RETRY_AFTER
+    } else {
+        BACKPRESSURE_RETRY_AFTER
+    };
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static(retry_after));
+    response
+}
+
+/// Broker acceptance of load-only work is required before model-loading
+/// fallback; the pending marker remains until real local traffic takes over.
+async fn warm_local_model(
+    state: &AppState,
+    publisher: &dyn WorkDispatcher,
+    lane: &PhysicalLane,
+    target: publisher::PublishTarget,
+    engine: &str,
+    hash: &str,
+) -> bool {
+    state.demand_tracker.record(lane);
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (_, durability) = publisher.publish_model_load(target, engine, hash).await?;
+            durability.wait().await.map_err(DispatchError::Other)
+        })
+        .await,
+        Ok(Ok(()))
+    )
+}
+
+fn model_loading_refusal(endpoint: &str) -> Response {
+    let mut refusal = endpoint_error_response(
+        endpoint,
+        StatusCode::SERVICE_UNAVAILABLE,
+        MODEL_LOADING_ERROR_CODE,
+        oai_type::SERVER_ERROR,
+        MODEL_LOADING_ERROR_CODE,
+        None,
+        "Local model is loading",
+    );
+    refusal.headers_mut().insert(
+        "retry-after",
+        HeaderValue::from_static(MODEL_LOADING_RETRY_AFTER),
+    );
+    refusal
+}
+
+fn native_bridge_eligible(
+    endpoint: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    body_held: bool,
+) -> bool {
+    if matches!(endpoint, "encode" | "score") {
+        return body_held;
+    }
+    parsed.is_some_and(|(items, params)| match endpoint {
+        "generate" => params.generate.is_some(),
+        "extract" => {
+            !items.is_empty()
+                && items.iter().all(|item| {
+                    item.as_map()
+                        .and_then(|fields| rmpv_map_get(fields, "metadata"))
+                        .filter(|value| !value.is_nil())
+                        .is_none_or(|value| worker_metadata_encoded_size(value).is_some())
+                })
+        }
+        _ => false,
+    })
+}
+
+/// Begin one bridge only at a typed pre-dispatch refusal. A numerical plan
+/// serves only encode and score, and only once admitted; no failure after a
+/// work item was published reaches this helper.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+fn native_fallback_plan(
+    state: &AppState,
+    req: &Request,
+    endpoint: &str,
+    model: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    body_held: bool,
+    trigger: FallbackTrigger,
+) -> Option<crate::state::model_registry::RemoteFallbackPlan> {
+    let intent = parsed.map_or(GenerationRequestIntent::Default, |(_, params)| {
+        generation_intent_of(params)
+    });
+    let generation = (endpoint == "generate").then_some(intent);
+    let eligible = native_bridge_eligible(endpoint, parsed, body_held)
+        && generation
+            .is_none_or(|intent| generation_bridge_allowed(state, req.extensions(), model, intent));
+    fallback_plan_candidate(
+        state,
+        req.headers(),
+        req.extensions(),
+        model,
+        eligible,
+        "",
+        trigger,
+        generation,
+    )
+    .filter(|plan| {
+        plan.numerical.as_ref().is_none_or(|route| {
+            numerical_request_outputs(endpoint, parsed, &route.outputs).is_some()
+        })
+    })
+}
+
+/// The bridge a request would take, admitted in full: the deployment's
+/// decision and, for a numerical plan, its admission.
+#[allow(clippy::too_many_arguments)]
+fn native_bridge_plan(
+    state: &AppState,
+    req: &Request,
+    endpoint: &str,
+    model: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    body_held: bool,
+    trigger: FallbackTrigger,
+) -> Option<crate::state::model_registry::RemoteFallbackPlan> {
+    native_fallback_plan(state, req, endpoint, model, parsed, body_held, trigger)
+        .and_then(|plan| admit_numerical(state, plan, endpoint, parsed, req.extensions()))
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+fn begin_native_fallback(
+    state: &AppState,
+    req: &mut Request,
+    endpoint: &str,
+    model: &str,
+    parsed: Option<&(Vec<rmpv::Value>, publisher::WorkParams)>,
+    body_held: bool,
+    refusal: Response,
+    trigger: FallbackTrigger,
+) -> Result<(), Response> {
+    let Some(plan) = native_bridge_plan(state, req, endpoint, model, parsed, body_held, trigger)
+    else {
+        return Err(refusal);
+    };
+    begin_planned_native_fallback(req, plan, refusal, trigger);
+    Ok(())
+}
+
+fn begin_planned_native_fallback(
+    req: &mut Request,
+    plan: crate::state::model_registry::RemoteFallbackPlan,
+    refusal: Response,
+    trigger: FallbackTrigger,
+) {
+    let attempt = req
+        .extensions()
+        .get::<FallbackAttempt>()
+        .expect("plan requires a request-owned attempt");
+    assert!(
+        attempt.begin(refusal, trigger),
+        "request-owned bridge begins once synchronously"
+    );
+    req.extensions_mut().insert(RemoteFallbackOverride(plan));
+}
+
 pub(crate) async fn proxy_request(
     State(state): State<Arc<AppState>>,
     mut req: Request,
@@ -2160,7 +2969,13 @@ pub(crate) async fn proxy_request(
 ) -> Response {
     // SDK version skew detection
     check_sdk_version(req.headers());
+    if let Some(response) = invalid_remote_header_response(endpoint, req.headers()) {
+        return response;
+    }
     let disclosure = ServingDisclosure::install(&mut req);
+    let fallback = FallbackAttempt::install(&mut req);
+    let numerical_decision = NumericalDecision::install(&mut req);
+    let defer_fallback = req.extensions().get::<DeferredFallbackFinish>().is_some();
     let provisioning_surface = provisioning_surface_for_endpoint(endpoint);
 
     // Keep the pre-generation queue hot path untouched for encode /
@@ -2215,8 +3030,13 @@ pub(crate) async fn proxy_request(
             inbound_publish_cx,
         )
         .await;
+        numerical_decision.record();
         disclosure.stamp(response.status(), response.headers_mut());
-        response
+        if defer_fallback {
+            response
+        } else {
+            fallback.finish(response)
+        }
     }
     .instrument(proxy_span)
     .await
@@ -2229,23 +3049,27 @@ async fn proxy_request_inner(
     provisioning_surface: ProvisioningSurface,
     inbound_publish_cx: Option<opentelemetry::Context>,
 ) -> Response {
-    // Native generation routing depends on request intent (default vs grammar),
-    // including in the no-policy OSS composition where grammar selects a
-    // profile-qualified model. Inspect the bounded body once before worker
-    // lookup and preserve the typed parse for the dispatch driver.
-    let mut governed_generate_body = None;
-    let mut governed_generate_parsed = None;
-    let generation_intent = if endpoint == "generate" {
+    let prefetch_first_output = req
+        .extensions()
+        .get::<FallbackAttempt>()
+        .is_some_and(FallbackAttempt::active);
+    // Inspect bridge-capable requests before worker lookup. Generation also
+    // needs default/grammar intent for routing. Preserve the bounded body and
+    // typed parse for dispatch and for the single remote attempt.
+    let mut prepared_native_body = None;
+    let mut prepared_native_parsed = None;
+    let generation_intent = if matches!(endpoint, "generate" | "extract") {
+        let body_limit = native_request_body_limit(endpoint);
         let is_msgpack = req
             .headers()
             .get("content-type")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|content_type| content_type.contains("msgpack"));
         let (parts, body) = req.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, MAX_GENERATE_BODY).await {
+        let body_bytes = match axum::body::to_bytes(body, body_limit).await {
             Ok(body) => body,
             Err(error) => {
-                let (status, code, message) = request_body_error(&error, MAX_GENERATE_BODY);
+                let (status, code, message) = request_body_error(&error, body_limit);
                 return endpoint_error_response(
                     endpoint,
                     status,
@@ -2262,24 +3086,19 @@ async fn proxy_request_inner(
             Ok(parsed) => parsed,
             Err(error) => return queue_parse_error_response(endpoint, error),
         };
-        let intent = if params
-            .generate
-            .as_ref()
-            .and_then(|generate| generate.grammar.as_ref())
-            .is_some()
-        {
-            GenerationRequestIntent::Grammar
-        } else {
-            GenerationRequestIntent::Default
-        };
-        governed_generate_body = Some(body_bytes);
-        governed_generate_parsed = Some((items, params));
-        Some(intent)
+        if native_request_has_profile_selector(&body_bytes, is_msgpack) {
+            req.extensions_mut().insert(ExplicitProfileSelector);
+        }
+        let intent = generation_intent_of(&params);
+        prepared_native_body = Some(body_bytes);
+        prepared_native_parsed = Some((items, params));
+        (endpoint == "generate").then_some(intent)
     } else {
         None
     };
 
     let RoutingResult {
+        caller_selected_route,
         model_name,
         dispatch_model,
         bundle,
@@ -2300,16 +3119,72 @@ async fn proxy_request_inner(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
+    if caller_selected_route {
+        req.extensions_mut().insert(ExplicitProfileSelector);
+    }
     ServingDisclosure::record(&state, req.extensions(), &dispatch_model);
+    // A numerical bridge needs the body to detect a caller's profile selector,
+    // to check the request against the admission and to replay it remotely.
+    // The request is validated before either side counts it. Other encode and
+    // score requests keep streaming their body straight to the queue path.
+    if prepared_native_body.is_none()
+        && matches!(endpoint, "encode" | "score")
+        && state.model_registry.has_numerical_bridge(&model_name)
+    {
+        let body_limit = native_request_body_limit(endpoint);
+        let is_msgpack = req
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|content_type| content_type.contains("msgpack"));
+        let (parts, body) = req.into_parts();
+        let body_bytes = match axum::body::to_bytes(body, body_limit).await {
+            Ok(body) => body,
+            Err(error) => {
+                let (status, code, message) = request_body_error(&error, body_limit);
+                return endpoint_error_response(
+                    endpoint,
+                    status,
+                    code,
+                    oai_type::INVALID_REQUEST,
+                    oai_code::INVALID_REQUEST,
+                    None,
+                    message,
+                );
+            }
+        };
+        req = Request::from_parts(parts, Body::empty());
+        let parsed = match parse_queue_request(&body_bytes, is_msgpack, endpoint) {
+            Ok(parsed) => parsed,
+            Err(error) => return queue_parse_error_response(endpoint, error),
+        };
+        if let Some(response) = queue_items_error(endpoint, &parsed.0) {
+            return response;
+        }
+        if native_request_has_profile_selector(&body_bytes, is_msgpack) {
+            req.extensions_mut().insert(ExplicitProfileSelector);
+        }
+        prepared_native_body = Some(body_bytes);
+        prepared_native_parsed = Some(parsed);
+    }
+    let body_held = prepared_native_body.is_some();
 
-    if let Some((items, params)) = governed_generate_parsed.as_ref() {
-        if let Some(response) = validate_native_generate_pre_admission(
-            &state,
-            &model_name,
-            &dispatch_model,
-            items,
-            params,
-        ) {
+    if let Some((items, params)) = prepared_native_parsed
+        .as_ref()
+        .filter(|_| matches!(endpoint, "generate" | "extract"))
+    {
+        let response = if endpoint == "generate" {
+            validate_native_generate_pre_admission(
+                &state,
+                &model_name,
+                &dispatch_model,
+                items,
+                params,
+            )
+        } else {
+            validate_native_extract_pre_admission(&state, &dispatch_model, items)
+        };
+        if let Some(response) = response {
             return response;
         }
     }
@@ -2376,9 +3251,35 @@ async fn proxy_request_inner(
         let requested_pool = normalize_pool_name(&pool_name);
         return build_pool_not_found_response_for_surface(&requested_pool, provisioning_surface);
     };
-    let (bundle_config_hash, model_revision, uses_catalog_scope) = state
+    let (bundle_config_hash, model_revision, uses_catalog_scope, served_by) = state
         .model_registry
-        .bundle_execution_evidence(&bundle, &hash_pool, &dispatch_model);
+        .serving_execution_evidence(&bundle, &hash_pool, &dispatch_model);
+    ServingDisclosure::record_evidence(req.extensions(), served_by.clone());
+    FallbackAttempt::record_model(req.extensions(), &dispatch_model, endpoint);
+    if let Some(RemoteFallbackOverride(plan)) = req.extensions().get::<RemoteFallbackOverride>() {
+        if plan.config_hash != bundle_config_hash
+            || served_by.as_ref() != Some(&plan.served_by)
+            || plan.revision != model_revision
+        {
+            return endpoint_error_response(
+                endpoint,
+                StatusCode::SERVICE_UNAVAILABLE,
+                err_code::QUEUE_UNAVAILABLE,
+                oai_type::SERVER_ERROR,
+                oai_code::TRANSPORT_FAILURE,
+                None,
+                "Bridge execution evidence changed before dispatch",
+            );
+        }
+    }
+    if let Some(response) = remote_control_response(
+        endpoint,
+        req.headers(),
+        served_by.as_ref(),
+        &bundle_config_hash,
+    ) {
+        return response;
+    }
     if !catalog_execution_hash_is_ready(&bundle_config_hash, uses_catalog_scope) {
         return endpoint_error_response(
             endpoint,
@@ -2389,6 +3290,40 @@ async fn proxy_request_inner(
             None,
             "Model execution evidence is unavailable while configuration converges",
         );
+    }
+
+    let native_intent = prepared_native_parsed
+        .as_ref()
+        .map_or(GenerationRequestIntent::Default, |(_, params)| {
+            generation_intent_of(params)
+        });
+    let native_generation = (endpoint == "generate").then_some(native_intent);
+    if let Some(plan) = threshold_remote_plan_for_request(
+        &state,
+        req.headers(),
+        req.extensions(),
+        &model_name,
+        endpoint,
+        prepared_native_parsed.as_ref(),
+        native_bridge_eligible(endpoint, prepared_native_parsed.as_ref(), body_held)
+            && native_generation.is_none_or(|intent| {
+                generation_bridge_allowed(&state, req.extensions(), &model_name, intent)
+            }),
+        "",
+        native_generation,
+    ) {
+        req.extensions_mut().insert(RemoteFallbackOverride(plan));
+        if let Some(body) = prepared_native_body {
+            *req.body_mut() = Body::from(body);
+        }
+        return Box::pin(proxy_request_inner(
+            state,
+            req,
+            endpoint,
+            provisioning_surface,
+            inbound_publish_cx,
+        ))
+        .await;
     }
 
     // Resolve the effective pool in one shot. `resolve_effective_pool`
@@ -2427,7 +3362,43 @@ async fn proxy_request_inner(
             return build_pool_not_found_response_for_surface(&pool, provisioning_surface);
         }
         PoolResolution::Provisioning => {
-            return build_provisioning_response_for_surface(&gpu, &bundle, provisioning_surface);
+            let trigger = cold_fallback_trigger(
+                &state,
+                &dispatch_model,
+                &demand_pool,
+                &pending_demand_profiles,
+                &bundle,
+                &bundle_config_hash,
+                &admission_pool,
+            )
+            .await;
+            let refusal =
+                build_provisioning_response_for_surface(&gpu, &bundle, provisioning_surface);
+            match begin_native_fallback(
+                &state,
+                &mut req,
+                endpoint,
+                &model_name,
+                prepared_native_parsed.as_ref(),
+                body_held,
+                refusal,
+                trigger,
+            ) {
+                Err(refusal) => return refusal,
+                Ok(()) => {
+                    if let Some(body) = prepared_native_body {
+                        *req.body_mut() = Body::from(body);
+                    }
+                    return Box::pin(proxy_request_inner(
+                        state,
+                        req,
+                        endpoint,
+                        provisioning_surface,
+                        inbound_publish_cx,
+                    ))
+                    .await;
+                }
+            }
         }
     };
     let effective_pool = &effective_route.pool_name;
@@ -2467,8 +3438,274 @@ async fn proxy_request_inner(
         return resp;
     }
 
+    let provisioning_bridge = if transport_lane_provisioning(
+        &state,
+        effective_pool,
+        effective_machine_profile,
+        &bundle,
+        &dispatch_model,
+    ) {
+        native_bridge_plan(
+            &state,
+            &req,
+            endpoint,
+            &model_name,
+            prepared_native_parsed.as_ref(),
+            body_held,
+            FallbackTrigger::Provisioning,
+        )
+    } else {
+        None
+    };
+    if provisioning_bridge.is_some() {
+        let refusal = build_provisioning_response_for_surface(&gpu, &bundle, provisioning_surface);
+        let target = lane_wake_target(
+            effective_pool,
+            effective_machine_profile,
+            &bundle,
+            &dispatch_model,
+        );
+        if !warm_local_model(
+            &state,
+            work_publisher.as_ref(),
+            &physical_lane,
+            target,
+            &engine,
+            &bundle_config_hash,
+        )
+        .await
+        {
+            return refusal;
+        }
+        let Some(plan) = native_bridge_plan(
+            &state,
+            &req,
+            endpoint,
+            &model_name,
+            prepared_native_parsed.as_ref(),
+            body_held,
+            FallbackTrigger::Provisioning,
+        ) else {
+            return refusal;
+        };
+        begin_planned_native_fallback(&mut req, plan, refusal, FallbackTrigger::Provisioning);
+        if let Some(body) = prepared_native_body {
+            *req.body_mut() = Body::from(body);
+        }
+        return Box::pin(proxy_request_inner(
+            state,
+            req,
+            endpoint,
+            provisioning_surface,
+            inbound_publish_cx,
+        ))
+        .await;
+    }
+
+    if native_fallback_plan(
+        &state,
+        &req,
+        endpoint,
+        &model_name,
+        prepared_native_parsed.as_ref(),
+        body_held,
+        FallbackTrigger::Saturated,
+    )
+    .is_some()
+        || native_fallback_plan(
+            &state,
+            &req,
+            endpoint,
+            &model_name,
+            prepared_native_parsed.as_ref(),
+            body_held,
+            FallbackTrigger::Unhealthy,
+        )
+        .is_some()
+    {
+        if let Some(trigger) = local_spill_trigger(
+            &state,
+            &dispatch_model,
+            effective_pool,
+            effective_machine_profile,
+            &bundle,
+            &bundle_config_hash,
+            &admission_pool,
+        )
+        .await
+        {
+            if let Some(plan) = native_bridge_plan(
+                &state,
+                &req,
+                endpoint,
+                &model_name,
+                prepared_native_parsed.as_ref(),
+                body_held,
+                trigger,
+            ) {
+                state.demand_tracker.record(&physical_lane);
+                let refusal = local_spill_refusal(endpoint, trigger);
+                begin_planned_native_fallback(&mut req, plan, refusal, trigger);
+                if let Some(body) = prepared_native_body {
+                    *req.body_mut() = Body::from(body);
+                }
+                return Box::pin(proxy_request_inner(
+                    state,
+                    req,
+                    endpoint,
+                    provisioning_surface,
+                    inbound_publish_cx,
+                ))
+                .await;
+            }
+        }
+    }
+
+    if native_fallback_plan(
+        &state,
+        &req,
+        endpoint,
+        &model_name,
+        prepared_native_parsed.as_ref(),
+        body_held,
+        FallbackTrigger::ModelLoading,
+    )
+    .is_some()
+    {
+        let admitted = state
+            .pool_manager
+            .admitted_worker_names_for_capped_lane(
+                &admission_pool,
+                effective_machine_profile,
+                &bundle,
+            )
+            .await;
+        let loaded = state.registry.ring_snapshot_for_admitted(
+            &dispatch_model,
+            effective_pool,
+            effective_machine_profile,
+            &bundle,
+            &bundle_config_hash,
+            admitted.as_ref(),
+        );
+        if loaded.is_empty() {
+            if let Ok(target) = execution_authority_target(
+                &state,
+                &dispatch_model,
+                effective_pool,
+                effective_machine_profile,
+                &bundle,
+                &bundle_config_hash,
+                &admission_pool,
+                None,
+            )
+            .await
+            {
+                if native_bridge_plan(
+                    &state,
+                    &req,
+                    endpoint,
+                    &model_name,
+                    prepared_native_parsed.as_ref(),
+                    body_held,
+                    FallbackTrigger::ModelLoading,
+                )
+                .is_some()
+                {
+                    let refusal = model_loading_refusal(endpoint);
+                    if !warm_local_model(
+                        &state,
+                        work_publisher.as_ref(),
+                        &physical_lane,
+                        target,
+                        &engine,
+                        &bundle_config_hash,
+                    )
+                    .await
+                    {
+                        return refusal;
+                    }
+                    let Some(plan) = native_bridge_plan(
+                        &state,
+                        &req,
+                        endpoint,
+                        &model_name,
+                        prepared_native_parsed.as_ref(),
+                        body_held,
+                        FallbackTrigger::ModelLoading,
+                    ) else {
+                        return refusal;
+                    };
+                    begin_planned_native_fallback(
+                        &mut req,
+                        plan,
+                        refusal,
+                        FallbackTrigger::ModelLoading,
+                    );
+                    if let Some(body) = prepared_native_body {
+                        *req.body_mut() = Body::from(body);
+                    }
+                    return Box::pin(proxy_request_inner(
+                        state,
+                        req,
+                        endpoint,
+                        provisioning_surface,
+                        inbound_publish_cx,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    let require_execution_authority_v1 =
+        forbid_requires_execution_authority(&state, req.headers(), &model_name)
+            || req.extensions().get::<RemoteFallbackOverride>().is_some();
     let batch_target = if endpoint == "generate" {
         None
+    } else if require_execution_authority_v1 {
+        let numerical_pin = bridged_numerical_pin(req.extensions());
+        match execution_authority_target(
+            &state,
+            &dispatch_model,
+            effective_pool,
+            effective_machine_profile,
+            &bundle,
+            &bundle_config_hash,
+            &admission_pool,
+            numerical_pin
+                .as_ref()
+                .map(
+                    |(model, admitted)| crate::state::worker_registry::NumericalPin {
+                        model,
+                        admitted,
+                    },
+                )
+                .as_ref(),
+        )
+        .await
+        {
+            Ok(target) => Some(target),
+            Err(_) => {
+                let mut response = endpoint_error_response(
+                    endpoint,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    err_code::QUEUE_UNAVAILABLE,
+                    oai_type::SERVER_ERROR,
+                    oai_code::TRANSPORT_FAILURE,
+                    None,
+                    if numerical_pin.is_some() {
+                        "No admitted remote worker can run this numerical bridge"
+                    } else {
+                        "No current worker can verify local execution"
+                    },
+                );
+                response
+                    .headers_mut()
+                    .insert("retry-after", axum::http::HeaderValue::from_static("5"));
+                return response;
+            }
+        }
     } else {
         match batch_publish_target(
             &state,
@@ -2522,8 +3759,9 @@ async fn proxy_request_inner(
     // (encode / score) get the same text-appropriate 16 MiB cap as the
     // chat / embeddings paths. Extract accepts bounded binary media, so
     // its cap covers the maximum legal audio after JSON base64 expansion.
+    let request_extensions = req.extensions().clone();
     let body_limit = native_request_body_limit(endpoint);
-    let body_bytes = if let Some(body) = governed_generate_body {
+    let body_bytes = if let Some(body) = prepared_native_body {
         body
     } else {
         match axum::body::to_bytes(req.into_body(), body_limit).await {
@@ -2555,7 +3793,7 @@ async fn proxy_request_inner(
         effective_pool,
         &admission_pool,
         &body_bytes,
-        governed_generate_parsed,
+        prepared_native_parsed,
         is_msgpack_in,
         use_msgpack_out,
         &token_id,
@@ -2564,6 +3802,9 @@ async fn proxy_request_inner(
         &bundle_config_hash,
         model_revision.as_deref(),
         batch_target,
+        require_execution_authority_v1,
+        prefetch_first_output,
+        &request_extensions,
         &physical_lane,
     );
     // Scope an OTel context over the publish so the work-item envelope
@@ -2622,6 +3863,24 @@ fn managed_request_parent(req: &Request) -> opentelemetry::Context {
         })
 }
 
+/// The request-wide item checks of the queue path.
+fn queue_items_error(endpoint: &str, items: &[rmpv::Value]) -> Option<Response> {
+    let message = if items.is_empty() && endpoint != "score" && endpoint != "generate" {
+        "No items found in request body".to_string()
+    } else {
+        publisher::validate_queue_request_item_count(items.len()).err()?
+    };
+    Some(endpoint_error_response(
+        endpoint,
+        StatusCode::BAD_REQUEST,
+        err_code::INVALID_REQUEST,
+        oai_type::INVALID_REQUEST,
+        oai_code::INVALID_REQUEST,
+        None,
+        message,
+    ))
+}
+
 /// Route request through the queue-only JetStream path.
 ///
 /// `pool` is always pre-resolved by the caller via
@@ -2676,6 +3935,198 @@ fn unsupported_streaming_response(
     )
 }
 
+/// Reject configured output limits before demand, load-only work or bridging.
+fn generation_token_cap_response(
+    state: &AppState,
+    model: &str,
+    requested: u32,
+    field: &'static str,
+    profile: Option<&str>,
+) -> Option<Response> {
+    let info = state.model_registry.get_model_info(model)?;
+    let cap = profile
+        .and_then(|name| {
+            info.info_extras
+                .profile_max_output_tokens
+                .get(name)
+                .copied()
+        })
+        .or_else(|| info.effective_max_output_tokens())?;
+    if cap == 0 || requested <= cap {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json_openai_error(
+                format!("{field} ({requested}) exceeds model max_output_tokens ({cap})"),
+                oai_type::INVALID_REQUEST,
+                Some(field),
+                oai_code::INVALID_REQUEST,
+            )),
+        )
+            .into_response(),
+    )
+}
+
+/// Measure decoded worker metadata, not the original MessagePack encoding.
+/// Python unpacking widens F32 to float/F64. Extensions have no stable encoded
+/// size under the worker's repr hook, so they retain local-only behavior.
+fn worker_metadata_encoded_size(metadata: &rmpv::Value) -> Option<usize> {
+    let mut stack = vec![metadata];
+    let mut size = 0usize;
+    let container_header = |len: usize| {
+        if len <= 15 {
+            1
+        } else if len <= 65535 {
+            3
+        } else {
+            5
+        }
+    };
+    while let Some(value) = stack.pop() {
+        let bytes = match value {
+            rmpv::Value::Nil | rmpv::Value::Boolean(_) => 1,
+            rmpv::Value::Integer(value) => {
+                if let Some(value) = value.as_u64() {
+                    if value <= 127 {
+                        1
+                    } else if value <= 255 {
+                        2
+                    } else if value <= 65535 {
+                        3
+                    } else if value <= u32::MAX.into() {
+                        5
+                    } else {
+                        9
+                    }
+                } else {
+                    let value = value.as_i64()?;
+                    if value >= -32 {
+                        1
+                    } else if value >= i8::MIN.into() {
+                        2
+                    } else if value >= i16::MIN.into() {
+                        3
+                    } else if value >= i32::MIN.into() {
+                        5
+                    } else {
+                        9
+                    }
+                }
+            }
+            rmpv::Value::F32(_) | rmpv::Value::F64(_) => 9,
+            rmpv::Value::String(value) => {
+                let len = value.as_str()?.len();
+                len.saturating_add(if len <= 31 {
+                    1
+                } else if len <= 255 {
+                    2
+                } else if len <= 65535 {
+                    3
+                } else {
+                    5
+                })
+            }
+            rmpv::Value::Binary(value) => value.len().saturating_add(if value.len() <= 255 {
+                2
+            } else if value.len() <= 65535 {
+                3
+            } else {
+                5
+            }),
+            rmpv::Value::Array(items) => {
+                stack.extend(items);
+                container_header(items.len())
+            }
+            rmpv::Value::Map(fields) => {
+                for (key, value) in fields {
+                    stack.push(key);
+                    stack.push(value);
+                }
+                container_header(fields.len())
+            }
+            rmpv::Value::Ext(_, _) => return None,
+        };
+        size = size.checked_add(bytes)?;
+    }
+    Some(size)
+}
+
+fn validate_native_extract_pre_admission(
+    state: &AppState,
+    model: &str,
+    items: &[rmpv::Value],
+) -> Option<Response> {
+    let invalid = |message: String| {
+        endpoint_error_response(
+            "extract",
+            StatusCode::BAD_REQUEST,
+            err_code::INVALID_REQUEST,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            None,
+            message,
+        )
+    };
+    if items.is_empty() {
+        return Some(invalid("No items found in request body".into()));
+    }
+    if let Err(message) = publisher::validate_queue_request_item_count(items.len()) {
+        return Some(invalid(message));
+    }
+    let entry = state.model_registry.get_model_info(model)?;
+    if !entry
+        .info_extras
+        .outputs
+        .iter()
+        .any(|output| output == "json")
+    {
+        return Some(invalid("Model does not support extraction".into()));
+    }
+    for (index, item) in items.iter().enumerate() {
+        let fields = item.as_map().expect("queue parser validates item maps");
+        let text_bytes = rmpv_map_get(fields, "text")
+            .and_then(rmpv::Value::as_str)
+            .map_or(0, str::len);
+        let metadata_bytes = rmpv_map_get(fields, "metadata")
+            .filter(|value| value.as_map().is_some_and(|map| !map.is_empty()))
+            .map(worker_metadata_encoded_size)
+            .unwrap_or(Some(0));
+        if text_bytes > state.config.max_item_text_bytes
+            || metadata_bytes.is_some_and(|size| {
+                text_bytes.saturating_add(size) > state.config.max_item_text_bytes
+            })
+        {
+            return Some(invalid(format!(
+                "items[{index}] text and metadata exceeds the configured byte limit"
+            )));
+        }
+        for (field, capability) in [
+            ("text", "text"),
+            ("images", "image"),
+            ("audio", "audio"),
+            ("video", "video"),
+            ("document", "document"),
+        ] {
+            if rmpv_map_get(fields, field).is_some_and(|value| {
+                !value.is_nil()
+                    && !(field == "images" && value.as_array().is_some_and(Vec::is_empty))
+            }) && !entry
+                .info_extras
+                .inputs
+                .iter()
+                .any(|input| input == capability)
+            {
+                return Some(invalid(format!(
+                    "item at index {index}: model does not support {capability} input"
+                )));
+            }
+        }
+    }
+    None
+}
+
 fn validate_native_generate_pre_admission(
     state: &AppState,
     display_model: &str,
@@ -2709,6 +4160,20 @@ fn validate_native_generate_pre_admission(
                 .into_response(),
         );
     };
+
+    if let Some(response) = generation_token_cap_response(
+        state,
+        model,
+        generate.max_new_tokens,
+        "max_new_tokens",
+        params
+            .options
+            .as_ref()
+            .and_then(|options| options.get("profile"))
+            .and_then(Value::as_str),
+    ) {
+        return Some(response);
+    }
 
     if let Some(response) =
         unsupported_streaming_response(&state.model_registry, model, display_model, generate.stream)
@@ -2821,10 +4286,13 @@ async fn queue_mode_proxy(
     bundle_config_hash: &str,
     model_revision: Option<&str>,
     batch_target: Option<publisher::PublishTarget>,
+    require_execution_authority_v1: bool,
+    prefetch_first_output: bool,
+    request_extensions: &Extensions,
     physical_lane: &PhysicalLane,
 ) -> Response {
     // Parse body once, extract items + params (avoids double parse)
-    let (items, params) = match preparsed {
+    let (items, mut params) = match preparsed {
         Some(parsed) => parsed,
         None => match parse_queue_request(body_bytes, is_msgpack_in, endpoint) {
             Ok(parsed) => parsed,
@@ -2832,28 +4300,35 @@ async fn queue_mode_proxy(
         },
     };
 
-    if items.is_empty() && endpoint != "score" && endpoint != "generate" {
-        return endpoint_error_response(
-            endpoint,
-            StatusCode::BAD_REQUEST,
-            err_code::INVALID_REQUEST,
-            oai_type::INVALID_REQUEST,
-            oai_code::INVALID_REQUEST,
-            None,
-            "No items found in request body",
-        );
+    params.require_execution_authority_v1 = require_execution_authority_v1;
+    params.fallback_reason = bridged_fallback_reason(request_extensions);
+    if request_extensions
+        .get::<RemoteFallbackOverride>()
+        .is_some_and(|RemoteFallbackOverride(plan)| plan.numerical.is_some())
+    {
+        let Some(admission) = matches!(endpoint, "encode" | "score")
+            .then(|| bridged_numerical_admission(request_extensions, batch_target.as_ref()))
+            .flatten()
+        else {
+            let mut response = endpoint_error_response(
+                endpoint,
+                StatusCode::SERVICE_UNAVAILABLE,
+                err_code::QUEUE_UNAVAILABLE,
+                oai_type::SERVER_ERROR,
+                oai_code::TRANSPORT_FAILURE,
+                None,
+                "No current worker can verify the numerical admission",
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("5"));
+            return response;
+        };
+        params.numerical_admission_sha256 = Some(admission);
     }
 
-    if let Err(message) = publisher::validate_queue_request_item_count(items.len()) {
-        return endpoint_error_response(
-            endpoint,
-            StatusCode::BAD_REQUEST,
-            err_code::INVALID_REQUEST,
-            oai_type::INVALID_REQUEST,
-            oai_code::INVALID_REQUEST,
-            None,
-            message,
-        );
+    if let Some(response) = queue_items_error(endpoint, &items) {
+        return response;
     }
 
     // Generate has its own publish + result-collection path
@@ -2875,6 +4350,8 @@ async fn queue_mode_proxy(
         };
         if params.generate.as_ref().is_some_and(|params| params.stream) {
             return super::sse::build_sse_response(super::sse::SseParams {
+                prefetch_first_output,
+                local_serving_model: FallbackAttempt::defer_local_stream(request_extensions),
                 state,
                 work_publisher: work_publisher_arc,
                 physical_lane: physical_lane.clone(),
@@ -3117,7 +4594,11 @@ async fn queue_mode_proxy(
                     physical_lane,
                     "upstream_result_timeout",
                 );
-                return build_queue_result_timeout_response(model, timeout_secs);
+                let mut response = build_queue_result_timeout_response(model, timeout_secs);
+                if buffered_results.is_none() {
+                    response.extensions_mut().insert(UnansweredBeforeDeadline);
+                }
+                return response;
             }
         }
     };
@@ -3196,6 +4677,28 @@ async fn queue_mode_proxy(
         {
             return build_model_load_failed_response();
         }
+        // An admitted remote attempt refused by its worker's admission check,
+        // which happens when the admission changed after this gateway checked
+        // it. Like an upstream that cannot serve now, it is retryable, and on
+        // a fallback route the held local refusal replaces it.
+        if params.numerical_admission_sha256.is_some()
+            && errors
+                .iter()
+                .all(|r| r.error_code.as_deref() == Some(INFERENCE_ERROR_ERROR_CODE))
+        {
+            let retry_after = longest_worker_retry_after(&errors).map_or_else(
+                || QUEUE_FULL_RETRY_AFTER.to_string(),
+                |seconds| seconds.to_string(),
+            );
+            return service_unavailable_with_code(
+                INFERENCE_ERROR_ERROR_CODE,
+                errors
+                    .first()
+                    .and_then(|r| r.error.as_deref())
+                    .unwrap_or("The remote profile cannot serve this request now"),
+                &retry_after,
+            );
+        }
         // Translate retryable worker error codes into the SDK-expected 503
         // contract. Without this every per-item failure surfaced as 500
         // ``all_items_failed`` and the SDK retry path never engaged. We
@@ -3207,7 +4710,11 @@ async fn queue_mode_proxy(
                 .first()
                 .and_then(|r| r.error.as_deref())
                 .unwrap_or("Worker reported a retryable error");
-            return build_retryable_error_response(code, first_msg);
+            return build_retryable_error_response(
+                code,
+                first_msg,
+                longest_worker_retry_after(&errors),
+            );
         }
         if let Some((status, code)) = unanimous_terminal_client_error(&errors) {
             let first_msg = errors
@@ -3262,7 +4769,7 @@ async fn queue_mode_proxy(
 
     let status: u16 = 200;
 
-    let resp_body = build_queue_success_body(endpoint, model, &successful, use_msgpack);
+    let resp_body = build_queue_success_body(endpoint, display_model, &successful, use_msgpack);
 
     // §10 spine: emit at INFO so there is ONE greppable per-request success line
     // (carrying request_id) at the prod default RUST_LOG=info — the log anchor
@@ -3525,6 +5032,152 @@ fn endpoint_error_response(
     }
 }
 
+/// Bind a verified contract to one fresh eligible worker; never use a pool subject.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execution_authority_target(
+    state: &AppState,
+    model: &str,
+    pool: &str,
+    machine_profile: &str,
+    bundle: &str,
+    hash: &str,
+    admission_pool: &str,
+    numerical: Option<&crate::state::worker_registry::NumericalPin<'_>>,
+) -> Result<publisher::PublishTarget, Box<Response>> {
+    if !publisher::PublishTarget::verified_model_is_unambiguous(model)
+        || !state
+            .work_publisher
+            .as_ref()
+            .is_some_and(|publisher| publisher.supports_execution_authority_v1())
+    {
+        let mut response = endpoint_error_response(
+            "generate",
+            StatusCode::SERVICE_UNAVAILABLE,
+            err_code::QUEUE_UNAVAILABLE,
+            oai_type::SERVER_ERROR,
+            oai_code::TRANSPORT_FAILURE,
+            None,
+            "The dispatch transport cannot verify local execution",
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", axum::http::HeaderValue::from_static("5"));
+        return Err(Box::new(response));
+    }
+    let admitted = state
+        .pool_manager
+        .admitted_worker_names_for_capped_lane(admission_pool, machine_profile, bundle)
+        .await;
+    if let Some(worker_id) = state.registry.execution_authority_worker(
+        model,
+        pool,
+        machine_profile,
+        bundle,
+        hash,
+        admitted.as_ref(),
+        numerical,
+    ) {
+        return Ok(publisher::PublishTarget::VerifiedWorker {
+            pool: pool.to_string(),
+            machine_profile: machine_profile.to_string(),
+            bundle: bundle.to_string(),
+            model: model.to_string(),
+            worker_id,
+            numerical_admission: numerical.is_some(),
+        });
+    }
+    let mut response = endpoint_error_response(
+        "generate",
+        StatusCode::SERVICE_UNAVAILABLE,
+        err_code::QUEUE_UNAVAILABLE,
+        oai_type::SERVER_ERROR,
+        oai_code::TRANSPORT_FAILURE,
+        None,
+        "No current worker can verify local execution",
+    );
+    response
+        .headers_mut()
+        .insert("retry-after", axum::http::HeaderValue::from_static("5"));
+    Err(Box::new(response))
+}
+
+/// `X-SIE-Remote: forbid` needs verified local dispatch only for a model that
+/// routing could send to a remote profile; ordinary dispatch of any other
+/// model is local.
+fn forbid_requires_execution_authority(state: &AppState, headers: &HeaderMap, model: &str) -> bool {
+    remote_forbidden(headers).unwrap_or(false) && state.model_registry.has_remote_route(model)
+}
+
+/// Refuse egress against the same serving snapshot as the pinned work hash.
+fn remote_control_response(
+    endpoint: &str,
+    headers: &axum::http::HeaderMap,
+    served_by: Option<&crate::types::model::ServedBy>,
+    execution_hash: &str,
+) -> Option<Response> {
+    let refusal = match remote_forbidden(headers) {
+        Ok(false) => return None,
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            INVALID_INPUT_ERROR_CODE,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            message,
+        ),
+        Ok(true) => match served_by {
+            Some(crate::types::model::ServedBy::Local) if !execution_hash.is_empty() => {
+                return None
+            }
+            Some(crate::types::model::ServedBy::Remote { .. }) => (
+                StatusCode::BAD_REQUEST,
+                INVALID_INPUT_ERROR_CODE,
+                oai_type::INVALID_REQUEST,
+                oai_code::INVALID_REQUEST,
+                "X-SIE-Remote: forbid refuses the selected remote profile",
+            ),
+            _ => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                err_code::QUEUE_UNAVAILABLE,
+                oai_type::SERVER_ERROR,
+                oai_code::TRANSPORT_FAILURE,
+                "Local serving cannot be verified while model configuration converges",
+            ),
+        },
+    };
+    let mut response = endpoint_error_response(
+        endpoint,
+        refusal.0,
+        refusal.1,
+        refusal.2,
+        refusal.3,
+        Some("X-SIE-Remote"),
+        refusal.4,
+    );
+    if refusal.0 == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .insert("retry-after", axum::http::HeaderValue::from_static("5"));
+    }
+    Some(response)
+}
+
+pub(crate) fn invalid_remote_header_response(
+    endpoint: &str,
+    headers: &axum::http::HeaderMap,
+) -> Option<Response> {
+    remote_forbidden(headers).err().map(|message| {
+        endpoint_error_response(
+            endpoint,
+            StatusCode::BAD_REQUEST,
+            INVALID_INPUT_ERROR_CODE,
+            oai_type::INVALID_REQUEST,
+            oai_code::INVALID_REQUEST,
+            Some("X-SIE-Remote"),
+            message,
+        )
+    })
+}
+
 fn dispatch_rejection_response(endpoint: &str, error: &DispatchError) -> Option<Response> {
     let mut response = match error {
         DispatchError::PayloadTooLarge(error) => endpoint_error_response(
@@ -3604,8 +5257,9 @@ pub(crate) enum StreamingDriverErr {
     /// reset, gateway shutting down, …). Maps to 504 Gateway Timeout.
     ResultChannelClosed,
     /// One of the three streaming generation timeouts fired. ``kind`` is
-    /// ``"first_chunk"`` | ``"inter_chunk"`` | ``"overall"``.
-    Timeout { kind: &'static str },
+    /// ``"first_chunk"`` | ``"inter_chunk"`` | ``"overall"``; ``answered``
+    /// says whether any output arrived before it.
+    Timeout { kind: &'static str, answered: bool },
     /// Worker emitted a terminal chunk with ``error`` populated. The
     /// caller chooses the wire status/code mapping; message, parameter,
     /// and retry metadata are bounded at the worker trust boundary.
@@ -3693,7 +5347,24 @@ pub(crate) async fn run_streaming_generate(
     // distinguish it from capacity/health-driven fallbacks. We also
     // skip the gauge update here — the ring isn't consulted, so
     // recording a size for it would be misleading.
-    let (target, pool_fallback_lane_worker_count) = if resolved_key.hash.is_none() {
+    let (target, pool_fallback_lane_worker_count) = if params.require_execution_authority_v1 {
+        let target = execution_authority_target(
+            state,
+            dispatch_model,
+            pool,
+            gpu,
+            bundle,
+            bundle_config_hash,
+            admission_pool,
+            None,
+        )
+        .await
+        .map_err(|_| StreamingDriverErr::PublishFailed {
+            message: "No current worker can verify local execution".into(),
+            retry_after: Some("5"),
+        })?;
+        (target, 0)
+    } else if resolved_key.hash.is_none() {
         (
             publisher::PublishTarget::Pool {
                 pool: pool.to_string(),
@@ -4090,6 +5761,10 @@ pub(crate) async fn run_streaming_generate(
             // One of the three generation timeouts fired. This is not a
             // client-disconnect cancellation, so defuse the Drop guard and
             // send the worker cancel explicitly.
+            let answered = buffered_outcome.is_some()
+                || work_publisher
+                    .stream_chunk_timing(&request_id)
+                    .is_some_and(|(first_chunk_at, _)| first_chunk_at.is_some());
             cancel_guard.defuse();
             telemetry::record_queue_result_wait(
                 "generate",
@@ -4098,7 +5773,7 @@ pub(crate) async fn run_streaming_generate(
             );
             work_publisher.publish_cancel(&request_id).await;
             work_publisher.drop_pending_stream(&request_id);
-            return Err(StreamingDriverErr::Timeout { kind });
+            return Err(StreamingDriverErr::Timeout { kind, answered });
         }
     };
     let wait_elapsed = wait_start.elapsed();
@@ -4143,9 +5818,10 @@ pub(crate) fn worker_error_http_status(code: &str) -> StatusCode {
         "invalid_request" | "unsupported_field" => StatusCode::BAD_REQUEST,
         "context_exceeded" | INPUT_TOO_LONG_ERROR_CODE => StatusCode::BAD_REQUEST,
         PAYLOAD_TOO_LARGE_ERROR_CODE => StatusCode::PAYLOAD_TOO_LARGE,
-        RESOURCE_EXHAUSTED_ERROR_CODE | MODEL_LOADING_ERROR_CODE | LORA_LOADING_ERROR_CODE => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        RESOURCE_EXHAUSTED_ERROR_CODE
+        | MODEL_LOADING_ERROR_CODE
+        | LORA_LOADING_ERROR_CODE
+        | QUEUE_FULL_ERROR_CODE => StatusCode::SERVICE_UNAVAILABLE,
         MODEL_LOAD_FAILED_ERROR_CODE => StatusCode::BAD_GATEWAY,
         "transport_failure" => StatusCode::SERVICE_UNAVAILABLE,
         "cancelled" => StatusCode::REQUEST_TIMEOUT,
@@ -4180,18 +5856,24 @@ pub(crate) fn worker_error_openai_type(code: &str) -> &'static str {
 /// with [`worker_error_http_status`] / [`worker_error_openai_type`].
 fn worker_error_retry_after(
     code: &str,
-    resource_exhausted_retry_after_s: Option<u16>,
+    worker_retry_after_s: Option<u16>,
 ) -> Option<(String, &'static str)> {
+    let worker_hint = || {
+        worker_retry_after_s
+            .filter(|value| (1..=60).contains(value))
+            .map(|value| value.to_string())
+    };
     match code {
         RESOURCE_EXHAUSTED_ERROR_CODE => Some((
-            resource_exhausted_retry_after_s
-                .filter(|value| (1..=60).contains(value))
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| RESOURCE_EXHAUSTED_RETRY_AFTER.to_string()),
+            worker_hint().unwrap_or_else(|| RESOURCE_EXHAUSTED_RETRY_AFTER.to_string()),
             RESOURCE_EXHAUSTED_ERROR_CODE,
         )),
+        QUEUE_FULL_ERROR_CODE => Some((
+            worker_hint().unwrap_or_else(|| QUEUE_FULL_RETRY_AFTER.to_string()),
+            QUEUE_FULL_ERROR_CODE,
+        )),
         MODEL_LOADING_ERROR_CODE => Some((
-            MODEL_LOADING_RETRY_AFTER.to_string(),
+            worker_hint().unwrap_or_else(|| MODEL_LOADING_RETRY_AFTER.to_string()),
             MODEL_LOADING_ERROR_CODE,
         )),
         LORA_LOADING_ERROR_CODE => Some((
@@ -4274,7 +5956,7 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
             )),
         )
             .into_response(),
-        StreamingDriverErr::Timeout { kind } => {
+        StreamingDriverErr::Timeout { kind, answered } => {
             // Inter-chunk timeout returns 502 (partial response is
             // corrupt; SDK cannot retry); first-chunk and overall
             // return 504 (gateway/upstream timing).
@@ -4288,7 +5970,7 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
                 "inter_chunk" => oai_code::INTER_CHUNK_TIMEOUT,
                 _ => oai_code::OVERALL_TIMEOUT,
             };
-            (
+            let mut resp = (
                 status,
                 Json(json_openai_error(
                     format!("Generation aborted: {kind} timeout"),
@@ -4297,7 +5979,11 @@ fn build_streaming_error_response(err: &StreamingDriverErr) -> Response {
                     code,
                 )),
             )
-                .into_response()
+                .into_response();
+            if !answered {
+                resp.extensions_mut().insert(UnansweredBeforeDeadline);
+            }
+            resp
         }
         StreamingDriverErr::WorkerError {
             code,
@@ -6694,6 +8380,9 @@ pub(crate) fn resolve_model_and_bundle(
 /// machine profile, effective pool, bundle config hash, the bound work
 /// publisher, plus audit fields. Produced by [`resolve_generation_route`].
 struct ResolvedRoute {
+    dispatch_model: String,
+    require_execution_authority_v1: bool,
+    fallback_reason: Option<FallbackTrigger>,
     physical_lane: PhysicalLane,
     bundle: String,
     gpu: String,
@@ -6722,8 +8411,22 @@ async fn resolve_generation_route(
     request_intent: GenerationRequestIntent,
     explicit_bundle_override: &str,
     ext: &axum::http::Extensions,
+    bridge_allowed: bool,
+    token_limit: (u32, &'static str),
     metric_labels_slot: Option<&telemetry::MetricLabelsSlot>,
 ) -> Result<ResolvedRoute, Response> {
+    let bridge_allowed =
+        bridge_allowed && generation_bridge_allowed(state, ext, customer_model, request_intent);
+    let bridge = ext.get::<RemoteFallbackOverride>();
+    let dispatch_model = bridge.map_or(dispatch_model, |RemoteFallbackOverride(plan)| {
+        plan.model.as_str()
+    });
+    let bundle = bridge.map_or(bundle, |RemoteFallbackOverride(plan)| plan.bundle.as_str());
+    if let Some(response) =
+        generation_token_cap_response(state, dispatch_model, token_limit.0, token_limit.1, None)
+    {
+        return Err(response);
+    }
     // #1841 sealed dispatch: an org-registered custom model routes to its own
     // sealed sandbox, not a catalog bundle. Force the synthetic (gpu, pool) =
     // ("sealed", "sealed") so `resolve_effective_pool` below matches the registered
@@ -6738,10 +8441,14 @@ async fn resolve_generation_route(
         .model_access_policy
         .as_ref()
         .and_then(|p| p.sealed_route(customer_model, ext));
-    let governed = if sealed.is_none() {
-        governed_generation_route(state, customer_model, dispatch_model, request_intent)?
-    } else {
-        None
+    let governed = match (&sealed, bridge) {
+        (Some(_), _) => None,
+        (None, Some(RemoteFallbackOverride(plan))) => {
+            governed_bridge_route(state, ext, customer_model, request_intent, plan)?
+        }
+        (None, None) => {
+            governed_generation_route(state, customer_model, dispatch_model, request_intent)?
+        }
     };
     if let Some(route) = governed.as_ref() {
         if !explicit_bundle_override.is_empty() && explicit_bundle_override != route.bundle {
@@ -6786,6 +8493,8 @@ async fn resolve_generation_route(
     } else if let Some(route) = governed.as_ref() {
         let route = governed_profile_and_pool(state, hdr, route)?;
         (route.gpu, route.pool_name, route.gpu_configured)
+    } else if let Some(RemoteFallbackOverride(plan)) = bridge {
+        (String::new(), plan.pool.clone(), true)
     } else {
         match resolve_profile_and_pool(state, hdr, customer_model).await {
             Ok(ProfilePoolRoute {
@@ -6867,9 +8576,32 @@ async fn resolve_generation_route(
             ProvisioningSurface::OpenAiCompat,
         ));
     };
-    let (bundle_config_hash, model_revision, uses_catalog_scope) = state
+    let (bundle_config_hash, model_revision, uses_catalog_scope, served_by) = state
         .model_registry
-        .bundle_execution_evidence(&bundle, &hash_pool, dispatch_model);
+        .serving_execution_evidence(&bundle, &hash_pool, dispatch_model);
+    ServingDisclosure::record_evidence(ext, served_by.clone());
+    FallbackAttempt::record_model(ext, dispatch_model, "generate");
+    if let Some(RemoteFallbackOverride(plan)) = bridge {
+        if plan.config_hash != bundle_config_hash
+            || served_by.as_ref() != Some(&plan.served_by)
+            || plan.revision != model_revision
+        {
+            return Err(endpoint_error_response(
+                "generate",
+                StatusCode::SERVICE_UNAVAILABLE,
+                err_code::QUEUE_UNAVAILABLE,
+                oai_type::SERVER_ERROR,
+                oai_code::TRANSPORT_FAILURE,
+                None,
+                "Bridge execution evidence changed before dispatch",
+            ));
+        }
+    }
+    if let Some(response) =
+        remote_control_response("generate", hdr, served_by.as_ref(), &bundle_config_hash)
+    {
+        return Err(response);
+    }
     if !catalog_execution_hash_is_ready(&bundle_config_hash, uses_catalog_scope) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6892,6 +8624,35 @@ async fn resolve_generation_route(
             .map(|info| info.engine)
             .unwrap_or_else(|| crate::types::bundle::DEFAULT_ENGINE.to_string()),
     };
+    if let Some(plan) = threshold_remote_plan_for_request(
+        state,
+        hdr,
+        ext,
+        customer_model,
+        "generate",
+        None,
+        bridge_allowed,
+        explicit_bundle_override,
+        Some(request_intent),
+    ) {
+        let mut remote_ext = ext.clone();
+        remote_ext.insert(RemoteFallbackOverride(plan));
+        return Box::pin(resolve_generation_route(
+            state,
+            hdr,
+            &bundle,
+            customer_model,
+            dispatch_model,
+            request_intent,
+            explicit_bundle_override,
+            &remote_ext,
+            bridge_allowed,
+            token_limit,
+            metric_labels_slot,
+        ))
+        .await;
+    }
+
     let lookup = resolve_effective_pool_for_model(
         &state.registry,
         Some(&state.pool_manager),
@@ -6922,7 +8683,49 @@ async fn resolve_generation_route(
             ));
         }
         PoolResolution::Provisioning => {
-            return Err(build_openai_provisioning_response(&gpu, &bundle));
+            let trigger = cold_fallback_trigger(
+                state,
+                dispatch_model,
+                &demand_pool,
+                &pending_demand_profiles,
+                &bundle,
+                &bundle_config_hash,
+                &admission_pool,
+            )
+            .await;
+            let refusal = build_openai_provisioning_response(&gpu, &bundle);
+            let attempt = ext.get::<FallbackAttempt>();
+            let plan = fallback_plan_for_request(
+                state,
+                hdr,
+                ext,
+                customer_model,
+                bridge_allowed,
+                explicit_bundle_override,
+                trigger,
+                request_intent,
+            );
+            let Some(plan) = plan else {
+                return Err(refusal);
+            };
+            let attempt = attempt.expect("bridge requires request record");
+            assert!(attempt.begin(refusal, trigger));
+            let mut remote_ext = ext.clone();
+            remote_ext.insert(RemoteFallbackOverride(plan.clone()));
+            return Box::pin(resolve_generation_route(
+                state,
+                hdr,
+                &plan.bundle,
+                customer_model,
+                &plan.model,
+                request_intent,
+                "",
+                &remote_ext,
+                false,
+                token_limit,
+                metric_labels_slot,
+            ))
+            .await;
         }
     };
     let effective_pool = effective_route.pool_name;
@@ -6974,6 +8777,210 @@ async fn resolve_generation_route(
         return Err(resp);
     }
 
+    if transport_lane_provisioning(
+        state,
+        &effective_pool,
+        &effective_machine_profile,
+        &bundle,
+        dispatch_model,
+    ) {
+        if let Some(plan) = fallback_plan_for_request(
+            state,
+            hdr,
+            ext,
+            customer_model,
+            bridge_allowed,
+            explicit_bundle_override,
+            FallbackTrigger::Provisioning,
+            request_intent,
+        ) {
+            let refusal = build_openai_provisioning_response(&gpu, &bundle);
+            let target = lane_wake_target(
+                &effective_pool,
+                &effective_machine_profile,
+                &bundle,
+                dispatch_model,
+            );
+            if !warm_local_model(
+                state,
+                work_publisher_arc.as_ref(),
+                &physical_lane,
+                target,
+                &engine,
+                &bundle_config_hash,
+            )
+            .await
+            {
+                return Err(refusal);
+            }
+            let attempt = ext
+                .get::<FallbackAttempt>()
+                .expect("plan requires a request record");
+            assert!(attempt.begin(refusal, FallbackTrigger::Provisioning));
+            let mut remote_ext = ext.clone();
+            remote_ext.insert(RemoteFallbackOverride(plan.clone()));
+            return Box::pin(resolve_generation_route(
+                state,
+                hdr,
+                &plan.bundle,
+                customer_model,
+                &plan.model,
+                request_intent,
+                "",
+                &remote_ext,
+                false,
+                token_limit,
+                metric_labels_slot,
+            ))
+            .await;
+        }
+    }
+
+    if fallback_plan_for_request(
+        state,
+        hdr,
+        ext,
+        customer_model,
+        bridge_allowed,
+        explicit_bundle_override,
+        FallbackTrigger::Saturated,
+        request_intent,
+    )
+    .is_some()
+        || fallback_plan_for_request(
+            state,
+            hdr,
+            ext,
+            customer_model,
+            bridge_allowed,
+            explicit_bundle_override,
+            FallbackTrigger::Unhealthy,
+            request_intent,
+        )
+        .is_some()
+    {
+        if let Some(trigger) = local_spill_trigger(
+            state,
+            dispatch_model,
+            &effective_pool,
+            &effective_machine_profile,
+            &bundle,
+            &bundle_config_hash,
+            &admission_pool,
+        )
+        .await
+        {
+            if let Some(plan) = fallback_plan_for_request(
+                state,
+                hdr,
+                ext,
+                customer_model,
+                bridge_allowed,
+                explicit_bundle_override,
+                trigger,
+                request_intent,
+            ) {
+                state.demand_tracker.record(&physical_lane);
+                let attempt = ext
+                    .get::<FallbackAttempt>()
+                    .expect("plan requires a request record");
+                assert!(attempt.begin(local_spill_refusal("generate", trigger), trigger));
+                let mut remote_ext = ext.clone();
+                remote_ext.insert(RemoteFallbackOverride(plan.clone()));
+                return Box::pin(resolve_generation_route(
+                    state,
+                    hdr,
+                    &plan.bundle,
+                    customer_model,
+                    &plan.model,
+                    request_intent,
+                    "",
+                    &remote_ext,
+                    false,
+                    token_limit,
+                    metric_labels_slot,
+                ))
+                .await;
+            }
+        }
+    }
+
+    if let Some(plan) = fallback_plan_for_request(
+        state,
+        hdr,
+        ext,
+        customer_model,
+        bridge_allowed,
+        explicit_bundle_override,
+        FallbackTrigger::ModelLoading,
+        request_intent,
+    ) {
+        let admitted = state
+            .pool_manager
+            .admitted_worker_names_for_capped_lane(
+                &admission_pool,
+                &effective_machine_profile,
+                &bundle,
+            )
+            .await;
+        let loaded = state.registry.ring_snapshot_for_admitted(
+            dispatch_model,
+            &effective_pool,
+            &effective_machine_profile,
+            &bundle,
+            &bundle_config_hash,
+            admitted.as_ref(),
+        );
+        if loaded.is_empty() {
+            if let Ok(target) = execution_authority_target(
+                state,
+                dispatch_model,
+                &effective_pool,
+                &effective_machine_profile,
+                &bundle,
+                &bundle_config_hash,
+                &admission_pool,
+                None,
+            )
+            .await
+            {
+                let refusal = model_loading_refusal("generate");
+                if !warm_local_model(
+                    state,
+                    work_publisher_arc.as_ref(),
+                    &physical_lane,
+                    target,
+                    &engine,
+                    &bundle_config_hash,
+                )
+                .await
+                {
+                    return Err(refusal);
+                }
+                let attempt = ext
+                    .get::<FallbackAttempt>()
+                    .expect("plan requires a request record");
+                assert!(attempt.begin(refusal, FallbackTrigger::ModelLoading));
+                let mut remote_ext = ext.clone();
+                remote_ext.insert(RemoteFallbackOverride(plan.clone()));
+                return Box::pin(resolve_generation_route(
+                    state,
+                    hdr,
+                    &plan.bundle,
+                    customer_model,
+                    &plan.model,
+                    request_intent,
+                    "",
+                    &remote_ext,
+                    false,
+                    token_limit,
+                    metric_labels_slot,
+                ))
+                .await;
+            }
+        }
+    }
+
     let token_id = extract_bearer_token(hdr)
         .map(|t| mask_token(&t))
         .unwrap_or_default();
@@ -6984,6 +8991,13 @@ async fn resolve_generation_route(
         .unwrap_or(-1);
 
     Ok(ResolvedRoute {
+        dispatch_model: dispatch_model.to_string(),
+        require_execution_authority_v1: forbid_requires_execution_authority(
+            state,
+            hdr,
+            customer_model,
+        ) || bridge.is_some(),
+        fallback_reason: bridged_fallback_reason(ext),
         physical_lane,
         bundle,
         gpu,
@@ -7103,8 +9117,12 @@ impl GrammarProfileUnavailable {
     )
 )]
 pub async fn proxy_chat(State(state): State<Arc<AppState>>, mut req: Request) -> Response {
+    if let Some(response) = invalid_remote_header_response("generate", req.headers()) {
+        return response;
+    }
     check_sdk_version(req.headers());
     let disclosure = ServingDisclosure::install(&mut req);
+    let fallback = FallbackAttempt::install(&mut req);
     let metric_labels_slot = req
         .extensions()
         .get::<telemetry::MetricLabelsSlot>()
@@ -7140,7 +9158,7 @@ pub async fn proxy_chat(State(state): State<Arc<AppState>>, mut req: Request) ->
     async move {
         let mut response = proxy_chat_inner(state, req, metric_labels_slot).await;
         disclosure.stamp(response.status(), response.headers_mut());
-        response
+        fallback.finish(response)
     }
     .instrument(chat_span)
     .await
@@ -7202,7 +9220,10 @@ async fn proxy_chat_inner(
             Ok(mb) => mb,
             Err(resp) => return resp,
         };
-    let (explicit_bundle_override, _) = parse_model_spec(&params.model);
+    let (explicit_bundle_override, _) =
+        resolve_model_spec_with_aliases(&state.config.model_aliases, &params.model, |model| {
+            state.model_registry.resolve_canonical_model_name(model)
+        });
 
     // Grammar routing (follow-up: chat-path gate ordering). Resolve the model's
     // declared ``grammar_profile`` variant and compute the DISPATCH id BEFORE the
@@ -7277,23 +9298,6 @@ async fn proxy_chat_inner(
                     )
                         .into_response();
                 }
-            }
-        }
-        if let Some(cap) = info.effective_max_output_tokens() {
-            if cap > 0 && params.max_new_tokens > cap {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json_openai_error(
-                        format!(
-                            "max_completion_tokens ({}) exceeds model max_output_tokens ({cap})",
-                            params.max_new_tokens
-                        ),
-                        oai_type::INVALID_REQUEST,
-                        Some("max_completion_tokens"),
-                        oai_code::INVALID_REQUEST,
-                    )),
-                )
-                    .into_response();
             }
         }
         if let Some(g) = params.grammar.as_ref() {
@@ -7432,6 +9436,9 @@ async fn proxy_chat_inner(
     // -- headers → GPU/pool routing, effective-pool selection, publisher bind.
     //    Shared with /v1/completions via resolve_generation_route.
     let ResolvedRoute {
+        dispatch_model,
+        require_execution_authority_v1,
+        fallback_reason,
         physical_lane,
         bundle,
         gpu,
@@ -7457,6 +9464,8 @@ async fn proxy_chat_inner(
         },
         &explicit_bundle_override,
         &parts.extensions,
+        !native_request_has_profile_selector(&body_bytes, false),
+        (params.max_new_tokens, "max_completion_tokens"),
         metric_labels_slot.as_ref(),
     )
     .await
@@ -7469,7 +9478,9 @@ async fn proxy_chat_inner(
     // Copied out BEFORE the params are consumed into `WorkParams` below.
     let stream = params.stream;
     let stream_include_usage = params.stream_include_usage;
-    let work_params = params.into_work_params();
+    let mut work_params = params.into_work_params();
+    work_params.require_execution_authority_v1 = require_execution_authority_v1;
+    work_params.fallback_reason = fallback_reason;
 
     // SSE branch — when `stream: true` we hand off to the SSE
     // response builder. The non-streaming aggregating path below is
@@ -7481,6 +9492,11 @@ async fn proxy_chat_inner(
     // arrives instead of being aggregated.
     if stream {
         return super::sse::build_sse_response(super::sse::SseParams {
+            prefetch_first_output: parts
+                .extensions
+                .get::<FallbackAttempt>()
+                .is_some_and(FallbackAttempt::active),
+            local_serving_model: FallbackAttempt::defer_local_stream(&parts.extensions),
             state: state.as_ref(),
             work_publisher: work_publisher_arc,
             physical_lane: physical_lane.clone(),
@@ -8023,10 +10039,14 @@ fn build_text_completion_body(
 /// resolution + generation driver; differs from chat only in the request parse
 /// (raw `prompt` → `GenerateInput::Prompt`) and the `text_completion` body.
 pub async fn proxy_completions(State(state): State<Arc<AppState>>, mut req: Request) -> Response {
+    if let Some(response) = invalid_remote_header_response("generate", req.headers()) {
+        return response;
+    }
     let disclosure = ServingDisclosure::install(&mut req);
+    let fallback = FallbackAttempt::install(&mut req);
     let mut response = proxy_completions_inner(state, req).await;
     disclosure.stamp(response.status(), response.headers_mut());
-    response
+    fallback.finish(response)
 }
 
 async fn proxy_completions_inner(state: Arc<AppState>, req: Request) -> Response {
@@ -8082,7 +10102,10 @@ async fn proxy_completions_inner(state: Arc<AppState>, req: Request) -> Response
             Err(resp) => return resp,
         };
     ServingDisclosure::record(&state, &parts.extensions, &model_name);
-    let (explicit_bundle_override, _) = parse_model_spec(&params.model);
+    let (explicit_bundle_override, _) =
+        resolve_model_spec_with_aliases(&state.config.model_aliases, &params.model, |model| {
+            state.model_registry.resolve_canonical_model_name(model)
+        });
 
     if let Some(response) = unsupported_streaming_response(
         &state.model_registry,
@@ -8094,6 +10117,9 @@ async fn proxy_completions_inner(state: Arc<AppState>, req: Request) -> Response
     }
 
     let ResolvedRoute {
+        dispatch_model,
+        require_execution_authority_v1,
+        fallback_reason,
         physical_lane,
         bundle,
         gpu,
@@ -8115,6 +10141,8 @@ async fn proxy_completions_inner(state: Arc<AppState>, req: Request) -> Response
         GenerationRequestIntent::Default,
         &explicit_bundle_override,
         &parts.extensions,
+        !native_request_has_profile_selector(&body_bytes, false),
+        (params.max_new_tokens, "max_tokens"),
         metric_labels_slot.as_ref(),
     )
     .await
@@ -8127,19 +10155,26 @@ async fn proxy_completions_inner(state: Arc<AppState>, req: Request) -> Response
     // Copied out BEFORE the params are consumed into `WorkParams` below.
     let stream = params.stream;
     let stream_include_usage = params.stream_include_usage;
-    let work_params = params.into_work_params();
+    let mut work_params = params.into_work_params();
+    work_params.require_execution_authority_v1 = require_execution_authority_v1;
+    work_params.fallback_reason = fallback_reason;
 
     // SSE streaming → emit `text_completion` chunks. Single-candidate
     // (completions rejects n>1), so no per-candidate interleave.
     if stream {
         return super::sse::build_sse_response(super::sse::SseParams {
+            prefetch_first_output: parts
+                .extensions
+                .get::<FallbackAttempt>()
+                .is_some_and(FallbackAttempt::active),
+            local_serving_model: FallbackAttempt::defer_local_stream(&parts.extensions),
             state: state.as_ref(),
             work_publisher: work_publisher_arc,
             physical_lane: physical_lane.clone(),
             model: model_name.clone(),
             // /v1/completions does not accept grammar, so it never routes:
             // dispatch == display.
-            dispatch_model: model_name.clone(),
+            dispatch_model: dispatch_model.clone(),
             bundle: bundle.clone(),
             engine: engine.clone(),
             gpu: effective_machine_profile.clone(),
@@ -8159,7 +10194,7 @@ async fn proxy_completions_inner(state: Arc<AppState>, req: Request) -> Response
         work_publisher_arc,
         &physical_lane,
         &model_name,
-        &model_name,
+        &dispatch_model,
         &bundle,
         &engine,
         &effective_machine_profile,
@@ -8680,10 +10715,14 @@ fn build_responses_body(
 /// `/v1/responses` — OpenAI Responses API (MVP). String `input` → raw-prompt
 /// generation via the shared resolve+drive helpers; `response`-shaped body.
 pub async fn proxy_responses(State(state): State<Arc<AppState>>, mut req: Request) -> Response {
+    if let Some(response) = invalid_remote_header_response("generate", req.headers()) {
+        return response;
+    }
     let disclosure = ServingDisclosure::install(&mut req);
+    let fallback = FallbackAttempt::install(&mut req);
     let mut response = proxy_responses_inner(state, req).await;
     disclosure.stamp(response.status(), response.headers_mut());
-    response
+    fallback.finish(response)
 }
 
 async fn proxy_responses_inner(state: Arc<AppState>, req: Request) -> Response {
@@ -8739,8 +10778,14 @@ async fn proxy_responses_inner(state: Arc<AppState>, req: Request) -> Response {
             Err(resp) => return resp,
         };
     ServingDisclosure::record(&state, &parts.extensions, &model_name);
-    let (explicit_bundle_override, _) = parse_model_spec(&params.model);
+    let (explicit_bundle_override, _) =
+        resolve_model_spec_with_aliases(&state.config.model_aliases, &params.model, |model| {
+            state.model_registry.resolve_canonical_model_name(model)
+        });
     let ResolvedRoute {
+        dispatch_model,
+        require_execution_authority_v1,
+        fallback_reason,
         physical_lane,
         bundle,
         gpu,
@@ -8762,6 +10807,8 @@ async fn proxy_responses_inner(state: Arc<AppState>, req: Request) -> Response {
         GenerationRequestIntent::Default,
         &explicit_bundle_override,
         &parts.extensions,
+        !native_request_has_profile_selector(&body_bytes, false),
+        (params.max_new_tokens, "max_output_tokens"),
         metric_labels_slot.as_ref(),
     )
     .await
@@ -8771,16 +10818,16 @@ async fn proxy_responses_inner(state: Arc<AppState>, req: Request) -> Response {
     };
     let start = Instant::now();
 
-    let work_params = params.into_work_params();
+    let mut work_params = params.into_work_params();
+    work_params.require_execution_authority_v1 = require_execution_authority_v1;
+    work_params.fallback_reason = fallback_reason;
 
     let driver = run_streaming_generate(
         &state,
         work_publisher_arc,
         &physical_lane,
         &model_name,
-        // /v1/responses does not accept grammar, so it never routes:
-        // dispatch == display.
-        &model_name,
+        &dispatch_model,
         &bundle,
         &engine,
         &effective_machine_profile,
@@ -9126,6 +11173,7 @@ fn unanimous_retryable_error_code(errors: &[&publisher::WorkResult]) -> Option<&
         RESOURCE_EXHAUSTED_ERROR_CODE => RESOURCE_EXHAUSTED_ERROR_CODE,
         MODEL_LOADING_ERROR_CODE => MODEL_LOADING_ERROR_CODE,
         LORA_LOADING_ERROR_CODE => LORA_LOADING_ERROR_CODE,
+        QUEUE_FULL_ERROR_CODE => QUEUE_FULL_ERROR_CODE,
         _ => return None,
     };
     if errors
@@ -9239,20 +11287,35 @@ fn build_terminal_client_error_response(
     resp
 }
 
+/// The longest valid retry hint the failed results carry, if any.
+fn longest_worker_retry_after(errors: &[&publisher::WorkResult]) -> Option<u16> {
+    errors
+        .iter()
+        .filter_map(|result| result.retry_after_s)
+        .filter(|seconds| (1..=60).contains(seconds))
+        .max()
+        .map(|seconds| seconds as u16)
+}
+
 /// Build a ``503 + <code>`` response that mirrors the worker-side HTTP
 /// contract (see ``packages/sie_server/src/sie_server/api/helpers.py``).
 ///
 ///   * status:  503 Service Unavailable
 ///   * body:    ``{"error": {"code": <code>, "message": <upstream message>}}``
-///   * headers: ``Retry-After: 5``, ``X-SIE-Error-Code: <code>``, plus the
+///   * headers: a bounded worker ``Retry-After`` hint (default 5),
+///     ``X-SIE-Error-Code: <code>``, plus the
 ///     standard ``X-SIE-*`` version pair.
 ///
 /// The worker is **not** marked unhealthy — these codes are transient
 /// per-request signals, not worker-health signals.
-fn build_retryable_error_response(code: &'static str, message: &str) -> Response {
+fn build_retryable_error_response(
+    code: &'static str,
+    message: &str,
+    worker_retry_after_s: Option<u16>,
+) -> Response {
     // Retry hint via the shared `worker_error_retry_after` classifier — the
     // same source of truth the streaming path uses.
-    let retry_after = worker_error_retry_after(code, None)
+    let retry_after = worker_error_retry_after(code, worker_retry_after_s)
         .map(|(retry_after, _)| retry_after)
         .unwrap_or_else(|| {
             // Defensive default. Should be unreachable given the
@@ -9267,6 +11330,12 @@ fn build_retryable_error_response(code: &'static str, message: &str) -> Response
             );
             MODEL_LOADING_RETRY_AFTER.to_string()
         });
+    service_unavailable_with_code(code, message, &retry_after)
+}
+
+/// A `503` with the worker contract's error envelope, `Retry-After`,
+/// `X-SIE-Error-Code` and version headers.
+fn service_unavailable_with_code(code: &str, message: &str, retry_after: &str) -> Response {
     let mut resp = (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
@@ -9279,7 +11348,7 @@ fn build_retryable_error_response(code: &'static str, message: &str) -> Response
         .into_response();
     resp.headers_mut().insert(
         HeaderName::from_static("retry-after"),
-        HeaderValue::from_str(&retry_after).unwrap_or_else(|_| HeaderValue::from_static("5")),
+        HeaderValue::from_str(retry_after).unwrap_or_else(|_| HeaderValue::from_static("5")),
     );
     resp.headers_mut().insert(
         HeaderName::from_static("x-sie-error-code"),
@@ -9780,6 +11849,8 @@ pub(crate) fn is_openai_compat_forwarded_header(name: &str) -> bool {
         "x-sie-request-id",
         "x-sie-served-by",
         "x-sie-upstream",
+        "x-sie-fallback-reason",
+        "x-sie-fallback-error",
         "x-sie-version",
         "x-sie-server-version",
         "x-sie-worker",
@@ -9811,6 +11882,7 @@ pub(crate) fn is_openai_compat_inner_request_header(name: &str) -> bool {
         "x-sie-pool",
         "x-sie-engine",
         "x-sie-sdk-version",
+        "x-sie-remote",
         "traceparent",
         "tracestate",
     ]
@@ -9839,9 +11911,10 @@ pub(crate) async fn translate_inner_compat_error(resp: Response) -> Response {
     // it by symmetry would only widen the buffer an unhealthy upstream can make
     // the gateway hold.
     const MAX: usize = 16 * 1024 * 1024;
-    let status = resp.status();
-    let headers = resp.headers().clone();
-    let parsed: Value = match to_bytes(resp.into_body(), MAX).await {
+    let (parts, body) = resp.into_parts();
+    let status = parts.status;
+    let headers = parts.headers;
+    let parsed: Value = match to_bytes(body, MAX).await {
         Ok(b) => serde_json::from_slice(&b).unwrap_or(Value::Null),
         Err(_) => Value::Null,
     };
@@ -9864,6 +11937,8 @@ pub(crate) async fn translate_inner_compat_error(resp: Response) -> Response {
         .unwrap_or("internal server error")
         .to_string();
     let mut out = (status, Json(embeddings_error(&sie_code, None, message))).into_response();
+    // Keep gateway-owned translation faults visible to metered compositions.
+    *out.extensions_mut() = parts.extensions;
     for (k, v) in headers.iter() {
         let n = k.as_str();
         if is_openai_compat_forwarded_header(n) || n.eq_ignore_ascii_case("retry-after") {
@@ -10330,8 +12405,123 @@ fn validate_queue_item_shapes(
         if !matches!(item, rmpv::Value::Map(_)) {
             return Err(format!("item at index {index} must be an object").into());
         }
+        if endpoint == "extract" {
+            validate_extract_item(item, index)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Validate caller types before a cold local route can acquire bridge authority.
+/// Both wire formats converge here; media remains binary, never JSON-expanded.
+fn validate_extract_item(item: &rmpv::Value, index: usize) -> Result<(), String> {
+    let fields = item.as_map().expect("caller checked item map");
+    for field in ["id", "text"] {
+        if rmpv_map_get(fields, field).is_some_and(|v| !v.is_nil() && v.as_str().is_none()) {
+            return Err(format!("items[{index}].{field} must be a string or null"));
+        }
+    }
+    if rmpv_map_get(fields, "metadata").is_some_and(|v| !v.is_nil() && v.as_map().is_none()) {
+        return Err(format!("items[{index}].metadata must be an object or null"));
+    }
+    if rmpv_map_get(fields, "metadata")
+        .and_then(rmpv::Value::as_map)
+        .is_some_and(|map| map.iter().any(|(key, _)| key.as_str().is_none()))
+    {
+        return Err(format!("items[{index}].metadata keys must be strings"));
+    }
+    for field in ["audio", "video", "document", "images"] {
+        let Some(value) = rmpv_map_get(fields, field).filter(|v| !v.is_nil()) else {
+            continue;
+        };
+        let media = if field == "images" {
+            value
+                .as_array()
+                .ok_or_else(|| format!("items[{index}].images must be an array"))?
+                .iter()
+                .collect::<Vec<_>>()
+        } else {
+            vec![value]
+        };
+        for value in media {
+            let map = value
+                .as_map()
+                .ok_or_else(|| format!("items[{index}].{field} must contain media objects"))?;
+            if !matches!(rmpv_map_get(map, "data"), Some(rmpv::Value::Binary(_))) {
+                return Err(format!("items[{index}].{field}.data must be binary media"));
+            }
+            if rmpv_map_get(map, "format").is_some_and(|v| !v.is_nil() && v.as_str().is_none()) {
+                return Err(format!(
+                    "items[{index}].{field}.format must be a string or null"
+                ));
+            }
+            if field == "audio"
+                && (map.iter().any(|(key, _)| {
+                    !matches!(rmpv_key_str(key), Some("data" | "format" | "sample_rate"))
+                }) || rmpv_map_get(map, "sample_rate")
+                    .is_some_and(|v| !v.is_nil() && !v.as_i64().is_some_and(|rate| rate > 0)))
+            {
+                return Err(format!("items[{index}].audio has invalid fields"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_extract_params(params: Option<&rmpv::Value>) -> Result<(), String> {
+    let Some(params) = params.filter(|v| !v.is_nil()) else {
+        return Ok(());
+    };
+    let fields = params.as_map().ok_or("params must be an object or null")?;
+    if rmpv_map_get(fields, "instruction").is_some_and(|v| !v.is_nil() && v.as_str().is_none()) {
+        return Err("params.instruction must be a string or null".into());
+    }
+    if let Some(labels) = rmpv_map_get(fields, "labels").filter(|v| !v.is_nil()) {
+        if !labels
+            .as_array()
+            .is_some_and(|labels| labels.iter().all(|v| v.as_str().is_some()))
+        {
+            return Err("params.labels must be an array of strings or null".into());
+        }
+    }
+    for field in ["options", "output_schema"] {
+        if rmpv_map_get(fields, field).is_some_and(|v| !v.is_nil() && v.as_map().is_none()) {
+            return Err(format!("params.{field} must be an object or null"));
+        }
+    }
+    if let Some(schema) = rmpv_map_get(fields, "output_schema").filter(|v| !v.is_nil()) {
+        // Mirror sie_server.core.extract_cost without recursive traversal.
+        let mut stack = vec![(schema, 1usize)];
+        let mut values = 0usize;
+        while let Some((value, depth)) = stack.pop() {
+            values += 1;
+            if values > 100_000 {
+                return Err("params.output_schema exceeds 100000 values".into());
+            }
+            match value {
+                rmpv::Value::Map(fields) => {
+                    if depth > 128 {
+                        return Err("params.output_schema exceeds 128 container levels".into());
+                    }
+                    stack.extend(fields.iter().map(|(_, value)| (value, depth + 1)));
+                }
+                rmpv::Value::Array(items) => {
+                    if depth > 128 {
+                        return Err("params.output_schema exceeds 128 container levels".into());
+                    }
+                    stack.extend(items.iter().map(|value| (value, depth + 1)));
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(options) = rmpv_map_get(fields, "options").and_then(rmpv::Value::as_map) {
+        if rmpv_map_get(options, "instruction").is_some_and(|v| !v.is_nil() && v.as_str().is_none())
+        {
+            return Err("params.options.instruction must be a string or null".into());
+        }
+    }
     Ok(())
 }
 
@@ -10792,6 +12982,7 @@ fn work_params_from_json(
     if endpoint == "score" {
         validate_score_grammar_json(parsed)?;
         return Ok(publisher::WorkParams {
+            require_execution_authority_v1: false,
             output_types: None,
             instruction: score_instruction_from_json(parsed),
             is_query: false,
@@ -10809,11 +13000,14 @@ fn work_params_from_json(
             generate: None,
             routing_key: None,
             prompt_cache_key: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         });
     }
 
     if endpoint == "generate" {
         return Ok(publisher::WorkParams {
+            require_execution_authority_v1: false,
             options: parse_generate_options_field(parsed.get("options"))
                 .map_err(QueueParseError::PreBuilt)?,
             generate: generate_params_from_json(parsed).map_err(QueueParseError::PreBuilt)?,
@@ -10822,6 +13016,9 @@ fn work_params_from_json(
     }
 
     let nested_params = parsed.get("params");
+    if endpoint == "extract" {
+        validate_extract_params(nested_params.cloned().map(json_to_rmpv).as_ref())?;
+    }
     let field = |key: &str| nested_params.and_then(|params| params.get(key));
     let options = if endpoint == "encode" {
         encode_options_with_output_dtype(field("options").cloned(), field("output_dtype").cloned())
@@ -10830,6 +13027,7 @@ fn work_params_from_json(
     };
 
     Ok(publisher::WorkParams {
+        require_execution_authority_v1: false,
         output_types: field("output_types").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
                 .filter_map(|v| v.as_str().map(String::from))
@@ -10858,6 +13056,8 @@ fn work_params_from_json(
         generate: None,
         routing_key: None,
         prompt_cache_key: None,
+        fallback_reason: None,
+        numerical_admission_sha256: None,
     })
 }
 
@@ -11689,6 +13889,7 @@ fn work_params_from_rmpv(
     if endpoint == "score" {
         validate_score_grammar_rmpv(parsed)?;
         return Ok(publisher::WorkParams {
+            require_execution_authority_v1: false,
             output_types: None,
             instruction: score_instruction_from_rmpv(parsed),
             is_query: false,
@@ -11703,11 +13904,14 @@ fn work_params_from_rmpv(
             generate: None,
             routing_key: None,
             prompt_cache_key: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         });
     }
 
     if endpoint == "generate" {
         return Ok(publisher::WorkParams {
+            require_execution_authority_v1: false,
             options: parse_generate_options_field(
                 rmpv_map_get(parsed, "options")
                     .map(rmpv_to_json_owned)
@@ -11721,6 +13925,9 @@ fn work_params_from_rmpv(
 
     // For `encode`/`extract`, match ``sie_server`` / msgspec: tuning fields live
     // only under the ``params`` object (no top-level merge).
+    if endpoint == "extract" {
+        validate_extract_params(rmpv_map_get(parsed, "params"))?;
+    }
     let nested = rmpv_map_get(parsed, "params").and_then(|v| match v {
         rmpv::Value::Map(m) => Some(m.as_slice()),
         _ => None,
@@ -11748,6 +13955,7 @@ fn work_params_from_rmpv(
         .unwrap_or(false);
 
     Ok(publisher::WorkParams {
+        require_execution_authority_v1: false,
         output_types: field("output_types").and_then(rmpv_string_array),
         instruction: field("instruction").and_then(rmpv_as_str).map(String::from),
         is_query,
@@ -11758,6 +13966,8 @@ fn work_params_from_rmpv(
         generate: None,
         routing_key: None,
         prompt_cache_key: None,
+        fallback_reason: None,
+        numerical_admission_sha256: None,
     })
 }
 
@@ -13403,24 +15613,27 @@ fn rerank_response_from_score(
         ranked.truncate(limit);
     }
 
-    let usage = native
-        .get("usage")
-        .and_then(Value::as_object)
-        .ok_or_else(|| "score response missing authoritative usage".to_string())?;
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "score response usage missing input_tokens".to_string())?;
-    let images = usage.get("images").map(|value| {
-        value
-            .as_u64()
-            .ok_or_else(|| "score response usage has an invalid images count".to_string())
-    });
-    let mut output_usage = Map::new();
-    output_usage.insert("input_tokens".to_string(), json!(input_tokens));
-    if let Some(images) = images {
-        output_usage.insert("images".to_string(), json!(images?));
-    }
+    let output_usage = match native.get("usage") {
+        None | Some(Value::Null) => None,
+        Some(usage) => {
+            let usage = usage
+                .as_object()
+                .ok_or_else(|| "score response usage is not an object".to_string())?;
+            let input_tokens = usage
+                .get("input_tokens")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "score response usage missing input_tokens".to_string())?;
+            let mut output_usage = Map::new();
+            output_usage.insert("input_tokens".to_string(), json!(input_tokens));
+            if let Some(images) = usage.get("images") {
+                let images = images.as_u64().ok_or_else(|| {
+                    "score response usage has an invalid images count".to_string()
+                })?;
+                output_usage.insert("images".to_string(), json!(images));
+            }
+            Some(output_usage)
+        }
+    };
 
     let results = ranked
         .into_iter()
@@ -13435,11 +15648,13 @@ fn rerank_response_from_score(
         })
         .collect::<Vec<_>>();
 
-    Ok(json!({
-        "model": model,
-        "results": results,
-        "usage": output_usage,
-    }))
+    let mut response = Map::new();
+    response.insert("model".to_string(), json!(model));
+    response.insert("results".to_string(), Value::Array(results));
+    if let Some(usage) = output_usage {
+        response.insert("usage".to_string(), Value::Object(usage));
+    }
+    Ok(Value::Object(response))
 }
 
 fn rerank_error(status: StatusCode, message: impl Into<String>) -> Response {
@@ -13699,6 +15914,10 @@ pub async fn proxy_moderations() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::test_support::{
+        TestGateway, HYBRID_GENERATE_MODEL, LOCAL_LANE, REMOTE_LANE,
+    };
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::queue::dispatch::{
@@ -13706,6 +15925,79 @@ mod tests {
         WorkResult,
     };
     use tokio::sync::{broadcast, oneshot, Notify};
+
+    #[test]
+    fn spill_refusal_retry_hint_matches_local_capacity_class() {
+        for (trigger, retry) in [
+            (FallbackTrigger::Unhealthy, PROVISIONING_RETRY_AFTER),
+            (FallbackTrigger::Saturated, BACKPRESSURE_RETRY_AFTER),
+        ] {
+            for endpoint in ["generate", "extract"] {
+                let response = local_spill_refusal(endpoint, trigger);
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(response.headers()["retry-after"], retry);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_spill_trigger_ignores_unassigned_workers_and_unconfigured_bundle_lanes() {
+        let gateway = TestGateway::new(&[HYBRID_GENERATE_MODEL]).await;
+        gateway
+            .add_verified_worker("local-1", LOCAL_LANE, &["acme/chat"])
+            .await;
+        gateway
+            .state
+            .registry
+            .mark_unhealthy("http://local-1:8080")
+            .await;
+        let hash = gateway
+            .state
+            .model_registry
+            .compute_bundle_config_hash_for_pool(LOCAL_LANE.2, LOCAL_LANE.0);
+        let profiles = vec![LOCAL_LANE.1.to_string(), REMOTE_LANE.1.to_string()];
+        assert_eq!(
+            cold_fallback_trigger(
+                &gateway.state,
+                "acme/chat",
+                LOCAL_LANE.0,
+                &profiles,
+                LOCAL_LANE.2,
+                &hash,
+                LOCAL_LANE.0
+            )
+            .await,
+            FallbackTrigger::Unhealthy
+        );
+        gateway
+            .state
+            .pool_manager
+            .sync_static_pools(&[crate::types::pool::PoolSpec {
+                name: "bounded".to_string(),
+                queue_pool: LOCAL_LANE.0.to_string(),
+                bundle: None,
+                gpus: std::collections::HashMap::from([(LOCAL_LANE.1.to_string(), 0)]),
+                gpu_caps: std::collections::HashMap::from([(LOCAL_LANE.1.to_string(), 1)]),
+                ttl_seconds: None,
+                minimum_worker_count: 0,
+                pinned_models: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            cold_fallback_trigger(
+                &gateway.state,
+                "acme/chat",
+                LOCAL_LANE.0,
+                &profiles,
+                LOCAL_LANE.2,
+                &hash,
+                "bounded"
+            )
+            .await,
+            FallbackTrigger::Provisioning
+        );
+    }
 
     #[derive(Default)]
     struct AbandonmentProbe {
@@ -13833,6 +16125,7 @@ mod tests {
     fn dispatcher_defaults_to_no_first_chunk_pool_republish() {
         let dispatcher = AbandonmentProbe::default();
         assert!(!dispatcher.supports_first_chunk_pool_republish());
+        assert!(!dispatcher.supports_execution_authority_v1());
     }
 
     #[test]
@@ -14695,6 +16988,7 @@ mod tests {
         assert_eq!(RetryAfter::DEFAULT.model_loading, "5");
         assert_eq!(RetryAfter::DEFAULT.resource_exhausted, "5");
         assert_eq!(RetryAfter::DEFAULT.lora_loading, "5");
+        assert_eq!(RetryAfter::DEFAULT.queue_full, "5");
         // The named constants alias the typed home — pin each against its wire
         // literal (not against `RetryAfter::DEFAULT.*`, which would be a
         // tautological `x == x`), so a broken alias is actually caught.
@@ -14704,6 +16998,7 @@ mod tests {
         assert_eq!(MODEL_LOADING_RETRY_AFTER, "5");
         assert_eq!(RESOURCE_EXHAUSTED_RETRY_AFTER, "5");
         assert_eq!(LORA_LOADING_RETRY_AFTER, "5");
+        assert_eq!(QUEUE_FULL_RETRY_AFTER, "5");
     }
 
     fn admission_test_state(pool_manager: Arc<PoolManager>) -> AppState {
@@ -14761,6 +17056,7 @@ mod tests {
             watch_polling: false,
             multi_router: false,
             request_timeout: 30.0,
+            max_item_text_bytes: 2 * 1024 * 1024,
             max_stream_pending: 1024,
             max_lane_in_flight_items:
                 crate::queue::lane_admission::DEFAULT_MAX_LANE_IN_FLIGHT_ITEMS,
@@ -14976,17 +17272,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WorkDispatcher for GenerationTargetProbe {
+        fn supports_execution_authority_v1(&self) -> bool {
+            true
+        }
+
         async fn publish_work(
             self: Arc<Self>,
-            _target: PublishTarget,
+            target: PublishTarget,
             _admission_pool: &str,
             _endpoint: &str,
             _model: &str,
-            _display_model: &str,
+            display_model: &str,
             _engine: &str,
             _bundle_config_hash: &str,
             _items: Vec<rmpv::Value>,
-            _params: &WorkParams,
+            params: &WorkParams,
         ) -> Result<
             (
                 String,
@@ -14995,7 +17295,14 @@ mod tests {
             ),
             DispatchError,
         > {
-            unreachable!("generation target probe only accepts generation")
+            self.params.lock().unwrap().push(params.clone());
+            self.targets
+                .lock()
+                .unwrap()
+                .push((display_model.to_string(), target));
+            Err(DispatchError::Other(
+                "numeric probe refusal after target capture".into(),
+            ))
         }
 
         async fn publish_generate_streaming(
@@ -15028,6 +17335,7 @@ mod tests {
                 text: "ok".to_string(),
                 finish_reason: "stop".to_string(),
                 usage: Some(crate::queue::streaming::UsageBlock {
+                    upstream_usage: None,
                     gpu_second: None,
                     images: None,
                     prompt_tokens_details: None,
@@ -15185,6 +17493,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/h".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -15301,6 +17610,13 @@ mod tests {
         assert_eq!(target.0, display_model);
         let (pool, machine_profile, bundle, dispatch_model) = match target.1 {
             PublishTarget::Worker {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+                ..
+            }
+            | PublishTarget::VerifiedWorker {
                 pool,
                 machine_profile,
                 bundle,
@@ -15696,6 +18012,207 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_generation_target(probe.take_target(), "org/h", "org/h", "h100");
         }
+    }
+
+    #[tokio::test]
+    async fn remote_forbid_generation_surfaces_dispatch_a_model_without_a_remote_route_normally() {
+        for (surface, stream) in [
+            ("generate", false),
+            ("generate", true),
+            ("chat", false),
+            ("chat", true),
+            ("completions", false),
+            ("completions", true),
+            ("responses", false),
+        ] {
+            let (state, probe) = mixed_governed_generation_state(false).await;
+            let (uri, body) = match surface {
+                "generate" => (
+                    "/v1/generate/org%2Fg",
+                    json!({"prompt":"hello","max_new_tokens":4,"stream":stream}),
+                ),
+                "chat" => (
+                    "/v1/chat/completions",
+                    json!({"model":"org/g","messages":[{"role":"user","content":"hello"}],"max_tokens":4,"stream":stream}),
+                ),
+                "completions" => (
+                    "/v1/completions",
+                    json!({"model":"org/g","prompt":"hello","max_tokens":4,"stream":stream}),
+                ),
+                _ => (
+                    "/v1/responses",
+                    json!({"model":"org/g","input":"hello","max_output_tokens":4}),
+                ),
+            };
+            for capable in [false, true] {
+                let mut worker = worker_msg("default", "l4", "default");
+                worker.name = "worker-l4".into();
+                worker.bundle_config_hash = state
+                    .model_registry
+                    .compute_bundle_config_hash_for_pool("default", "default");
+                worker.supports_execution_authority_v1 = capable;
+                state
+                    .registry
+                    .update_worker("http://worker-l4:8080", worker)
+                    .await;
+                let mut request = json_request(uri, body.clone());
+                request
+                    .headers_mut()
+                    .insert("x-sie-remote", HeaderValue::from_static("forbid"));
+                let response = match surface {
+                    "generate" => proxy_request(State(state.clone()), request, "generate").await,
+                    "chat" => proxy_chat(State(state.clone()), request).await,
+                    "completions" => proxy_completions(State(state.clone()), request).await,
+                    _ => proxy_responses(State(state.clone()), request).await,
+                };
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{surface}/{stream}/{capable}"
+                );
+                assert!(!matches!(
+                    probe.take_target().1,
+                    PublishTarget::VerifiedWorker { .. }
+                ));
+                assert!(!probe.take_params().require_execution_authority_v1);
+                let _ = axum::body::to_bytes(response.into_body(), 16384)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_forbid_numeric_surfaces_publish_a_routed_model_only_to_verified_workers() {
+        for (surface, routed) in [
+            "encode",
+            "score",
+            "extract",
+            "embeddings",
+            "rerank",
+            "rerank-v2",
+        ]
+        .into_iter()
+        .flat_map(|surface| [(surface, true), (surface, false)])
+        {
+            let (mut state, _bundles, _models) = embeddings_dimensions_state();
+            let path = _models.path().join("embedder.yaml");
+            let mut raw = std::fs::read_to_string(&path).unwrap();
+            if surface == "extract" {
+                // This transport authority test needs a valid extraction task.
+                raw = raw.replace("tasks:\n", "tasks:\n  extract: {}\n");
+            }
+            if routed {
+                std::fs::write(
+                    _bundles.path().join("remote.yaml"),
+                    "name: remote\npriority: 1\ndefault: false\nadapters:\n  - sie_server.adapters.remote.sie\n",
+                )
+                .unwrap();
+                raw.push_str(
+                    "  remote:\n    adapter_path: sie_server.adapters.remote.sie:SieUpstreamAdapter\n    adapter_options:\n      loadtime:\n        upstream: team-sie\n        upstream_model: known/embedder\nrouting:\n  policy: fallback\n  fallback_profile: remote\n",
+                );
+            }
+            std::fs::write(path, raw).unwrap();
+            state.model_registry.reload();
+            assert_eq!(
+                state.model_registry.has_remote_route("known/embedder"),
+                routed
+            );
+            state.pool_manager.create_default_pool().await;
+            let probe = Arc::new(GenerationTargetProbe::default());
+            state.work_publisher = Some(probe.clone());
+            let state = Arc::new(state);
+            let (uri, body) = match surface {
+                "encode" => (
+                    "/v1/encode/known%2Fembedder",
+                    json!({"items":[{"text":"hello"}]}),
+                ),
+                "score" => (
+                    "/v1/score/known%2Fembedder",
+                    json!({"query":{"text":"hello"},"items":[{"text":"world"}]}),
+                ),
+                "extract" => (
+                    "/v1/extract/known%2Fembedder",
+                    json!({"items":[{"text":"hello"}],"labels":["topic"]}),
+                ),
+                "embeddings" => (
+                    "/v1/embeddings",
+                    json!({"model":"known/embedder","input":"hello"}),
+                ),
+                "rerank" => (
+                    "/v1/rerank",
+                    json!({"model":"known/embedder","query":"hello","documents":["world"]}),
+                ),
+                _ => (
+                    "/v2/rerank",
+                    json!({"model":"known/embedder","query":"hello","documents":["world"]}),
+                ),
+            };
+            for capable in [false, true] {
+                let mut worker = worker_msg("default", "l4", "default");
+                worker.name = "verified-worker".into();
+                worker.bundle_config_hash = state
+                    .model_registry
+                    .compute_bundle_config_hash_for_pool("default", "default");
+                worker.supports_execution_authority_v1 = capable;
+                state
+                    .registry
+                    .update_worker("http://verified-worker:8080", worker)
+                    .await;
+                let mut request = json_request(uri, body.clone());
+                request
+                    .headers_mut()
+                    .insert("x-sie-remote", HeaderValue::from_static("forbid"));
+                let response = match surface {
+                    "embeddings" => proxy_openai_embeddings(State(state.clone()), request).await,
+                    "rerank" => proxy_rerank(State(state.clone()), request).await,
+                    "rerank-v2" => proxy_rerank_v2(State(state.clone()), request).await,
+                    _ => proxy_request(State(state.clone()), request, surface).await,
+                };
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{surface}/{routed}/{capable}"
+                );
+                if !routed {
+                    assert!(!matches!(
+                        probe.take_target().1,
+                        PublishTarget::VerifiedWorker { .. }
+                    ));
+                    assert!(!probe.take_params().require_execution_authority_v1);
+                } else if capable {
+                    assert!(
+                        matches!(probe.take_target().1, PublishTarget::VerifiedWorker { worker_id, .. } if worker_id == "verified-worker")
+                    );
+                    assert!(probe.take_params().require_execution_authority_v1);
+                } else {
+                    assert_eq!(response.headers()["retry-after"], "5");
+                    assert_eq!(probe.target_count(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn remote_forbid_requires_local_snapshot_with_nonempty_hash() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sie-remote", HeaderValue::from_static("forbid"));
+        let local = crate::types::model::ServedBy::Local;
+        assert!(remote_control_response("encode", &headers, Some(&local), "hash").is_none());
+        for side in [None, Some(&local)] {
+            let response = remote_control_response("encode", &headers, side, "").unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "5");
+        }
+        let remote = crate::types::model::ServedBy::Remote {
+            upstream: Some("private".into()),
+        };
+        assert_eq!(
+            remote_control_response("encode", &headers, Some(&remote), "hash")
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -17201,6 +19718,9 @@ mod tests {
             .update_worker(
                 "http://assigned-cold:8080",
                 crate::types::WorkerStatusMessage {
+                    supports_execution_authority_v1: false,
+                    supports_numerical_admission_v1: false,
+                    supports_numerical_admission_subject_v1: false,
                     name: "assigned-cold".to_string(),
                     ready: true,
                     gpu_count: 1,
@@ -17220,6 +19740,7 @@ mod tests {
                     memory_total_bytes: None,
                     saturated: false,
                     terminated: false,
+                    numerical_process_inventory: None,
                     unsupported_models: Vec::new(),
                 },
             )
@@ -17251,7 +19772,8 @@ mod tests {
                 assert_eq!(model, "BAAI/bge-m3");
                 assert_eq!(worker_id, "assigned-cold");
             }
-            publisher::PublishTarget::Pool { .. } => {
+            publisher::PublishTarget::Pool { .. }
+            | publisher::PublishTarget::VerifiedWorker { .. } => {
                 panic!("capped logical batch work must not publish to the shared pool subject")
             }
         }
@@ -18476,6 +20998,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         };
         let body = build_generate_success_body("Qwen/Qwen3-4B-Instruct", &[&r], false);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -18630,6 +21153,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/slow".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -18673,6 +21197,7 @@ mod tests {
             text: "Hello world!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -18962,6 +21487,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         }
     }
 
@@ -19010,6 +21536,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         }
     }
 
@@ -19126,8 +21653,11 @@ mod tests {
 
     #[test]
     fn test_build_retryable_error_response_lora_loading_status_and_headers() {
-        let resp =
-            build_retryable_error_response(LORA_LOADING_ERROR_CODE, "Loading lora adapter 'foo'");
+        let resp = build_retryable_error_response(
+            LORA_LOADING_ERROR_CODE,
+            "Loading lora adapter 'foo'",
+            None,
+        );
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let headers = resp.headers();
         assert_eq!(
@@ -19137,6 +21667,61 @@ mod tests {
         assert_eq!(
             headers.get("x-sie-error-code").unwrap(),
             LORA_LOADING_ERROR_CODE
+        );
+    }
+
+    #[test]
+    fn invalid_worker_retry_hints_do_not_hide_valid_ones() {
+        let mut valid = _err_result(Some("QUEUE_FULL"), "upstream busy");
+        valid.retry_after_s = Some(9);
+        let mut invalid = _err_result(Some("QUEUE_FULL"), "upstream busy");
+        for hint in [0, 61, u32::MAX] {
+            invalid.retry_after_s = Some(hint);
+            assert_eq!(longest_worker_retry_after(&[&valid, &invalid]), Some(9));
+            assert_eq!(longest_worker_retry_after(&[&invalid]), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unanimous_queue_full_answers_503_with_the_longest_worker_hint() {
+        let mut short = _err_result(Some("QUEUE_FULL"), "upstream busy");
+        short.retry_after_s = Some(3);
+        let mut long = _err_result(Some("QUEUE_FULL"), "upstream busy");
+        long.retry_after_s = Some(9);
+        let unhinted = _err_result(Some("QUEUE_FULL"), "upstream busy");
+        let errors: Vec<&publisher::WorkResult> = vec![&short, &long, &unhinted];
+
+        assert_eq!(
+            unanimous_retryable_error_code(&errors),
+            Some(QUEUE_FULL_ERROR_CODE)
+        );
+        let resp = build_retryable_error_response(
+            QUEUE_FULL_ERROR_CODE,
+            "upstream busy",
+            longest_worker_retry_after(&errors),
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "9");
+        assert_eq!(
+            resp.headers().get("x-sie-error-code").unwrap(),
+            QUEUE_FULL_ERROR_CODE
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], QUEUE_FULL_ERROR_CODE);
+
+        let without_hint = build_retryable_error_response(
+            QUEUE_FULL_ERROR_CODE,
+            "upstream busy",
+            longest_worker_retry_after(&[&unhinted]),
+        );
+        assert_eq!(
+            without_hint.headers().get("retry-after").unwrap(),
+            QUEUE_FULL_RETRY_AFTER
         );
     }
 
@@ -19165,6 +21750,88 @@ mod tests {
         let r1 = _err_result(None, "no code");
         let errors: Vec<&publisher::WorkResult> = vec![&r1];
         assert_eq!(unanimous_retryable_error_code(&errors), None);
+    }
+
+    #[test]
+    fn a_request_keeps_only_its_last_numerical_decision() {
+        use crate::state::worker_registry::NumericalRefusal;
+        let decision = NumericalDecision::default();
+        let mut ext = axum::http::Extensions::new();
+        ext.insert(decision.clone());
+        NumericalDecision::note(
+            &ext,
+            "acme/hybrid",
+            "encode",
+            Some(NumericalRefusal::NoAdmission),
+        );
+        NumericalDecision::note(&ext, "acme/hybrid", "encode", None);
+        let latest = decision.0.lock().unwrap().take().unwrap();
+        assert_eq!(
+            (
+                latest.model.as_str(),
+                latest.operation.as_str(),
+                latest.refusal
+            ),
+            ("acme/hybrid", "encode", None)
+        );
+        assert!(decision.0.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_numerical_request_is_measured_only_without_other_runtime_options() {
+        let parsed = |params: serde_json::Value| {
+            parse_queue_request(
+                serde_json::to_vec(&json!({"items":[{"text":"x"}], "params": params}))
+                    .unwrap()
+                    .as_slice(),
+                false,
+                "encode",
+            )
+            .unwrap()
+        };
+        let declared = ["dense", "sparse", "score"].map(String::from);
+        let outputs = |operation: &str, params: serde_json::Value| {
+            numerical_request_outputs(operation, Some(&parsed(params)), &declared)
+        };
+        assert_eq!(
+            outputs("encode", json!({})),
+            Some(vec!["dense".to_string()])
+        );
+        assert_eq!(
+            outputs(
+                "encode",
+                json!({"output_types":["dense", "sparse"], "is_query": true})
+            ),
+            Some(vec!["dense".to_string(), "sparse".to_string()])
+        );
+        assert_eq!(
+            outputs("encode", json!({"options":{"is_query": true}})),
+            Some(vec!["dense".to_string()])
+        );
+        assert_eq!(outputs("score", json!({})), Some(vec!["score".to_string()]));
+        for params in [
+            json!({"output_dtype": "int8"}),
+            json!({"output_dtype": "float32"}),
+            json!({"options": {"normalize": true}}),
+            json!({"options": {"max_seq_length": 16}}),
+            json!({"instruction": "Represent this sentence:"}),
+            json!({"instruction": ""}),
+        ] {
+            assert_eq!(outputs("encode", params.clone()), None, "{params}");
+            assert_eq!(outputs("score", params.clone()), None, "{params}");
+        }
+        assert_eq!(numerical_request_outputs("encode", None, &declared), None);
+        assert_eq!(outputs("extract", json!({})), None);
+        for params in [
+            json!({"output_types": ["multivector"]}),
+            json!({"output_types": ["dense", "multivector"]}),
+        ] {
+            assert_eq!(outputs("encode", params.clone()), None, "{params}");
+        }
+        assert_eq!(
+            numerical_request_outputs("score", Some(&parsed(json!({}))), &["dense".to_string()]),
+            None
+        );
     }
 
     #[test]
@@ -19666,6 +22333,7 @@ mod tests {
         let resp = build_retryable_error_response(
             RESOURCE_EXHAUSTED_ERROR_CODE,
             "CUDA out of memory after recovery",
+            None,
         );
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let headers = resp.headers();
@@ -19688,6 +22356,7 @@ mod tests {
         let resp = build_retryable_error_response(
             RESOURCE_EXHAUSTED_ERROR_CODE,
             "CUDA out of memory after recovery",
+            None,
         );
         let body_bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -21034,6 +23703,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         };
         let resp_body = result.result_msgpack.clone();
         assert_eq!(resp_body, payload);
@@ -21074,6 +23744,7 @@ mod tests {
                 executed_bundle_config_hash: None,
                 execution_identity_sha256: None,
                 execution_binding_sha256: None,
+                retry_after_s: None,
             },
             publisher::WorkResult {
                 work_item_id: "r1.1".to_string(),
@@ -21095,6 +23766,7 @@ mod tests {
                 executed_bundle_config_hash: None,
                 execution_identity_sha256: None,
                 execution_binding_sha256: None,
+                retry_after_s: None,
             },
         ];
         let items: Vec<serde_json::Value> = results
@@ -21284,6 +23956,9 @@ mod tests {
 
     fn worker_msg(bundle: &str, gpu: &str, pool: &str) -> WorkerStatusMessage {
         WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: "worker-1".into(),
             ready: true,
             gpu_count: 1,
@@ -21306,6 +23981,7 @@ mod tests {
             memory_total_bytes: None,
             saturated: false,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         }
     }
@@ -21843,6 +24519,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/buffered".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -21905,6 +24582,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -21987,6 +24665,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/plain".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -22053,6 +24732,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g2".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -22115,6 +24795,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g3".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -23478,6 +26159,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -23536,6 +26218,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -23606,6 +26289,7 @@ mod tests {
             text: String::new(),
             finish_reason: "stop".to_string(),
             usage: Some(UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -23991,6 +26675,7 @@ mod tests {
             text: "a continuation".to_string(),
             finish_reason: "length".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -24617,6 +27302,7 @@ mod tests {
             text: "a joke".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -24652,6 +27338,7 @@ mod tests {
     #[test]
     fn test_responses_usage_reports_cached_input_tokens() {
         let usage = crate::queue::streaming::UsageBlock {
+            upstream_usage: None,
             gpu_second: None,
             images: None,
             prompt_tokens_details: Some(crate::queue::streaming::PromptTokensDetails {
@@ -24701,6 +27388,7 @@ mod tests {
             text: "Hi there!".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -24794,6 +27482,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -24834,6 +27523,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -24869,6 +27559,7 @@ mod tests {
             text: String::new(),
             finish_reason: "tool_calls".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -25368,6 +28059,29 @@ mod tests {
         assert!(value["error"]["param"].is_null());
     }
 
+    #[tokio::test]
+    async fn test_model_loading_uses_the_workers_retry_hint() {
+        for (retry_after_s, retry_after) in [(Some(7), "7"), (None, MODEL_LOADING_RETRY_AFTER)] {
+            let err = StreamingDriverErr::WorkerError {
+                code: MODEL_LOADING_ERROR_CODE.to_string(),
+                message: "the upstream is not ready, please retry".to_string(),
+                param: None,
+                retry_after_s,
+                request_id: "req-loading".to_string(),
+                attempt_id: "att-loading".to_string(),
+            };
+
+            let response = build_streaming_error_response(&err);
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers().get("retry-after").unwrap(), retry_after);
+            assert_eq!(
+                response.headers().get("x-sie-error-code").unwrap(),
+                MODEL_LOADING_ERROR_CODE
+            );
+        }
+    }
+
     /// HTTP status mapping unit test — guards against an off-by-one
     /// edit that drops the 429 mapping without touching
     /// ``build_streaming_error_response``.
@@ -25440,6 +28154,30 @@ mod tests {
                 LORA_LOADING_ERROR_CODE
             ))
         );
+        assert_eq!(
+            worker_error_retry_after(QUEUE_FULL_ERROR_CODE, None),
+            Some((QUEUE_FULL_RETRY_AFTER.to_string(), QUEUE_FULL_ERROR_CODE))
+        );
+        assert_eq!(
+            worker_error_retry_after(QUEUE_FULL_ERROR_CODE, Some(12)),
+            Some(("12".to_string(), QUEUE_FULL_ERROR_CODE))
+        );
+        assert_eq!(
+            worker_error_retry_after(MODEL_LOADING_ERROR_CODE, Some(12)),
+            Some(("12".to_string(), MODEL_LOADING_ERROR_CODE))
+        );
+        assert_eq!(
+            worker_error_retry_after(LORA_LOADING_ERROR_CODE, Some(12)),
+            Some((
+                LORA_LOADING_RETRY_AFTER.to_string(),
+                LORA_LOADING_ERROR_CODE
+            )),
+            "only the codes that take a worker hint use it"
+        );
+        assert_eq!(
+            worker_error_http_status(QUEUE_FULL_ERROR_CODE),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         // Terminal / non-retryable codes carry no retry hint.
         assert_eq!(worker_error_retry_after("invalid_request", None), None);
         assert_eq!(
@@ -25458,6 +28196,13 @@ mod tests {
                     RESOURCE_EXHAUSTED_ERROR_CODE
                 ))
             );
+            assert_eq!(
+                worker_error_retry_after(MODEL_LOADING_ERROR_CODE, Some(invalid)),
+                Some((
+                    MODEL_LOADING_RETRY_AFTER.to_string(),
+                    MODEL_LOADING_ERROR_CODE
+                ))
+            );
         }
     }
 
@@ -25472,6 +28217,7 @@ mod tests {
             text: "Hi".to_string(),
             finish_reason: "stop".to_string(),
             usage: Some(crate::queue::streaming::UsageBlock {
+                upstream_usage: None,
                 gpu_second: None,
                 images: None,
                 prompt_tokens_details: None,
@@ -25522,6 +28268,7 @@ mod tests {
             dims: std::collections::HashMap::new(),
             max_sequence_length: None,
             revision: None,
+            routing: None,
             max_output_tokens: None,
             profile_max_output_tokens: std::collections::HashMap::new(),
             grammar_capabilities: None,
@@ -25576,6 +28323,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         }
     }
 
@@ -26034,10 +28782,38 @@ mod tests {
     }
 
     #[test]
-    fn test_rerank_response_rejects_missing_or_malformed_usage() {
+    fn test_rerank_response_omits_usage_when_the_score_reports_none() {
+        let scores = json!([
+            {"item_id": "1", "score": 0.9, "rank": 0},
+            {"item_id": "0", "score": 0.2, "rank": 1}
+        ]);
+        for native in [
+            json!({"model": "m", "scores": scores.clone()}),
+            json!({"model": "m", "scores": scores.clone(), "usage": null}),
+        ] {
+            let response = rerank_response_from_score(
+                &native,
+                &["first".to_string(), "second".to_string()],
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(response.get("usage").is_none(), "{response}");
+            let indexes = response["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|result| result["index"].as_u64().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(indexes, vec![1, 0]);
+        }
+    }
+
+    #[test]
+    fn test_rerank_response_rejects_malformed_usage() {
         let scores = json!([{"item_id": "0", "score": 0.5, "rank": 0}]);
         for (usage, expected) in [
-            (Value::Null, "missing authoritative usage"),
+            (json!([4]), "usage is not an object"),
             (json!({"images": 1}), "missing input_tokens"),
             (
                 json!({"input_tokens": 4, "images": -1}),
@@ -26470,5 +29246,225 @@ mod tests {
             !rendered.contains("encoding_format") && !rendered.contains("base64"),
             "the inner encode request carries no encoding hint: {rendered}",
         );
+    }
+}
+
+#[cfg(test)]
+mod governed_bridge_route_tests {
+    use super::*;
+    use crate::handlers::test_support::{TestGateway, HYBRID_GENERATE_MODEL, REMOTE_LANE};
+
+    struct RemoteRoute(Option<GovernedGenerationRoute>);
+
+    impl ModelAccessPolicy for RemoteRoute {
+        fn visible(&self, _resolved_model: &str, _ext: &axum::http::Extensions) -> bool {
+            true
+        }
+
+        fn generation_route_policy(&self) -> Option<&dyn GenerationRoutePolicy> {
+            Some(self)
+        }
+    }
+
+    impl GenerationRoutePolicy for RemoteRoute {
+        fn resolve(
+            &self,
+            _customer_model: &str,
+            _intent: GenerationRequestIntent,
+        ) -> Option<GovernedGenerationRoute> {
+            None
+        }
+
+        fn resolve_remote(
+            &self,
+            _customer_model: &str,
+            _intent: GenerationRequestIntent,
+        ) -> Option<GovernedGenerationRoute> {
+            self.0.clone()
+        }
+    }
+
+    fn route(
+        model: &str,
+        (pool, machine_profile, bundle): (&str, &str, &str),
+    ) -> GovernedGenerationRoute {
+        GovernedGenerationRoute {
+            model: model.to_string(),
+            bundle: bundle.to_string(),
+            pool: pool.to_string(),
+            machine_profile: machine_profile.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bridged_generation_request_dispatches_only_on_an_agreeing_remote_route() {
+        let config = format!(
+            "{HYBRID_GENERATE_MODEL}\nrouting:\n  policy: fallback\n  fallback_profile: remote\n"
+        );
+        let mut gateway = TestGateway::new(&[&config]).await;
+        let plan = gateway
+            .state
+            .model_registry
+            .remote_fallback_plan("acme/chat", FallbackTrigger::Provisioning)
+            .expect("remote plan");
+        let intent = GenerationRequestIntent::Default;
+        assert_eq!(
+            governed_bridge_route(
+                &gateway.state,
+                &axum::http::Extensions::new(),
+                "acme/chat",
+                intent,
+                &plan
+            )
+            .ok(),
+            Some(None),
+            "an ungoverned bridge keeps the plan's coordinates"
+        );
+
+        let agreeing = route("acme/chat:remote", REMOTE_LANE);
+        gateway.install_policy(Arc::new(RemoteRoute(Some(agreeing.clone()))));
+        assert_eq!(
+            governed_bridge_route(
+                &gateway.state,
+                &axum::http::Extensions::new(),
+                "acme/chat",
+                intent,
+                &plan
+            )
+            .ok(),
+            Some(Some(agreeing))
+        );
+
+        for (case, remote) in [
+            ("no remote route", None),
+            (
+                "another model",
+                Some(route("acme/other:remote", REMOTE_LANE)),
+            ),
+            (
+                "another bundle",
+                Some(route("acme/chat:remote", ("default", "cpu", "default"))),
+            ),
+            (
+                "another pool",
+                Some(route("acme/chat:remote", ("other", "cpu", "remote"))),
+            ),
+            (
+                "an unconfigured machine profile",
+                Some(route("acme/chat:remote", ("default", "tpu", "remote"))),
+            ),
+        ] {
+            gateway.install_policy(Arc::new(RemoteRoute(remote)));
+            assert!(
+                governed_bridge_route(
+                    &gateway.state,
+                    &axum::http::Extensions::new(),
+                    "acme/chat",
+                    intent,
+                    &plan
+                )
+                .is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    /// A deployment policy that reads the registry while it names the remote
+    /// route.
+    struct RegistryReadingRoute {
+        route: GovernedGenerationRoute,
+        registry: Arc<crate::state::model_registry::ModelRegistry>,
+    }
+
+    impl ModelAccessPolicy for RegistryReadingRoute {
+        fn visible(&self, _resolved_model: &str, _ext: &axum::http::Extensions) -> bool {
+            true
+        }
+
+        fn remote_route_admitted(
+            &self,
+            _model: &str,
+            _remote_model: &str,
+            _reason: RemoteRouteReason,
+            _ext: &axum::http::Extensions,
+        ) -> bool {
+            true
+        }
+
+        fn generation_route_policy(&self) -> Option<&dyn GenerationRoutePolicy> {
+            Some(self)
+        }
+    }
+
+    impl GenerationRoutePolicy for RegistryReadingRoute {
+        fn resolve(
+            &self,
+            _customer_model: &str,
+            _intent: GenerationRequestIntent,
+        ) -> Option<GovernedGenerationRoute> {
+            None
+        }
+
+        fn resolve_remote(
+            &self,
+            _customer_model: &str,
+            _intent: GenerationRequestIntent,
+        ) -> Option<GovernedGenerationRoute> {
+            self.registry
+                .with_current_generation(&self.registry.capture_generation(), || self.route.clone())
+        }
+    }
+
+    #[test]
+    fn a_threshold_plan_may_ask_a_policy_that_reads_the_registry() {
+        use crate::handlers::test_support::ThresholdBroker;
+        use crate::state::threshold_coordinator::ThresholdSampler;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let planned = runtime.block_on(async {
+                let broker = ThresholdBroker::start().await?;
+                let config = format!("{HYBRID_GENERATE_MODEL}\nrouting:\n  policy: threshold\n  fallback_profile: remote\n  wake_above: 1\n  sleep_below: 0.5\n  window_s: 1\n  cooldown_s: 1\n");
+                let mut gateway = TestGateway::with_threshold_routing(&[&config], true).await;
+                let registry = Arc::clone(&gateway.state.model_registry);
+                gateway.install_policy(Arc::new(RegistryReadingRoute {
+                    route: route("acme/chat:remote", REMOTE_LANE),
+                    registry,
+                }));
+                let binding = broker.bind(&gateway).await;
+                let mut sampler = ThresholdSampler::default();
+                binding.coordinator.sample(&mut sampler).await.unwrap();
+                for _ in 0..2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1050)).await;
+                    binding.coordinator.sample(&mut sampler).await.unwrap();
+                }
+                Some(
+                    threshold_remote_plan_for_request(
+                        &gateway.state,
+                        &HeaderMap::new(),
+                        &axum::http::Extensions::new(),
+                        "acme/chat",
+                        "generate",
+                        None,
+                        true,
+                        "",
+                        Some(GenerationRequestIntent::Default),
+                    )
+                    .map(|plan| plan.model),
+                )
+            });
+            let _ = done_tx.send(planned);
+        });
+
+        // A policy that re-enters a held registry lock blocks its thread forever.
+        let planned = done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("planning finished");
+        if let Some(planned) = planned {
+            assert_eq!(planned.as_deref(), Some("acme/chat:remote"));
+        }
     }
 }

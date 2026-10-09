@@ -4,13 +4,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
+use crate::state::threshold_coordinator::{ThresholdDecision, ThresholdError, ThresholdTarget};
+use crate::state::threshold_runtime::ThresholdBinding;
+
 use crate::types::bundle::{engine_adapter_prefixes, BundleInfo, DEFAULT_ENGINE, KNOWN_ENGINES};
 use crate::types::model::{
-    CanonicalProfile, ModelConfig, ModelEntry, ModelInfoExtras, ProfileConfig, ServedBy,
+    remote_adapter_upstream_kind, CanonicalProfile, FallbackTrigger, ModelConfig, ModelEntry,
+    ModelInfoExtras, ProfileConfig, RoutingPolicy, ServedBy,
 };
 
 #[derive(Debug)]
@@ -205,6 +209,38 @@ impl ModelRegistryGeneration {
     }
 }
 
+/// The remote profile and worker contract chosen from one registry snapshot.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteFallbackPlan {
+    /// The canonical bare model the route stands in for.
+    pub local_model: String,
+    pub model: String,
+    pub bundle: String,
+    pub pool: String,
+    pub engine: String,
+    pub config_hash: String,
+    pub revision: Option<String>,
+    pub served_by: ServedBy,
+    /// Set for a model with numerical outputs, whose remote attempt also needs
+    /// a current numerical admission that covers the local fleet.
+    pub numerical: Option<NumericalRoute>,
+}
+
+/// The local side of a numerical bridge, and the remote workers whose
+/// admission covers it once the gateway has checked.
+#[derive(Clone, Debug)]
+pub(crate) struct NumericalRoute {
+    /// The bare model, as worker inventories name it.
+    pub model: String,
+    pub local_bundles: Vec<String>,
+    /// The model's own pool, `default` when it names none. Workers load only
+    /// the models of their own pool.
+    pub local_pool: String,
+    /// The numerical outputs the bare model declares.
+    pub outputs: Vec<String>,
+    pub admitted: Option<Arc<crate::state::worker_registry::AdmittedWorkers>>,
+}
+
 pub struct ModelRegistry {
     bundles_dir: PathBuf,
     models_dir: PathBuf,
@@ -223,6 +259,8 @@ pub struct ModelRegistry {
     /// installed is protected by the retention guard, so a config service
     /// that later restarts empty cannot take it down.
     authoritative_surface: AtomicBool,
+    threshold_enabled: bool,
+    threshold_binding: ArcSwapOption<ThresholdBinding>,
 }
 
 impl ModelRegistry {
@@ -231,12 +269,23 @@ impl ModelRegistry {
         models_dir: impl AsRef<Path>,
         auto_load: bool,
     ) -> Self {
+        Self::with_threshold_routing(bundles_dir, models_dir, auto_load, false)
+    }
+
+    pub fn with_threshold_routing(
+        bundles_dir: impl AsRef<Path>,
+        models_dir: impl AsRef<Path>,
+        auto_load: bool,
+        threshold_enabled: bool,
+    ) -> Self {
         let registry = Self {
             bundles_dir: bundles_dir.as_ref().to_path_buf(),
             models_dir: models_dir.as_ref().to_path_buf(),
             snapshot: ArcSwap::from_pointee(RegistrySnapshot::default()),
             write_lock: Mutex::new(()),
             authoritative_surface: AtomicBool::new(false),
+            threshold_enabled,
+            threshold_binding: ArcSwapOption::empty(),
         };
         if auto_load {
             registry.reload();
@@ -352,7 +401,7 @@ impl ModelRegistry {
                         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
                             continue;
                         }
-                        match Self::load_model_file(&path) {
+                        match Self::load_model_file(&path, self.threshold_enabled) {
                             Ok(model_entries) => {
                                 for model_entry in model_entries {
                                     debug!(
@@ -490,11 +539,14 @@ impl ModelRegistry {
         })
     }
 
-    fn load_model_file(path: &Path) -> Result<Vec<ModelEntry>, Box<dyn std::error::Error>> {
+    fn load_model_file(
+        path: &Path,
+        threshold_enabled: bool,
+    ) -> Result<Vec<ModelEntry>, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let config: ModelConfig = serde_yaml::from_str(&content)?;
 
-        Self::expand_model_config_into_profile_variants(&config).map_err(|message| {
+        Self::expand_model_config_with_threshold(&config, threshold_enabled).map_err(|message| {
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 message,
@@ -524,10 +576,18 @@ impl ModelRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     fn expand_model_config_into_profile_variants(
         config: &ModelConfig,
     ) -> Result<Vec<ModelEntry>, String> {
-        let base_entry = Self::model_entry_from_config(config)?;
+        Self::expand_model_config_with_threshold(config, false)
+    }
+
+    fn expand_model_config_with_threshold(
+        config: &ModelConfig,
+        threshold_enabled: bool,
+    ) -> Result<Vec<ModelEntry>, String> {
+        let base_entry = Self::model_entry_with_threshold(config, threshold_enabled)?;
         let mut entries = if base_entry.profile_names.contains("default") {
             vec![base_entry.clone()]
         } else {
@@ -600,6 +660,7 @@ impl ModelRegistry {
         // (see ``base_grammar_profile``), so a sibling variant such as
         // ``…:a100-40gb`` still reroutes to ``{base}:{grammar_profile}``.
         narrowed.grammar_profile = None;
+        narrowed.routing = None;
         narrowed.profile_parents.clear();
         if let Some(map) = base.profile_lora_adapters.as_ref() {
             let scoped = map.get(profile_name).cloned().unwrap_or_default();
@@ -679,7 +740,15 @@ impl ModelRegistry {
             .retain(|name, _| Some(name.as_str()) == native_encode_output);
     }
 
+    #[cfg(test)]
     fn model_entry_from_config(config: &ModelConfig) -> Result<ModelEntry, String> {
+        Self::model_entry_with_threshold(config, false)
+    }
+
+    fn model_entry_with_threshold(
+        config: &ModelConfig,
+        threshold_enabled: bool,
+    ) -> Result<ModelEntry, String> {
         let info_extras = crate::types::model::ModelInfoExtras::from_model_config(config);
         let model_name = config.name.clone();
         let pool = Self::normalize_model_pool(config.pool.as_deref())?;
@@ -707,7 +776,51 @@ impl ModelRegistry {
             info_extras,
         };
         Self::validate_profile_grammar_fallbacks(&entry)?;
+        Self::validate_remote_routing(&entry, threshold_enabled)?;
         Ok(entry)
+    }
+
+    fn validate_remote_routing(entry: &ModelEntry, threshold_enabled: bool) -> Result<(), String> {
+        let Some(routing) = &entry.info_extras.routing else {
+            return Ok(());
+        };
+        routing.validate()?;
+        if matches!(routing.policy, RoutingPolicy::Threshold) && !threshold_enabled {
+            return Err("routing policy threshold is not available yet".into());
+        }
+        let profile_kind = |name: &str| {
+            entry
+                .profile_configs
+                .get(name)
+                .and_then(|profile| profile.adapter_path.as_deref())
+                .and_then(|path| {
+                    remote_adapter_upstream_kind(path.split(':').next().unwrap_or(path))
+                })
+        };
+        if matches!(routing.policy, RoutingPolicy::RemoteOnly) {
+            if profile_kind("default").is_none()
+                || entry
+                    .profile_configs
+                    .keys()
+                    .any(|profile| profile_kind(profile).is_none())
+            {
+                return Err("remote_only routing requires a remote default profile".into());
+            }
+            return Ok(());
+        }
+        if !entry.profile_configs.contains_key("default")
+            || matches!(entry.served_by(), ServedBy::Remote { .. })
+        {
+            return Err("fallback routing requires a local default profile".into());
+        }
+        let profile = routing
+            .fallback_profile()
+            .expect("hybrid routing names a profile");
+        Self::validate_profile_name(profile)?;
+        if profile == "default" || profile_kind(profile).is_none() {
+            return Err("fallback routing requires a non-default remote profile".into());
+        }
+        Ok(())
     }
 
     fn validate_profile_grammar_fallbacks(entry: &ModelEntry) -> Result<(), String> {
@@ -1630,6 +1743,208 @@ impl ModelRegistry {
         snap.models.get(&canonical).map(ModelEntry::served_by)
     }
 
+    /// Whether routing can send a request for `model` to a remote profile: the
+    /// route is remote, or the model's policy names a remote profile. A model
+    /// the registry does not hold cannot be ruled out.
+    pub(crate) fn has_remote_route(&self, model: &str) -> bool {
+        let snap = self.snapshot.load();
+        Self::canonical_model_name(&snap, model)
+            .and_then(|canonical| snap.models.get(&canonical))
+            .is_none_or(|entry| {
+                entry.info_extras.routing.is_some()
+                    || matches!(entry.served_by(), ServedBy::Remote { .. })
+            })
+    }
+
+    /// Whether a bare local model with numerical outputs declares a bridge,
+    /// so its encode and score requests may need a numerical admission.
+    pub(crate) fn has_numerical_bridge(&self, model: &str) -> bool {
+        if model.contains(':') {
+            return false;
+        }
+        let snap = self.snapshot.load();
+        Self::canonical_model_name(&snap, model)
+            .and_then(|canonical| snap.models.get(&canonical))
+            .and_then(|local| Self::remote_plan_from_snapshot(&snap, local))
+            .is_some_and(|plan| plan.numerical.is_some())
+    }
+
+    /// Resolve only a bare local model's configured and enabled bridge.
+    /// The route, disclosure and exact worker hash share one snapshot; caller
+    /// profile selectors cannot acquire this authority, and a numerical plan
+    /// still needs the gateway's admission check.
+    pub(crate) fn remote_fallback_plan(
+        &self,
+        model: &str,
+        trigger: FallbackTrigger,
+    ) -> Option<RemoteFallbackPlan> {
+        if model.contains(':') {
+            return None;
+        }
+        let snap = self.snapshot.load();
+        let canonical = Self::canonical_model_name(&snap, model)?;
+        let local = snap.models.get(&canonical)?;
+        let routing = local.info_extras.routing.as_ref()?;
+        if !routing.permits(trigger)
+            || local.canonical_profile != "default"
+            || !matches!(local.served_by(), ServedBy::Local)
+        {
+            return None;
+        }
+        Self::remote_plan_from_snapshot(&snap, local)
+    }
+
+    fn remote_plan_from_snapshot(
+        snap: &RegistrySnapshot,
+        local: &ModelEntry,
+    ) -> Option<RemoteFallbackPlan> {
+        if local.canonical_profile != "default" || !matches!(local.served_by(), ServedBy::Local) {
+            return None;
+        }
+        let (remote_name, _) = local.routed_remote_profile()?;
+        let remote = snap.models.get(&remote_name)?;
+        let served_by = remote.served_by();
+        if !matches!(served_by, ServedBy::Remote { .. }) {
+            return None;
+        }
+        let bundle = remote.bundles.first()?.clone();
+        let pool = Self::entry_pool_name(remote).to_string();
+        let config_hash = snap
+            .bundle_pool_config_hashes
+            .get(&(bundle.clone(), pool.clone()))?
+            .clone();
+        if config_hash.is_empty() {
+            return None;
+        }
+        let outputs: Vec<String> = local
+            .info_extras
+            .outputs
+            .iter()
+            .filter(|output| {
+                matches!(
+                    output.as_str(),
+                    "dense" | "sparse" | "multivector" | "score"
+                )
+            })
+            .cloned()
+            .collect();
+        let numerical = (!outputs.is_empty()).then(|| NumericalRoute {
+            model: local.canonical_base_model.clone(),
+            local_bundles: local.bundles.clone(),
+            local_pool: Self::normalize_pool_name(Self::entry_pool_name(local)),
+            outputs,
+            admitted: None,
+        });
+        Some(RemoteFallbackPlan {
+            local_model: local.canonical_base_model.clone(),
+            model: remote_name,
+            engine: snap.bundles.get(&bundle)?.engine.clone(),
+            bundle,
+            pool,
+            config_hash,
+            revision: Self::immutable_model_revision(remote),
+            served_by,
+            numerical,
+        })
+    }
+
+    pub(crate) fn threshold_targets(
+        &self,
+        epoch: u64,
+    ) -> Result<(ModelRegistryGeneration, Vec<ThresholdTarget>), ThresholdError> {
+        let generation = self.capture_generation();
+        let snap = &generation.snapshot;
+        let mut targets = Vec::new();
+        for local in snap.models.values() {
+            let Some(routing) = local.info_extras.routing.as_ref() else {
+                continue;
+            };
+            if routing.policy != RoutingPolicy::Threshold || local.canonical_profile != "default" {
+                continue;
+            }
+            let plan = Self::remote_plan_from_snapshot(snap, local)
+                .ok_or(ThresholdError::Configuration)?;
+            let local_bundle = local.bundles.first().ok_or(ThresholdError::Configuration)?;
+            let local_hash = snap
+                .bundle_pool_config_hashes
+                .get(&(
+                    local_bundle.clone(),
+                    Self::entry_pool_name(local).to_string(),
+                ))
+                .ok_or(ThresholdError::Configuration)?;
+            if local_hash.is_empty() {
+                return Err(ThresholdError::Configuration);
+            }
+            let mut fingerprint = Sha256::new();
+            fingerprint.update(local_hash.as_bytes());
+            fingerprint.update(plan.config_hash.as_bytes());
+            let fingerprint = fingerprint
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            targets.push(ThresholdTarget::new(
+                &local.name,
+                epoch,
+                &fingerprint,
+                routing,
+            )?);
+        }
+        Ok((generation, targets))
+    }
+
+    pub(crate) fn install_threshold_binding(&self, binding: Arc<ThresholdBinding>) {
+        self.with_current_generation(&binding.generation, || {
+            self.threshold_binding.store(Some(binding.clone()))
+        });
+    }
+
+    pub(crate) fn clear_threshold_binding(&self) {
+        self.threshold_binding.store(None);
+    }
+
+    /// `accept`, when given, decides the plan before the request is counted
+    /// as demand. It runs while no registry lock is held, so it may read the
+    /// registry. The plan is counted only while its binding and snapshot are
+    /// still current.
+    pub(crate) fn threshold_remote_route(
+        &self,
+        model: &str,
+        epoch: u64,
+        accept: Option<&dyn Fn(&RemoteFallbackPlan) -> bool>,
+    ) -> Option<RemoteFallbackPlan> {
+        let binding = self.threshold_binding.load_full()?;
+        if binding.epoch != epoch || model.contains(':') {
+            return None;
+        }
+        let snap = &binding.generation.snapshot;
+        let canonical = Self::canonical_model_name(snap, model)?;
+        let plan = snap
+            .models
+            .get(&canonical)
+            .and_then(|entry| Self::remote_plan_from_snapshot(snap, entry));
+        if accept.is_some_and(|accept| !plan.as_ref().is_some_and(accept)) {
+            return None;
+        }
+        // A snapshot writer must never block a request thread. Contention is
+        // unavailable authority and retains the ordinary local/fallback path.
+        let _fence = self.write_lock.try_lock().ok()?;
+        if !Arc::ptr_eq(&self.snapshot.load_full(), snap)
+            || !self
+                .threshold_binding
+                .load()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &binding))
+        {
+            return None;
+        }
+        binding.coordinator.record_request(&canonical).ok()?;
+        if binding.coordinator.decision(&canonical).ok()? != ThresholdDecision::Remote {
+            return None;
+        }
+        plan
+    }
+
     pub fn get_model_pool_name(&self, model: &str) -> Option<String> {
         let snap = self.snapshot.load();
         let canonical = Self::canonical_model_name(&snap, model)?;
@@ -1686,12 +2001,27 @@ impl ModelRegistry {
     /// The scope bit reports whether the hash is governed by a known catalog
     /// model. Proxy paths use it to reject a missing known hash instead of
     /// treating it as the legacy unknown/sealed wildcard.
+    #[cfg(test)]
     pub fn bundle_execution_evidence(
         &self,
         bundle_id: &str,
         pool_name: &str,
         model: &str,
     ) -> (String, Option<String>, bool) {
+        let (hash, revision, catalog, _) =
+            self.serving_execution_evidence(bundle_id, pool_name, model);
+        (hash, revision, catalog)
+    }
+
+    /// Serving side and worker execution hash from one immutable snapshot.
+    /// Request egress guards must use this pair together: a config reload may
+    /// not pair a local classification with a later remote profile's hash.
+    pub fn serving_execution_evidence(
+        &self,
+        bundle_id: &str,
+        pool_name: &str,
+        model: &str,
+    ) -> (String, Option<String>, bool, Option<ServedBy>) {
         let snap = self.snapshot.load();
         let canonical = Self::canonical_model_name(&snap, model);
         let uses_catalog_scope = canonical.is_some();
@@ -1706,10 +2036,12 @@ impl ModelRegistry {
             .get(&(bundle_id.to_string(), pool_name))
             .cloned()
             .unwrap_or_default();
-        let revision = canonical
-            .and_then(|canonical| snap.models.get(&canonical))
-            .and_then(Self::immutable_model_revision);
-        (bundle_config_hash, revision, uses_catalog_scope)
+        let entry = canonical
+            .as_ref()
+            .and_then(|canonical| snap.models.get(canonical));
+        let revision = entry.and_then(Self::immutable_model_revision);
+        let served_by = entry.map(ModelEntry::served_by);
+        (bundle_config_hash, revision, uses_catalog_scope, served_by)
     }
 
     /// Resolve one connector encode identity from a single registry snapshot.
@@ -2224,7 +2556,7 @@ impl ModelRegistry {
         };
         let applied = configs.len();
         let (new_models, new_model_names_lower) =
-            Self::build_authoritative_models(configs, &new_bundles)?;
+            Self::build_authoritative_models(configs, &new_bundles, self.threshold_enabled)?;
 
         let mut bundle_config_hashes =
             Self::rebuild_bundle_config_hashes(&new_bundles, &new_models);
@@ -2305,6 +2637,7 @@ impl ModelRegistry {
     fn build_authoritative_models(
         configs: Vec<ModelConfig>,
         bundles: &HashMap<String, BundleInfo>,
+        threshold_enabled: bool,
     ) -> Result<AuthoritativeModels, String> {
         let mut new_models: HashMap<String, ModelEntry> = HashMap::new();
         let mut new_model_names_lower: HashMap<String, String> = HashMap::new();
@@ -2356,7 +2689,7 @@ impl ModelRegistry {
                 ));
             }
 
-            for mut entry in Self::expand_model_config_into_profile_variants(&config)? {
+            for mut entry in Self::expand_model_config_with_threshold(&config, threshold_enabled)? {
                 Self::assign_bundles(&mut entry, bundles);
                 new_model_names_lower.insert(entry.name.to_lowercase(), entry.name.clone());
                 new_models.insert(entry.name.clone(), entry);
@@ -2445,6 +2778,20 @@ impl ModelRegistry {
         let incoming_pool = Self::normalize_model_pool(config.pool.as_deref())?;
 
         if let Some(existing) = snap.models.get_mut(sie_id) {
+            if let Some(routing) = &config.routing {
+                if existing
+                    .info_extras
+                    .routing
+                    .as_ref()
+                    .is_some_and(|stored| stored != routing)
+                    && !authoritative
+                {
+                    return Err(
+                        "routing policy already exists with different config (append-only)".into(),
+                    );
+                }
+                existing.info_extras.routing = Some(routing.clone());
+            }
             if config.pool.is_some() && existing.pool != incoming_pool {
                 return Err(format!(
                     "Pool on model '{}' already exists with different value (append-only)",
@@ -2563,6 +2910,7 @@ impl ModelRegistry {
         let mut affected_model_names = vec![sie_id.clone()];
         if let Some(base_entry) = snap.models.get(sie_id).cloned() {
             Self::validate_profile_grammar_fallbacks(&base_entry)?;
+            Self::validate_remote_routing(&base_entry, self.threshold_enabled)?;
             let old_variants: Vec<String> = snap
                 .models
                 .keys()
@@ -2693,7 +3041,11 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::test_support::{TestGateway, ThresholdBroker, HYBRID_GENERATE_MODEL};
+    use crate::state::threshold_coordinator::ThresholdSampler;
     use std::fs;
+    use std::sync::mpsc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn create_test_dirs() -> (TempDir, PathBuf, PathBuf) {
@@ -2720,6 +3072,377 @@ mod tests {
             compute_precision: None,
             adapter_options: None,
             extends: extends.map(str::to_string),
+        }
+    }
+
+    fn remote_routing_fixture() -> (TempDir, ModelRegistry, ModelConfig) {
+        let (dir, bundles, models) = create_test_dirs();
+        fs::write(bundles.join("default.yaml"),
+            "name: default\npriority: 10\nadapters:\n  - sie_server.adapters.bge_m3\n  - sie_server.adapters.remote.sie\n").unwrap();
+        let registry = ModelRegistry::new(&bundles, &models, true);
+        let config = serde_json::from_value(serde_json::json!({
+            "sie_id":"acme/hybrid", "profiles": {
+                "default":{"adapter_path":"sie_server.adapters.bge_m3:BgeM3Adapter"},
+                "remote":{"adapter_path":"sie_server.adapters.remote.sie:SieUpstreamAdapter",
+                    "adapter_options":{"loadtime":{"upstream":"team-sie", "upstream_model":"acme/hybrid:default"}}},
+                "local":{"extends":"default"}
+            }
+        })).unwrap();
+        (dir, registry, config)
+    }
+
+    #[test]
+    fn threshold_flag_admits_generation_and_numerical_models_but_keeps_the_zero_epoch_gate() {
+        let (_dir, mut registry, mut config) = remote_routing_fixture();
+        registry.threshold_enabled = true;
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+                "policy":"threshold", "fallback_profile":"remote", "wake_above":2,
+                "sleep_below":1, "window_s":1, "cooldown_s":1
+            }))
+            .unwrap(),
+        );
+        config.tasks = Some(serde_yaml::from_str("generate: {}\n").unwrap());
+        registry
+            .replace_model_configs_authoritative(vec![config.clone()])
+            .unwrap();
+        assert_eq!(registry.threshold_targets(1).unwrap().1.len(), 1);
+        assert!(registry.threshold_targets(0).is_err());
+        config.tasks = Some(serde_yaml::from_str("encode:\n  dense:\n    dim: 2\n").unwrap());
+        registry
+            .replace_model_configs_authoritative(vec![config])
+            .unwrap();
+        assert_eq!(registry.threshold_targets(1).unwrap().1.len(), 1);
+        assert!(registry.has_numerical_bridge("acme/hybrid"));
+    }
+
+    #[tokio::test]
+    async fn threshold_request_refuses_contended_snapshot_without_blocking() {
+        let Some(broker) = ThresholdBroker::start().await else {
+            return;
+        };
+        let model = format!(
+            "{HYBRID_GENERATE_MODEL}\nrouting:\n  policy: threshold\n  fallback_profile: remote\n  wake_above: 1\n  sleep_below: 0.5\n  window_s: 1\n  cooldown_s: 1\n"
+        );
+        let gateway = TestGateway::with_threshold_routing(&[&model], true).await;
+        let binding = broker.bind(&gateway).await;
+        let mut sampler = ThresholdSampler::default();
+        binding.coordinator.sample(&mut sampler).await.unwrap();
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+            binding.coordinator.sample(&mut sampler).await.unwrap();
+        }
+        assert!(gateway
+            .state
+            .model_registry
+            .threshold_remote_route("acme/chat", 1, None)
+            .is_some());
+
+        let registry = Arc::clone(&gateway.state.model_registry);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let _write = registry.write_lock.lock().unwrap();
+            held_tx.send(()).unwrap();
+            // Bound a regression's blocking wait so this test cannot hang.
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let route = gateway
+            .state
+            .model_registry
+            .threshold_remote_route("acme/chat", 1, None);
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        assert!(route.is_none());
+        assert!(gateway
+            .state
+            .model_registry
+            .threshold_remote_route("acme/chat", 1, None)
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_threshold_accept_callback_runs_outside_the_registry_lock() {
+        let Some(broker) = ThresholdBroker::start().await else {
+            return;
+        };
+        let model = format!(
+            "{HYBRID_GENERATE_MODEL}\nrouting:\n  policy: threshold\n  fallback_profile: remote\n  wake_above: 1\n  sleep_below: 0.5\n  window_s: 1\n  cooldown_s: 1\n"
+        );
+        let gateway = TestGateway::with_threshold_routing(&[&model], true).await;
+        let binding = broker.bind(&gateway).await;
+        let mut sampler = ThresholdSampler::default();
+        binding.coordinator.sample(&mut sampler).await.unwrap();
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(1050)).await;
+            binding.coordinator.sample(&mut sampler).await.unwrap();
+        }
+        let route = |clear_binding: bool| {
+            let registry = Arc::clone(&gateway.state.model_registry);
+            let (done_tx, done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let accept = |_: &RemoteFallbackPlan| {
+                    let read =
+                        registry.with_current_generation(&registry.capture_generation(), || ());
+                    if clear_binding {
+                        registry.clear_threshold_binding();
+                    }
+                    read.is_some()
+                };
+                let _ = done_tx.send(
+                    registry
+                        .threshold_remote_route("acme/chat", 1, Some(&accept))
+                        .is_some(),
+                );
+            });
+            // Bound a regression's deadlock so this test cannot hang.
+            done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the callback ran without the registry lock")
+        };
+
+        assert!(route(false), "a callback may read the registry");
+        assert!(
+            !route(true),
+            "a binding that changed while the callback ran is not counted"
+        );
+    }
+
+    #[test]
+    fn remote_routing_policy_survives_snapshots_and_is_scoped_to_bare_model() {
+        let (_dir, registry, mut config) = remote_routing_fixture();
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+            "policy":"fallback", "fallback_profile":"remote"}))
+            .unwrap(),
+        );
+        registry
+            .replace_model_configs_authoritative(vec![config.clone()])
+            .unwrap();
+        let base = registry.get_model_info("acme/hybrid").unwrap();
+        assert_eq!(
+            base.to_model_info_value(false)["routing"],
+            serde_json::json!({
+            "policy":"fallback", "upstream_kind":"sie"})
+        );
+        assert!(matches!(base.served_by(), ServedBy::Local));
+        let explicit = registry.get_model_info("acme/hybrid:local").unwrap();
+        assert!(explicit.info_extras.routing.is_none());
+        assert!(explicit.to_model_info_value(false)["routing"]["policy"].is_null());
+        let remote = registry.get_model_info("acme/hybrid:remote").unwrap();
+        assert!(remote.info_extras.routing.is_none());
+        assert_eq!(
+            remote.to_model_info_value(false)["routing"]["policy"],
+            "remote_only"
+        );
+
+        config.routing.as_mut().unwrap().triggers =
+            Some(vec![crate::types::model::FallbackTrigger::Unhealthy]);
+        registry
+            .replace_model_configs_authoritative(vec![config.clone()])
+            .unwrap();
+        assert!(registry
+            .get_model_info("acme/hybrid")
+            .unwrap()
+            .info_extras
+            .routing
+            .unwrap()
+            .permits(crate::types::model::FallbackTrigger::Unhealthy));
+        config.routing = None;
+        registry
+            .replace_model_configs_authoritative(vec![config])
+            .unwrap();
+        assert!(registry
+            .get_model_info("acme/hybrid")
+            .unwrap()
+            .info_extras
+            .routing
+            .is_none());
+    }
+
+    #[test]
+    fn remote_routing_constructed_invalid_policy_is_not_silently_erased() {
+        let (_dir, registry, mut config) = remote_routing_fixture();
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+            "policy":"fallback", "fallback_profile":"remote"}))
+            .unwrap(),
+        );
+        config.routing.as_mut().unwrap().triggers = Some(vec![]);
+        assert!(registry
+            .replace_model_configs_authoritative(vec![config.clone()])
+            .is_err());
+        assert!(registry.list_models().is_empty());
+        config.routing.as_mut().unwrap().triggers = None;
+        config.profiles.get_mut("default").unwrap().adapter_path =
+            Some("sie_server.adapters.remote.unknown:Adapter".into());
+        assert!(ModelRegistry::model_entry_from_config(&config).is_err());
+        config.profiles.clear();
+        config.profiles.insert(
+            "default".into(),
+            profile(
+                Some("sie_server.adapters.remote.sie:SieUpstreamAdapter"),
+                Some(4096),
+                None,
+            ),
+        );
+        config.routing =
+            Some(serde_json::from_value(serde_json::json!({"policy":"remote_only"})).unwrap());
+        registry.add_model_config(config).unwrap();
+        assert_eq!(
+            registry
+                .get_model_info("acme/hybrid")
+                .unwrap()
+                .to_model_info_value(false)["routing"]["policy"],
+            "remote_only"
+        );
+    }
+
+    #[test]
+    fn remote_routing_invalid_delta_keeps_last_snapshot_and_triggers() {
+        let (_dir, registry, mut config) = remote_routing_fixture();
+        registry.add_model_config(config.clone()).unwrap();
+        for target in ["default", "missing", "local", "bad/name"] {
+            config.routing = Some(
+                serde_json::from_value(serde_json::json!({
+                "policy":"fallback", "fallback_profile":target}))
+                .unwrap(),
+            );
+            assert!(registry.add_model_config(config.clone()).is_err());
+            assert!(registry
+                .replace_model_configs_authoritative(vec![config.clone()])
+                .is_err());
+            assert!(registry
+                .get_model_info("acme/hybrid")
+                .unwrap()
+                .info_extras
+                .routing
+                .is_none());
+        }
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+            "policy":"threshold", "fallback_profile":"remote", "wake_above":2,
+            "sleep_below":1, "window_s":1, "cooldown_s":1}))
+            .unwrap(),
+        );
+        assert!(registry
+            .add_model_config(config.clone())
+            .unwrap_err()
+            .contains("not available"));
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+            "policy":"remote_only"}))
+            .unwrap(),
+        );
+        assert!(registry.add_model_config(config.clone()).is_err());
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+            "policy":"fallback", "fallback_profile":"remote"}))
+            .unwrap(),
+        );
+        registry.add_model_config(config.clone()).unwrap();
+        config.routing = None;
+        registry.add_model_config(config.clone()).unwrap();
+        assert!(registry
+            .get_model_info("acme/hybrid")
+            .unwrap()
+            .info_extras
+            .routing
+            .is_some());
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+            "policy":"fallback", "fallback_profile":"remote", "triggers":["unhealthy"]}))
+            .unwrap(),
+        );
+        assert!(registry
+            .add_model_config(config)
+            .unwrap_err()
+            .contains("append-only"));
+        assert!(!registry
+            .get_model_info("acme/hybrid")
+            .unwrap()
+            .info_extras
+            .routing
+            .unwrap()
+            .permits(crate::types::model::FallbackTrigger::Unhealthy));
+    }
+
+    #[test]
+    fn fallback_plan_requires_bare_model_trigger_and_fresh_remote_contract() {
+        let (_dir, registry, mut config) = remote_routing_fixture();
+        config.tasks = Some(serde_yaml::from_str("generate: {}\n").unwrap());
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+                "policy":"fallback", "fallback_profile":"remote"
+            }))
+            .unwrap(),
+        );
+        registry.add_model_config(config.clone()).unwrap();
+        let plan = registry
+            .remote_fallback_plan("ACME/HYBRID", FallbackTrigger::Provisioning)
+            .unwrap();
+        assert_eq!(plan.model, "acme/hybrid:remote");
+        assert!(!plan.config_hash.is_empty());
+        assert!(matches!(plan.served_by, ServedBy::Remote { .. }));
+        assert!(registry
+            .remote_fallback_plan("acme/hybrid:remote", FallbackTrigger::Provisioning)
+            .is_none());
+        assert!(registry
+            .remote_fallback_plan("acme/hybrid:default", FallbackTrigger::Provisioning)
+            .is_none());
+        assert!(registry
+            .remote_fallback_plan("acme/hybrid", FallbackTrigger::Saturated)
+            .is_none());
+        assert!(registry
+            .remote_fallback_plan("acme/hybrid", FallbackTrigger::Unhealthy)
+            .is_none());
+        config.routing = None;
+        registry
+            .replace_model_configs_authoritative(vec![config])
+            .unwrap();
+        assert!(registry
+            .remote_fallback_plan("acme/hybrid", FallbackTrigger::Provisioning)
+            .is_none());
+    }
+
+    #[test]
+    fn a_numerical_plan_names_its_local_route_and_is_not_yet_admitted() {
+        let (_dir, registry, mut config) = remote_routing_fixture();
+        config.routing = Some(
+            serde_json::from_value(serde_json::json!({
+                "policy":"fallback", "fallback_profile":"remote"
+            }))
+            .unwrap(),
+        );
+        config.tasks = Some(serde_yaml::from_str("encode:\n  dense:\n    dim: 2\n").unwrap());
+        registry.add_model_config(config.clone()).unwrap();
+        let plan = registry
+            .remote_fallback_plan("acme/hybrid", FallbackTrigger::Provisioning)
+            .unwrap();
+        let route = plan
+            .numerical
+            .expect("a numerical model's plan needs admission");
+        assert_eq!(route.model, "acme/hybrid");
+        assert_eq!(route.local_bundles, ["default"]);
+        assert_eq!(
+            route.local_pool, DEFAULT_MODEL_POOL,
+            "a model without a pool is served from the default pool"
+        );
+        assert!(route.admitted.is_none());
+        assert!(registry.has_numerical_bridge("acme/hybrid"));
+        assert!(!registry.has_numerical_bridge("acme/hybrid:remote"));
+
+        for (pool, expected) in [("default", DEFAULT_MODEL_POOL), (" Tenant ", "tenant")] {
+            let mut pooled = config.clone();
+            pooled.pool = Some(pool.to_string());
+            registry
+                .replace_model_configs_authoritative(vec![pooled])
+                .unwrap();
+            let plan = registry
+                .remote_fallback_plan("acme/hybrid", FallbackTrigger::Provisioning)
+                .unwrap();
+            assert_eq!(plan.numerical.unwrap().local_pool, expected, "{pool}");
         }
     }
 
@@ -2831,6 +3554,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/x".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -2944,6 +3668,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/g".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3037,6 +3762,7 @@ mod tests {
             .add_model_config(ModelConfig {
                 name: "org/scoped-only".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3341,6 +4067,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/n".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3392,6 +4119,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/unsafe-global-target".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3415,6 +4143,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/mismatch".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3440,6 +4169,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/mode-mismatch".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3466,6 +4196,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/output-cap-mismatch".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3492,6 +4223,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/kv-budget-mismatch".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3518,6 +4250,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/chained-fallback".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3608,6 +4341,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/g".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3678,6 +4412,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/x".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -3844,6 +4579,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/profile-only".to_string(),
                 hf_revision: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -4264,6 +5000,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/broken".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -4326,6 +5063,7 @@ profiles:
                     let cfg = ModelConfig {
                         name: name.clone(),
                         hf_revision: None,
+                        routing: None,
                         adapter_module: None,
                         default_bundle: None,
                         pool: None,
@@ -4578,6 +5316,7 @@ adapters:
         let config = ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            routing: None,
             adapter_module: None,
             default_bundle: None,
             pool: None,
@@ -4652,6 +5391,7 @@ adapters:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -4710,6 +5450,7 @@ encode:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -4760,6 +5501,7 @@ encode:
             .add_model_config(ModelConfig {
                 name: "test/generator".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -4793,6 +5535,7 @@ encode:
                 .add_model_config(ModelConfig {
                     name: "test/generator".to_string(),
                     hf_revision: None,
+                    routing: None,
                     adapter_module: None,
                     default_bundle: None,
                     pool: None,
@@ -4865,6 +5608,7 @@ adapters:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -4918,6 +5662,7 @@ encode:
             .add_model_config(ModelConfig {
                 name: "test/model".to_string(),
                 hf_revision: None,
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -4942,6 +5687,7 @@ encode:
         ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            routing: None,
             adapter_module: None,
             default_bundle: None,
             pool: None,
@@ -5543,6 +6289,7 @@ adapters:
         let seed = ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            routing: None,
             adapter_module: None,
             default_bundle: None,
             pool: None,
@@ -5605,6 +6352,7 @@ adapters:
         let delta = ModelConfig {
             name: "test/model".to_string(),
             hf_revision: None,
+            routing: None,
             adapter_module: None,
             default_bundle: None,
             pool: None,
@@ -6088,6 +6836,7 @@ profiles:
             .add_model_config(ModelConfig {
                 name: "org/revisioned".to_string(),
                 hf_revision: Some("89abcdef0123456789abcdef0123456789abcdef".to_string()),
+                routing: None,
                 adapter_module: None,
                 default_bundle: None,
                 pool: None,
@@ -6407,6 +7156,7 @@ adapters:
                 let config = ModelConfig {
                     name: format!("race/model-{i}"),
                     hf_revision: None,
+                    routing: None,
                     adapter_module: None,
                     default_bundle: None,
                     pool: None,
@@ -6640,6 +7390,7 @@ profiles:
         ModelConfig {
             name: name.to_string(),
             hf_revision: None,
+            routing: None,
             adapter_module: None,
             default_bundle: None,
             pool: None,

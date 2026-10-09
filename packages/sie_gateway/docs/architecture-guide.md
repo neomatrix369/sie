@@ -62,7 +62,7 @@ Rules enforced on the inference path:
 - On scale-from-zero — i.e. no healthy worker registered for the `(bundle, machine_profile)` tuple and the caller did not pin an explicit pool — the gateway records pending demand for KEDA and returns a retryable `503` provisioning response with `Retry-After: 60`, `X-SIE-Error-Code: PROVISIONING`, and gateway version headers. SIE-native surfaces use the SDK retry envelope (`{"error":{"code","message"}}`); OpenAI-compatible surfaces (`/v1/generate`, `/v1/embeddings`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`) use the OpenAI error envelope, because standard OpenAI clients parse 2xx as successful model output. This applies whether or not the caller set `X-SIE-MACHINE-PROFILE`; default-routing clients get the same contract as profile-pinned clients.
 - On no-consumer conditions for the JetStream publish, the gateway treats the miss as the same pre-execution provisioning state and returns the same retryable `503 PROVISIONING` contract (`Retry-After: 60`, `X-SIE-Error-Code: PROVISIONING`, and surface-specific error envelope). On backpressure conditions the gateway returns `503` with `Retry-After: 5`. Backpressure is evaluated twice: pool-wide against the `WORK_POOL_{pool}` stream's pending count (`SIE_GATEWAY_MAX_STREAM_PENDING`), and per lane (`pool`/`machine_profile`/`bundle`) against a gateway-local in-flight work-item count (`SIE_GATEWAY_MAX_LANE_IN_FLIGHT_ITEMS`). The per-lane decision is always computed and recorded on `sie.gateway.queue.lane_admission.decisions`, but it only sheds when `SIE_GATEWAY_LANE_BACKPRESSURE_ENFORCE` is set; with the flag off (the default) the pool-wide check is the sole gate. Both sheds produce the same `503` contract and both record pending demand for the exact physical lane so KEDA scales it.
 - On queue result timeouts the gateway returns `504` with `X-SIE-Error-Code: GATEWAY_TIMEOUT` and `Retry-After: 5`. This means the gateway accepted and published the work item, but no worker result reached the gateway before `SIE_GATEWAY_REQUEST_TIMEOUT`; it must not be collapsed into worker-emitted `MODEL_LOADING`, which remains a separate retryable `503 MODEL_LOADING` signal.
-- When workers report failure on every item of a batch with the **same retryable error code** in `WorkResult.error_code`, the gateway translates that into a `503` with the SDK-expected envelope (`error.code`, `Retry-After`, `X-SIE-Error-Code`) so the SDK auto-retries. Currently recognised codes: `RESOURCE_EXHAUSTED`, `MODEL_LOADING`, and `LORA_LOADING`. Generation workers attach the operator's validated `oom_recovery.retry_after_s` value to a `RESOURCE_EXHAUSTED` terminal chunk; the gateway accepts only an integer in `1..=60` on that exact error class and otherwise uses the backward-compatible 5-second default. **Mixed batches** (different codes per item) keep going through the compatibility `500 all_items_failed` path with per-item `code` fields exposed in `details[]`, so callers can see exactly which items hit which failure mode. Workers reporting `RESOURCE_EXHAUSTED` are **not** marked unhealthy — losing an allocation race is not a worker-health signal.
+- When workers report failure on every item of a batch with the **same retryable error code** in `WorkResult.error_code`, the gateway translates that into a `503` with the SDK-expected envelope (`error.code`, `Retry-After`, `X-SIE-Error-Code`) so the SDK auto-retries. Currently recognised codes: `RESOURCE_EXHAUSTED`, `MODEL_LOADING`, `LORA_LOADING`, and `QUEUE_FULL` (a worker that cannot serve the item now, such as a remote profile whose upstream is busy, unreachable, rate capped or behind an open circuit breaker; a remote profile whose upstream model is not ready answers `MODEL_LOADING`). A remote worker answers these upstream refusals at once with the upstream's wait rather than redelivering the item. Generation workers attach the operator's validated `oom_recovery.retry_after_s` value to a `RESOURCE_EXHAUSTED` terminal chunk, and a worker may set `WorkResult.retry_after_s` on a failed item; for `RESOURCE_EXHAUSTED`, `QUEUE_FULL` and `MODEL_LOADING` failures, the gateway uses the longest worker hint that qualifies as an integer in `1..=60` seconds, ignoring other hints. If no hint qualifies, or the code is `LORA_LOADING` even when a worker provides a hint, it uses the current five-second default compiled into the gateway. **Mixed batches** (different codes per item) keep going through the compatibility `500 all_items_failed` path with per-item `code` fields exposed in `details[]`, so callers can see exactly which items hit which failure mode. Workers reporting `RESOURCE_EXHAUSTED` are **not** marked unhealthy — losing an allocation race is not a worker-health signal.
 - When **every** failed item carries **`MODEL_LOAD_FAILED`**, the gateway returns **`502 Bad Gateway`** with the SDK-style **`error`** object (`code`, `message`, `error_class`, `attempts`, `permanent`) — matching the terminal model-load contract consumed by SDK retry logic (no `Retry-After`; the SDK must not burn the `MODEL_LOADING` retry budget). The gateway synthesises conservative `attempts` / `permanent` fields on this queue path when the worker payload does not carry registry-shaped failure metadata.
 - Every successful response and every `5xx` of an inference route carries `X-SIE-Served-By` (`local` or `remote`) once routing has resolved the dispatched model, and `X-SIE-Upstream` with the upstream's name when that model's default profile uses a remote adapter (`handlers::serving_disclosure`). The value is read from the dispatched route's configuration, as `sie_server.api.helpers.serving_disclosure_headers` reads it on the single server, so a `model:remote` variant or a remote-backed model reports `remote` and the model's local profile reports `local`. Client errors carry neither header. The compatibility routes (`/v1/embeddings`, `/v1/rerank`, `/v2/rerank`, `/v1/audio/transcriptions`) forward both through `is_openai_compat_forwarded_header`.
 
@@ -421,7 +421,7 @@ The `ConfigNotification` JSON payload carries the following fields, verified aga
 
 The hot path is always **msgpack** (`rmp_serde` on the gateway, `msgpack-python` / `msgpack-numpy` on workers). Specifically:
 
-- `WorkItem` (gateway → worker on JetStream): msgpack. `model_id` is the route the work runs on. When routing dispatched the request to another route of the requested model (a profile variant), `display_model` carries the model id the caller asked for, so logs and accounting downstream can report it; it is omitted otherwise. `WorkDispatcher::publish_work` takes the same `display_model`.
+- `WorkItem` (gateway → worker on JetStream): msgpack. `model_id` is the route the work runs on. When routing dispatched the request to another route of the requested model (a profile variant), `display_model` carries the model id the caller asked for, so logs and accounting downstream can report it; it is omitted otherwise. `WorkDispatcher::publish_work` takes the same `display_model`. A remote attempt that stands in for a local refusal the gateway holds carries `fallback_reason`, the trigger of that refusal (`provisioning`, `model_loading`, `saturated` or `unhealthy`), on every fallback bridge and on a threshold bridge while local capacity wakes. The remote worker answers such an item it cannot serve now with a retryable error instead of redelivering it, so the gateway restores the local refusal at once. Other work, including a low-demand threshold route, omits the field. An admitted numerical remote attempt also carries `numerical_admission_sha256` (see [Numerical bridges](#numerical-bridges)), and the remote worker answers it at once in the same way, even on a threshold route.
 - `WorkResult` (worker → gateway on the inbox subject): msgpack. Numpy arrays use `msgpack-numpy`'s extension-free encoding (maps with a `nd: true` sentinel + `type`, `shape`, `data`). When the gateway advertises `WorkItem.accepts_result_chunks: true`, a result that does not fit one NATS message may instead arrive as named-msgpack `result_chunk_v1` envelopes. This boolean negotiates v1 only; a future envelope version requires a new capability rather than reinterpreting the existing field. The gateway reassembles v1 transfers within the pending request lifetime, with a SHA-256 digest and fixed item/chunk/request/process memory limits, then decodes the reconstructed bytes as the same `WorkResult`. The gateway transcodes to native JSON arrays only when the client's `Accept` header asks for JSON.
 
 JSON (`serde_json`) is used where payloads are low-frequency or human-oriented:
@@ -928,3 +928,160 @@ A pool spec may also carry `pinned_models` (a per-pool set of always-loaded mode
 Creating a usable custom pool has two supported shapes. For a dynamic logical pool over base capacity, call `POST /v1/pools` with the logical name and GPU requirements and omit `queue_pool`; it defaults to `default`, so no additional Helm worker group is required. Pool `name` is user/dynamic. Non-default `queue_pool` is infra/admin: it must name a Helm-rendered `queuePool`/`SIE_POOL` backing lane declared under `queueRouting.staticQueuePools`. For a dedicated physical queue, first add that worker group to Helm values and declare the same name under `queueRouting.staticQueuePools`, then create logical pools with `queue_pool` set to that queue. Lease-owned dynamic pools expire after their TTL unless renewed with `POST /v1/pools/{name}/renew`. The gateway bounds API-created pools independently of auth: a `minimum_worker_count` whose total across the pool's machine profiles, or `gpus` requirements whose sum, exceeds `SIE_GATEWAY_POOL_MAX_MINIMUM_WORKER_COUNT` (default 4) and `ttl_seconds` above `SIE_GATEWAY_POOL_MAX_TTL_S` (default 3600) are rejected with `400 INVALID_REQUEST`, and a create beyond `SIE_GATEWAY_MAX_POOLS` live API-created pools (default 64) is rejected with `403 POOL_OPERATION_FORBIDDEN`. Pools restored from Kubernetes or applied from another replica are held to the same TTL and warm-floor caps when their lease expiry and KEDA warm floor are computed. An API-created pool's active lease keeps at most its `gpus` requirement per machine profile warm, and at most `SIE_GATEWAY_POOL_MAX_MINIMUM_WORKER_COUNT` in total, however many workers it is assigned; a stored pool's per-lane warm floor is capped so its total fits the same budget. The live-pool cap is checked by the replica serving the create against every pool it knows, so concurrent creates on different replicas can briefly exceed it. `POST /v1/pools` refuses the name `default` with `403 POOL_OPERATION_FORBIDDEN`. The `default` pool and static Helm queue pools are operator-owned and exempt. Clients target either shape with an explicit `X-SIE-POOL` header, for example `X-SIE-POOL: customer-acme`, or SDK `gpu="customer-acme/l4"`. The `default` pool is protected and cannot be deleted. Missing named pools intentionally fail closed so capped/dynamic pool isolation is not weakened by a silent fallback.
 
 Model configs registered via the control plane (`sie-config`) may carry a top-level `pool` field. That field is model routing/config assignment: omitted or empty means `default`, and a request that omits `X-SIE-POOL` defaults to the model's assigned pool. It does not create workers, KEDA ScaledObjects, or runtime pool leases. Worker counts, machine profiles, bundles, and autoscaling lanes are still Helm-driven physical capacity; `/v1/pools` and `queueRouting.staticQueuePools` only create or renew runtime admission/capacity state, optionally backed by existing `default` capacity through `PoolSpec.queue_pool`. In the Kubernetes/Helm composition, workers filter materialized model configs by their physical `SIE_POOL`, so a model config for a dedicated queue normally uses the physical queue-pool name; gateway requests may still target a logical pool whose `queue_pool` resolves to that physical name. A default-backed logical pool should not use a non-default model-config `pool` unless a matching dedicated worker queue exists. The managed Modal composition has one governed exception: a deployment-owned diagnostic admission queue may reuse the complete `default` catalog in a separate worker app. Dispatch stays on that physical queue, but bundle-hash and immutable-revision evidence are atomically scoped to the requested model's declared catalog pool. A known catalog model with a missing scoped hash fails closed rather than enabling the empty-hash wildcard; unknown sealed compatibility remains separately bounded.
+
+### Numerical process diagnostics
+
+NATS worker heartbeats may carry `numerical_process_inventory`: an observation
+time in Unix milliseconds and a complete list of adapter children. The gateway
+validates the optional metadata separately from worker health and exposes it in
+cluster status, including workers excluded from direct dispatch by saturation.
+Missing, malformed or oversized metadata clears the previous inventory without
+discarding the heartbeat. The wire budget is 64 KiB and 256 children; unknown
+fields and duplicate positive process IDs are rejected.
+
+A process that holds a model's remote profile also reports that profile's
+`remote_contract_sha256`, the `remote_execution_sha256` of its serving code and,
+for a hybrid `encode` or `score` model, an `admission`: the local execution
+identities its current evidence covers, the model contract, the outputs, the
+expiry and a digest. The gateway checks the digests and identity formats, at most
+eight identities, outputs from `dense`, `sparse`, `multivector` and `score`, and a
+positive expiry, and drops a malformed inventory. The fields are absent when empty.
+A gateway that predates them still accepts inventories from processes without a
+remote profile and drops those that carry one.
+
+Sidecars probe on dedicated IPC connections independently of readiness pings
+and health publication, with a
+five-second timeout and a ten-second observation lifetime. Shutdown tombstones
+omit diagnostics. A snapshot describes the process and model configuration at
+its observation time; it is not an atomic fleet proof, and on its own it grants
+no routing or execution authority.
+
+### Numerical bridges
+
+A bare `encode` or `score` request for a local model with numerical outputs
+(`dense`, `sparse`, `multivector` or `score`) bridges to the model's remote
+profile only under a numerical admission. This covers fallback bridges, the
+threshold route and `/v1/embeddings`, which wraps `encode`. Generation and
+extraction surfaces never bridge such a model. For these models alone, the
+gateway reads and parses the request body after route resolution and before
+any bridge, threshold or load decision. An invalid body gets its `400` before
+threshold demand is counted or load-only work is published. The parse lets the
+gateway refuse a body-level `options.profile` selector, check the request
+against the admission and replay the body remotely. The bridge decision is made
+when the gateway is about to commit to the remote attempt:
+
+- The request sets no instruction and no runtime option other than
+  `is_query`, and every output it asks for (`dense` when an encode names none,
+  `score` for score) is listed in the admission. Otherwise the remote process would refuse it, so the request
+  stays local:
+  - A request for an output that the model declares but the admission does not
+    list stays local with the reason `unmeasured_request`.
+  - A request with an instruction or another runtime option, or one that asks
+    for an output the model does not declare, is not a bridge candidate on a
+    fallback route. The
+    trigger leaves it on its ordinary local path instead of committing to the
+    local refusal, and no decision is recorded. On a `threshold` route it stays
+    local with the reason `unmeasured_request`.
+- An eligible remote worker is fresh and eligible for dispatch, reports
+  `supports_execution_authority_v1`, `supports_numerical_admission_v1` and
+  `supports_numerical_admission_subject_v1` (which builds that predate the
+  admission subject never send), has
+  the remote profile's exact configuration hash, bundle and pool, and has a
+  unique worker name. Every child in its inventory must report the same
+  admission for the bare model, together with the admission's own model
+  contract, expiring at least five seconds after the decision.
+- Every local process that could serve the model must be covered. That means
+  each child of every worker on the model's local bundles and in the model's
+  pool (`default` when it names none, because a worker loads only the models of
+  its own pool), starting and degraded workers included, unless the worker lists
+  the model as unsupported. Each such child must report an identity the
+  admission lists and the admission's model contract. A worker without a
+  complete inventory, a worker past the heartbeat timeout that has not been
+  evicted, or a child without an identity or without the model, closes the
+  bridge. The registry also closes it until it has heard worker health for one
+  heartbeat timeout after the health subscription starts or resumes, or after
+  a silence longer than that timeout, because a worker that has not reported
+  yet looks absent. With no local worker the remote admission decides.
+- The bridge pins one remote worker that both conditions admit. Selection checks
+  again that the worker still reports `supports_numerical_admission_subject_v1` and the
+  admitted digest. Its work items carry that digest as
+  `numerical_admission_sha256` on the worker's `numerical-admission-v1` subject,
+  which only a sidecar with the admission fence consumes, and the publisher
+  refuses the digest on any other subject. The remote process derives its
+  admission again before calling the upstream, and the sidecar answers a refused
+  admitted item at once. A bridged caller then receives its local refusal with
+  `X-SIE-Fallback-Error`. A threshold route holds no local refusal, so it
+  answers `503 INFERENCE_ERROR` with the worker's `Retry-After` hint (1 to 60
+  seconds, else 5).
+
+Anything else keeps the request on its local route. A numerical plan that was
+not admitted cannot select a worker, and a numerical bridge whose pinned worker
+has no admitted digest is refused before publication. Each request's decision
+is counted once, with the decision that applied, on
+`sie.gateway.remote.numerical_admissions` with `admitted` or one of the refusal
+reasons `no_admission`, `local_unobserved`, `uncovered_identity` and
+`unmeasured_request`. Configuration load no longer refuses `threshold` routing
+for numerical models; the admission gates each request instead.
+
+### Remote routes under a model access policy
+
+A deployment that installs a `ModelAccessPolicy` decides the implicit remote
+routes of a bare model, whether a fallback trigger or a `threshold` decision
+would take the route. A request that names the remote profile, directly or
+through an alias, is governed by `visible` and `serving_refusal` like any other
+model, so a caller who can see the remote profile can name it.
+
+- **When the gateway asks.** Only about a route it admits on its own: a bare
+  model whose routing names the remote profile and permits the reason, no
+  caller profile, bundle, pool or engine selector, no `X-SIE-Remote: forbid`,
+  a transport with execution authority v1, and no bridge already active.
+- **The remote profile first.** The gateway requires
+  `ModelAccessPolicy::visible` and `ModelAccessPolicy::serving_refusal` to
+  pass for the remote profile. It asks `serving_refusal` with the request
+  extensions minus the admission-outcome slot. A refusal keeps the local route,
+  and it is neither returned nor recorded.
+- **The question.** `ModelAccessPolicy::remote_route_admitted` receives the
+  canonical model, the remote profile and a `RemoteRouteReason`:
+  `Fallback(trigger)` or `Threshold`.
+- **Once per request.** The gateway decides once per request, remote profile
+  and reason, and reuses that decision.
+- **The answer.** `false`, the default, keeps the local route. The caller
+  receives the answer it would have received without a remote route.
+- **Without a policy.** The gateway's own checks decide.
+- **Governed generation.** A policy that governs generation routes keeps
+  generation local unless its `GenerationRoutePolicy::resolve_remote` names a
+  governed route for the model's remote profile and intent.
+  - The policy is asked once per request, so planning and the bridged
+    dispatch use the same route.
+  - A bridge is planned only when that route names the same model, bundle and
+    pool as the registry's remote plan, and its coordinates are ones the
+    gateway can dispatch on. The check runs before the policy's admission
+    hook and before a threshold request is counted as demand.
+  - The bridged request dispatches on that route, with its machine profile.
+- **Model listing.** `/v1/models` and `/v1/models/{model}` show a bare model
+  to a caller who may not see its remote profile without that profile and with
+  the routing of a model that has no remote route, so the listing does not
+  reveal the profile that `visible` hides.
+
+### Lanes a transport reports cold
+
+A dispatch transport that manages its own capacity can keep worker rows for a
+lane with no ready capacity. `WorkDispatcher::lane_provisioning` reports such a
+lane. It is `false` by default and is a non-publishing hint.
+
+- **When the gateway reads it.** After the route resolves and before any
+  dispatch.
+- **The bridge.** When the hint is `true` and a `provisioning` bridge is
+  admitted:
+  1. The gateway wakes the lane through `publish_model_load` with the lane's
+     pool target, recording pending demand as for any cold lane.
+  2. It waits up to 2 s for the transport to accept the wake.
+  3. It admits the bridge again, and makes the single remote attempt with
+     `fallback_reason: provisioning`.
+  - A wake that is not accepted, or a bridge that is no longer admitted after
+    the wake, leaves the caller with the local `503 PROVISIONING`. A
+    `model_loading` bridge admits its plan again after its load-only wake in the
+    same way.
+- **No bridge.** A request that is not bridged dispatches as before.
+- **A remote attempt refused as `PROVISIONING`** received no answer. It
+  restores the local refusal with `X-SIE-Fallback-Error: QUEUE_FULL`.

@@ -58,8 +58,10 @@ from sie_server.adapters._generation_base import (
     GenerationDrainingError,
     GenerationError,
     GenerationPreflightResult,
+    GenerationUnsupportedFieldError,
     ReasoningFormat,
     ToolCallDelta,
+    UpstreamTokenUsage,
     aclose_with_error_precedence,
     client_safe_generation_error_code,
     client_safe_generation_error_message,
@@ -69,6 +71,8 @@ from sie_server.adapters._generation_base import (
     suppress_thinking_blocks,
     thinking_blocks_must_be_hidden,
 )
+from sie_server.adapters.remote.openai import OpenAIUpstreamAdapter
+from sie_server.adapters.remote.sie import SieUpstreamAdapter
 from sie_server.api.helpers import oom_retry_after_from_registry
 from sie_server.config.model import validate_chat_template_kwargs
 from sie_server.core.grammar_routing import resolve_grammar_serving_model
@@ -82,8 +86,11 @@ from sie_server.core.video_frames import (
 )
 from sie_server.observability import worker_telemetry as _metrics
 from sie_server.observability.lifecycle import current_lifecycle, observe_generation
+from sie_server.processors.generate_params import extract_generate_params
 from sie_server.processors.grammar_cache import GrammarLRU
 from sie_server.processors.grammar_compile import compile_outlines
+from sie_server.processors.hybrid_usage import HybridCount, count_hybrid_usage
+from sie_server.processors.remote_chat import remote_chat_chunks
 from sie_server.processors.strict_grammar import enforce_strict_grammar
 from sie_server.processors.tool_call_grammar import (
     ToolChoiceError,
@@ -801,6 +808,54 @@ class _GenerateRequestParams:
     # Multi-LoRA — served-name of the adapter to apply (passed to SGLang as
     # ``sampling_params.lora_path``). ``None`` → base model.
     lora_adapter: str | None = None
+
+
+def _remote_chat_parameters(params: _GenerateRequestParams) -> dict[str, Any]:
+    """Project validated queue parameters onto the upstream chat contract."""
+    assert isinstance(params.input, _MessagesInput)
+    for field in ("top_k", "repetition_penalty", "min_tokens", "chat_template_kwargs", "lora_adapter"):
+        if getattr(params, field) is not None:
+            raise GenerationUnsupportedFieldError(field, "upstream chat cannot enforce this field")
+    if params.best_of not in (None, 1):
+        raise GenerationUnsupportedFieldError("best_of", "upstream chat does not support best_of")
+    messages: list[dict[str, Any]] = []
+    for message in params.input.messages:
+        if message.images or message.videos:
+            raise GenerationUnsupportedFieldError("messages", "remote chat currently accepts text messages only")
+        item: dict[str, Any] = {"role": message.role, "content": message.content}
+        if message.tool_calls is not None:
+            item["tool_calls"] = list(message.tool_calls)
+        if message.tool_call_id is not None:
+            item["tool_call_id"] = message.tool_call_id
+        messages.append(item)
+    body: dict[str, Any] = {
+        "messages": messages,
+        "max_tokens": params.max_new_tokens,
+        "temperature": params.temperature,
+        "top_p": params.top_p,
+        "n": params.n or 1,
+        "stream": params.stream,
+    }
+    for field in ("stop", "frequency_penalty", "presence_penalty", "seed", "logit_bias", "top_logprobs"):
+        value = getattr(params, field)
+        if value is not None:
+            body[field] = value
+    if params.logprobs:
+        body["logprobs"] = True
+    if params.tools:
+        body["tools"] = list(params.tools)
+        body["parallel_tool_calls"] = params.parallel_tool_calls
+    if params.tool_choice is not None:
+        body["tool_choice"] = params.tool_choice
+    if params.grammar is not None:
+        grammar = params.grammar
+        if grammar.kind != "json_schema":
+            raise GenerationUnsupportedFieldError("grammar", "upstream chat requires a JSON Schema grammar")
+        schema: dict[str, Any] = {"name": grammar.label or "response", "schema": grammar.value}
+        if grammar.strict is not None:
+            schema["strict"] = grammar.strict
+        body["response_format"] = {"type": "json_schema", "json_schema": schema}
+    return body
 
 
 def _adapter_generate_parameters(
@@ -1823,6 +1878,49 @@ class StreamingProcessor:
         tool_choice_mode, _tool_choice_name = normalize_tool_choice(params.tool_choice)
         effective_tools: tuple[dict[str, Any], ...] | None = None if tool_choice_mode == "none" else params.tools
 
+        remote_chat = (
+            isinstance(params.input, _MessagesInput)
+            and isinstance(adapter, (SieUpstreamAdapter, OpenAIUpstreamAdapter))
+            and (
+                (config is not None and config.remote_backed)
+                or params.grammar is not None
+                or tool_choice_mode in ("required", "named")
+                or any(tool.get("function", {}).get("strict") is True for tool in effective_tools or ())
+                or (params.n is not None and params.n > 1)
+                or (isinstance(adapter, OpenAIUpstreamAdapter) and not adapter.supports_raw_completions)
+            )
+        )
+        # A model with local weights that an OpenAI-compatible upstream serves
+        # is counted with its own tokenizer, as if it had run locally.
+        counted_upstream = (
+            isinstance(adapter, OpenAIUpstreamAdapter) and config is not None and not config.remote_backed
+        )
+        local_template = False
+        if (
+            isinstance(params.input, _MessagesInput)
+            and isinstance(adapter, (SieUpstreamAdapter, OpenAIUpstreamAdapter))
+            and (not remote_chat or counted_upstream)
+        ):
+            # An unavailable local template selects declared upstream chat.
+            local_template = await self._has_chat_template(model_id)
+            remote_chat = remote_chat or not local_template
+        remote_body: dict[str, Any] | None = None
+        if remote_chat:
+            try:
+                remote_body = _remote_chat_parameters(params)
+            except GenerationError as exc:
+                await self._terminal_error_then_settle(
+                    reply_subject,
+                    request_id=request_id,
+                    attempt_id=attempt_id,
+                    seq=0,
+                    code=exc.code,
+                    message=str(exc),
+                    param=exc.param,
+                    msg=msg,
+                )
+                return
+
         # Chat-template rendering. For ``Messages`` shape we
         # tokenize-via-template before handing the rendered string to
         # the underlying adapter. ``Prompt`` shape goes straight through.
@@ -1832,7 +1930,31 @@ class StreamingProcessor:
         # shape and for text-only message lists.
         request_images: list[ImageInput] | None = None
         request_videos: list[VideoInput] | None = None
-        if isinstance(params.input, _MessagesInput):
+        if remote_body is not None and counted_upstream and local_template and isinstance(params.input, _MessagesInput):
+            # Rendered only to count the prompt. The upstream owns chat templating.
+            rendered_for_count = await self._render_chat_template(
+                model_id,
+                params.input.messages,
+                effective_tools,
+                request_kwargs=params.chat_template_kwargs,
+            )
+            if isinstance(rendered_for_count, _ValidationError):
+                await self._terminal_error_then_settle(
+                    reply_subject,
+                    request_id=request_id,
+                    attempt_id=attempt_id,
+                    seq=0,
+                    code=rendered_for_count.code,
+                    message=rendered_for_count.message,
+                    msg=msg,
+                )
+                return
+            prompt_str = rendered_for_count
+        elif remote_body is not None:
+            # Used only for the existing admission estimate. The upstream owns
+            # chat templating; remote-backed models have no local tokenizer.
+            prompt_str = json.dumps(remote_body["messages"], ensure_ascii=False)
+        elif isinstance(params.input, _MessagesInput):
             collected = [img for m in params.input.messages for img in (m.images or ())]
             request_images = collected or None
             request_videos = [video for m in params.input.messages for video in (m.videos or ())] or None
@@ -1891,9 +2013,14 @@ class StreamingProcessor:
             prompt_str = rendered
         else:
             prompt_str = params.input.prompt
-        thinking_starts_in_prompt = suppress_thinking and reasoning_starts_in_prompt(
-            prompt_str,
-            reasoning_format,
+        thinking_starts_in_prompt = (
+            not remote_chat
+            and not isinstance(adapter, SieUpstreamAdapter)
+            and suppress_thinking
+            and reasoning_starts_in_prompt(
+                prompt_str,
+                reasoning_format,
+            )
         )
 
         # Cancel may have arrived during chat-template rendering (CPU-bound
@@ -1910,13 +2037,17 @@ class StreamingProcessor:
         # tokenizer (<1ms for typical prompts). Vision requests add a coarse
         # per-image token estimate so placeholder expansion doesn't overflow
         # the context window unaccounted.
-        ctx_error = await self._check_context_length(
-            model_id,
-            prompt_str,
-            params.max_new_tokens,
-            adapter=adapter,
-            num_images=len(request_images) if request_images else 0,
-            num_videos=len(request_videos) if request_videos else 0,
+        ctx_error = (
+            None
+            if remote_chat and not (counted_upstream and local_template)
+            else await self._check_context_length(
+                model_id,
+                prompt_str,
+                params.max_new_tokens,
+                adapter=adapter,
+                num_images=len(request_images) if request_images else 0,
+                num_videos=len(request_videos) if request_videos else 0,
+            )
         )
         if ctx_error is not None:
             await self._terminal_error_then_settle(
@@ -1937,6 +2068,31 @@ class StreamingProcessor:
             )
             return
 
+        hybrid_count: HybridCount | None = None
+        if counted_upstream and (remote_body is None or local_template):
+            assert config is not None
+            assert config.tasks.generate is not None
+            counted = await self._hybrid_count(
+                model_id,
+                prompt_str,
+                adapter=adapter,
+                max_new_tokens=params.max_new_tokens,
+                choices=params.n or 1,
+                context_length=config.tasks.generate.context_length,
+            )
+            if isinstance(counted, _ValidationError):
+                await self._terminal_error_then_settle(
+                    reply_subject,
+                    request_id=request_id,
+                    attempt_id=attempt_id,
+                    seq=0,
+                    code=counted.code,
+                    message=counted.message,
+                    msg=msg,
+                )
+                return
+            hybrid_count = counted
+
         # Resolve the on-wire tool-call format once (config-driven, not a
         # per-block heuristic) and, for an enforced tool_choice
         # ("required" / named function), build a constrained-decoding
@@ -1947,7 +2103,7 @@ class StreamingProcessor:
         # also skips forcing-grammar construction and parser wrapping.
         tool_call_format: ToolCallFormat = self._resolve_tool_call_format(model_id) if effective_tools else "auto"
         forcing_grammar: GrammarSpec | None = None
-        if effective_tools:
+        if effective_tools and not remote_chat:
             try:
                 forcing_grammar = build_tool_choice_grammar(effective_tools, params.tool_choice, tool_call_format)
             except ToolChoiceError as exc:
@@ -1966,7 +2122,7 @@ class StreamingProcessor:
         # passing ``tools=None`` to the chat template; the model literally
         # cannot emit ``<tool_call>`` syntax, so wrapping the parser would
         # be a no-op. Skip it.
-        enable_tool_parser = bool(effective_tools)
+        enable_tool_parser = bool(effective_tools) and not remote_chat
 
         # A forced tool_choice grammar takes precedence over a user
         # response_format grammar; the two are mutually exclusive (the
@@ -2013,8 +2169,21 @@ class StreamingProcessor:
             images=request_images,
             videos=request_videos,
         )
+        generation_chunks: AsyncIterator[GenerationChunk] | None = None
         try:
-            preflight_result = adapter.preflight_generate(generation_parameters, stream=params.stream)
+            if remote_body is not None:
+                assert config is not None
+                assert config.tasks.generate is not None
+                generation_chunks = remote_chat_chunks(
+                    adapter,
+                    remote_body,
+                    requested_model=model_id,
+                    context_length=config.tasks.generate.context_length,
+                    keep_reasoning=hybrid_count is not None,
+                )
+                preflight_result = None
+            else:
+                preflight_result = adapter.preflight_generate(generation_parameters, stream=params.stream)
         except GenerationError as exc:
             await self._terminal_error_then_settle(
                 reply_subject,
@@ -2123,6 +2292,8 @@ class StreamingProcessor:
                 stream=params.stream,
                 generation_parameters=generation_parameters,
                 preflight_result=preflight_result,
+                generation_chunks=generation_chunks,
+                hybrid_count=hybrid_count,
                 cancel_event=cancel_event,
             )
         finally:
@@ -2166,6 +2337,8 @@ class StreamingProcessor:
         stream: bool = False,
         generation_parameters: Mapping[str, Any],
         preflight_result: GenerationPreflightResult | None = None,
+        generation_chunks: AsyncIterator[GenerationChunk] | None = None,
+        hybrid_count: HybridCount | None = None,
         cancel_event: asyncio.Event,
     ) -> None:
         # ``adapter.generate`` is typed as returning ``AsyncIterator`` on
@@ -2192,7 +2365,13 @@ class StreamingProcessor:
                 grammar="none" if grammar is None else grammar.kind,
                 duration_s=time.perf_counter() - received_at,
             )
-        chunks_iter: AsyncIterator[GenerationChunk] = adapter.generate_with_preflight(gen_kwargs, preflight_result)
+        chunks_iter: AsyncIterator[GenerationChunk] = (
+            generation_chunks
+            if generation_chunks is not None
+            else adapter.generate_with_preflight(gen_kwargs, preflight_result)
+        )
+        if hybrid_count is not None:
+            chunks_iter = count_hybrid_usage(chunks_iter, hybrid_count)
         if suppress_thinking:
             chunks_iter = suppress_thinking_blocks(
                 chunks_iter,
@@ -2213,6 +2392,7 @@ class StreamingProcessor:
                 chunks_iter,
                 tool_call_format=tool_call_format,
                 parallel_tool_calls=parallel_tool_calls,
+                tools=tools,
             )
         chunks_iter = enforce_strict_grammar(chunks_iter, grammar)
 
@@ -2537,6 +2717,7 @@ class StreamingProcessor:
                         prompt_tokens=chunk.prompt_tokens,
                         completion_tokens=chunk.completion_tokens,
                         cached_tokens=chunk.cached_tokens,
+                        upstream_usage=chunk.upstream_usage,
                         images=image_count if not terminal_has_error and chunk.finish_reason != "cancelled" else None,
                         ttft_ms=_compute_ttft_ms(publish_at, first_text_at),
                         error_code=(chunk.error_code or "inference_error") if terminal_has_error else None,
@@ -2869,13 +3050,7 @@ class StreamingProcessor:
 
     @staticmethod
     def _extract_generate_params(wi: WorkItem) -> dict[str, Any] | None:
-        params = wi.get("generate")  # type: ignore[call-overload]
-        if isinstance(params, dict):
-            return params
-        options = wi.get("options")
-        if isinstance(options, dict) and ("prompt" in options or "messages" in options):
-            return options
-        return None
+        return extract_generate_params(wi)
 
     @classmethod
     def _validate_generate_params(
@@ -3729,6 +3904,64 @@ class StreamingProcessor:
             )
         return None
 
+    async def _has_chat_template(self, model_id: str) -> bool:
+        """Whether the model's tokenizer loads and carries a chat template."""
+        try:
+            tokenizer = await self._get_tokenizer(model_id)
+        except Exception:  # noqa: BLE001 - an unavailable tokenizer has no template
+            return False
+        return bool(getattr(tokenizer, "chat_template", None))
+
+    async def _hybrid_count(
+        self,
+        model_id: str,
+        prompt: str,
+        *,
+        adapter: GenerationAdapter,
+        max_new_tokens: int,
+        choices: int,
+        context_length: int,
+    ) -> HybridCount | _ValidationError | None:
+        """Count ``prompt`` with the model's tokenizer for an upstream generation.
+
+        The prompt is counted under the same special-token policy as the
+        context-length guard. ``None`` when the tokenizer does not load: the
+        generation then reports the upstream's own counts, as a model without
+        local weights does. A prompt the tokenizer cannot count is refused.
+        """
+        if len(prompt) > _MAX_PROMPT_CHARS:
+            return _ValidationError(
+                code="context_exceeded",
+                message=f"prompt exceeds context_length ({context_length}) for model '{model_id}'",
+            )
+        try:
+            tok = await self._get_tokenizer(model_id)
+        except Exception:  # noqa: BLE001 - no local tokenizer leaves the upstream's counts
+            logger.warning("No local tokenizer to count %s; reporting the upstream's counts", model_id, exc_info=True)
+            return None
+        loop = asyncio.get_running_loop()
+        try:
+            prompt_tokens = await loop.run_in_executor(
+                _GRAMMAR_EXECUTOR,
+                lambda: len(tok.encode(prompt, add_special_tokens=adapter.prompt_tokenization_add_special_tokens)),
+            )
+        except Exception:  # noqa: BLE001 - an uncountable prompt is refused, never estimated
+            logger.warning("Prompt count failed for %s", model_id, exc_info=True)
+            return _ValidationError(code="invalid_request", message=_INTERNAL_CHAT_TEMPLATE_MESSAGE)
+
+        async def count_tokens(text: str) -> int:
+            if not text:
+                return 0
+            return await loop.run_in_executor(
+                _GRAMMAR_EXECUTOR, lambda: len(tok.encode(text, add_special_tokens=False))
+            )
+
+        return HybridCount(
+            prompt_tokens=prompt_tokens,
+            completion_limit=max(0, min(max_new_tokens, context_length - prompt_tokens)) * choices,
+            count_tokens=count_tokens,
+        )
+
     async def _ensure_grammar_ready(
         self,
         grammar: GrammarSpec,
@@ -4269,10 +4502,12 @@ def _compute_ttft_ms(publish_at: float, first_text_at: float | None) -> float | 
 
 
 def _generation_error_retry_after_s(error: GenerationError, registry: Any) -> int | None:
-    """Return the configured hint only for a true OOM-capacity refusal."""
-    if isinstance(error, GenerationDrainingError):
-        return None
+    """Return the backend's own wait or the configured OOM hint, for a capacity refusal only."""
     if isinstance(error, GenerationCapacityError):
+        if error.retry_after_s is not None:
+            return error.retry_after_s
+        if isinstance(error, GenerationDrainingError):
+            return None
         return oom_retry_after_from_registry(registry)
     return None
 
@@ -4290,6 +4525,7 @@ def _encode_chunk(
     prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
     cached_tokens: int | None = None,
+    upstream_usage: UpstreamTokenUsage | None = None,
     images: int | None = None,
     ttft_ms: float | None = None,
     error_code: str | None = None,
@@ -4333,6 +4569,14 @@ def _encode_chunk(
             usage["prompt_tokens_details"] = {
                 "cached_tokens": min(int(cached_tokens), int(prompt_tokens or 0)),
             }
+        if upstream_usage is not None:
+            upstream: dict[str, int] = {
+                "prompt_tokens": int(upstream_usage.prompt_tokens),
+                "completion_tokens": int(upstream_usage.completion_tokens),
+            }
+            if upstream_usage.cached_tokens is not None:
+                upstream["cached_tokens"] = min(int(upstream_usage.cached_tokens), int(upstream_usage.prompt_tokens))
+            usage["upstream_usage"] = upstream
         if images is not None:
             usage["images"] = images
         payload["usage"] = usage

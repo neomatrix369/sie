@@ -416,6 +416,7 @@ mod tests {
             options: None,
             profile_id: None,
             bundle_config_hash: None,
+            numerical_admission_sha256: None,
             payload_fetch_ms: 0.0,
             prepared_tokens: prepared,
         }
@@ -437,6 +438,8 @@ mod tests {
             instruction: None,
             options: None,
             profile_id: None,
+            bundle_config_hash: None,
+            numerical_admission_sha256: None,
             payload_fetch_ms: 0.0,
             prepared_tokens,
         }
@@ -719,6 +722,8 @@ mod tests {
             tracestate: None,
             timestamp: 0.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         }
     }
 

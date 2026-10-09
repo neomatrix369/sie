@@ -33,6 +33,7 @@ impl NatsHealthManager {
         client: &async_nats::Client,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sub = subscribe_health(client).await?;
+        self.registry.health_subscription_started();
         info!(subject = HEALTH_SUBJECT, "subscribed to NATS health");
 
         let registry = Arc::clone(&self.registry);
@@ -130,6 +131,7 @@ async fn run_subscription_supervised(
             Some(sub) => sub,
             None => match subscribe_health(&client).await {
                 Ok(sub) => {
+                    registry.health_subscription_started();
                     info!(subject = HEALTH_SUBJECT, "resubscribed to NATS health");
                     sub
                 }
@@ -296,6 +298,9 @@ mod tests {
 
     fn status(ready: bool) -> WorkerStatusMessage {
         WorkerStatusMessage {
+            supports_execution_authority_v1: false,
+            supports_numerical_admission_v1: false,
+            supports_numerical_admission_subject_v1: false,
             name: "worker-1".into(),
             ready,
             gpu_count: 1,
@@ -315,6 +320,7 @@ mod tests {
             memory_total_bytes: None,
             saturated: false,
             terminated: false,
+            numerical_process_inventory: None,
             unsupported_models: Vec::new(),
         }
     }

@@ -334,6 +334,8 @@ fn work_item(request_id: &str, idx: u32, total: u32, op: &str, admission_pool: &
         tracestate: None,
         timestamp: 0.0,
         deadline: None,
+        fallback_reason: None,
+        numerical_admission_sha256: None,
     }
 }
 

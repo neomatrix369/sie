@@ -4476,12 +4476,12 @@ dev = [
 
 [[package]]
 name = "sie-audio-prep"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "packages/sie_audio_prep" }
 
 [[package]]
 name = "sie-chroma"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_chroma" }
 dependencies = [
     { name = "chromadb" },
@@ -4504,7 +4504,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-config"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "packages/sie_config" }
 dependencies = [
     { name = "fastapi" },
@@ -4563,7 +4563,7 @@ dev = [
 
 [[package]]
 name = "sie-crewai"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_crewai" }
 dependencies = [
     { name = "crewai" },
@@ -4588,7 +4588,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-dspy"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_dspy" }
 dependencies = [
     { name = "dspy" },
@@ -4613,7 +4613,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-haystack"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_haystack" }
 dependencies = [
     { name = "haystack-ai" },
@@ -4640,7 +4640,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-lancedb"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_lancedb" }
 dependencies = [
     { name = "lancedb" },
@@ -4667,7 +4667,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-langchain"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_langchain" }
 dependencies = [
     { name = "langchain-core" },
@@ -4694,7 +4694,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-llamaindex"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_llamaindex" }
 dependencies = [
     { name = "llama-index-core" },
@@ -4721,7 +4721,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-mcp"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "packages/sie_mcp" }
 dependencies = [
     { name = "jsonschema" },
@@ -4760,7 +4760,7 @@ dev = [
 
 [[package]]
 name = "sie-qdrant"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_qdrant" }
 dependencies = [
     { name = "qdrant-client" },
@@ -4783,7 +4783,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-sdk"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "packages/sie_sdk" }
 dependencies = [
     { name = "aiohttp" },
@@ -4840,7 +4840,7 @@ requires-dist = [
 
 [[package]]
 name = "sie-server"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "packages/sie_server" }
 dependencies = [
     { name = "blake3" },
@@ -4853,6 +4853,7 @@ dependencies = [
     { name = "gliner" },
     { name = "gliner2" },
     { name = "glirel" },
+    { name = "httpcore" },
     { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "jsonschema" },
@@ -4882,6 +4883,7 @@ dependencies = [
     { name = "safetensors" },
     { name = "sentence-transformers" },
     { name = "sie-sdk", extra = ["storage"] },
+    { name = "threadpoolctl" },
     { name = "timm" },
     { name = "tokenizers" },
     { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
@@ -4926,6 +4928,7 @@ requires-dist = [
     { name = "gliner", specifier = ">=0.2.26,<1" },
     { name = "gliner2", specifier = ">=1.3.1,<2" },
     { name = "glirel", specifier = ">=1.0,<2" },
+    { name = "httpcore", specifier = ">=1.0.7,<2" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=0.26,<2" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
@@ -4957,6 +4960,7 @@ requires-dist = [
     { name = "sentence-transformers", specifier = ">=5.0,<6" },
     { name = "sie-sdk", extras = ["storage"], editable = "packages/sie_sdk" },
     { name = "textual", marker = "extra == 'top'", specifier = ">=3.0,<4" },
+    { name = "threadpoolctl", specifier = ">=3.6.0" },
     { name = "timm", specifier = ">=0.9.0,<1.0" },
     { name = "tokenizers", specifier = ">=0.20,<1" },
     { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.9,<2.10" },
@@ -4977,7 +4981,7 @@ dev = []
 
 [[package]]
 name = "sie-weaviate"
-version = "0.9.0"
+version = "0.10.0"
 source = { editable = "integrations/sie_weaviate" }
 dependencies = [
     { name = "sie-sdk" },

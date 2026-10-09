@@ -33,6 +33,11 @@ def _validated_encode_output_types(value: object) -> list[str]:
     return validated_output_types
 
 
+# Response types a postprocessor builds from multivectors, by option key: the
+# adapter emits multivectors and the postprocessor adds the response type.
+_MULTIVECTOR_POSTPROCESSED_OUTPUTS = {"muvera": "dense", "smve": "sparse"}
+
+
 def resolve_encode_output_types(
     config: ModelConfig,
     request_output_types: list[str] | None,
@@ -43,7 +48,8 @@ def resolve_encode_output_types(
 
     Profiles may expose a postprocessed output that the adapter does not emit
     directly. MuVERA is the canonical example: the public response is dense,
-    while the adapter must first produce multivectors. Keeping capability
+    while the adapter must first produce multivectors. SMVE does the same for a
+    sparse response. Keeping capability
     validation and that translation here prevents the HTTP and managed queue
     paths from drifting apart.
 
@@ -74,10 +80,13 @@ def resolve_encode_output_types(
         raise InvalidInputError(msg)
 
     adapter_output_types = list(response_output_types)
-    if effective_options.get("muvera") is not None and "dense" in response_output_types:
-        adapter_output_types = [output_type for output_type in response_output_types if output_type != "dense"]
-        if "multivector" not in adapter_output_types:
-            adapter_output_types.append("multivector")
+    for option_key, postprocessed_type in _MULTIVECTOR_POSTPROCESSED_OUTPUTS.items():
+        if effective_options.get(option_key) is not None and postprocessed_type in adapter_output_types:
+            adapter_output_types = [
+                output_type for output_type in adapter_output_types if output_type != postprocessed_type
+            ]
+            if "multivector" not in adapter_output_types:
+                adapter_output_types.append("multivector")
 
     return adapter_output_types, response_output_types
 
@@ -88,11 +97,11 @@ def _validated_counts(value: Any, expected_len: int, *, non_negative: bool = Fal
     The single gate every metering basis passes through, so the contract lives
     in one place as §7 dimensions are added. A value that is not a list, is
     misaligned with the batch, or holds anything but real ints (``bool`` is an
-    ``int`` subclass and is rejected) yields ``None`` — the meter then falls
-    back to its reserve estimate rather than mis-attributing or approximating a
-    count. ``non_negative`` additionally rejects negatives; every §7 dimension
-    passes it, because a negative unit count is meaningless in all of them and
-    ``api/encode.py`` sums these straight into the reported usage.
+    ``int`` subclass and is rejected) yields ``None`` — the count is then absent
+    rather than mis-attributed or approximated. ``non_negative`` additionally
+    rejects negatives; every §7 dimension passes it, because a negative unit
+    count is meaningless in all of them and ``api/encode.py`` sums these
+    straight into the reported usage.
     """
     if not isinstance(value, list) or len(value) != expected_len:
         return None
@@ -247,7 +256,7 @@ class EncodePipeline:
         # there) expose real per-item counts via ``EncodeOutput.extra``.
         # The preprocessor-recorded counts (authoritative too) win when both
         # exist; malformed/misaligned values are dropped rather than
-        # mis-attributed — metering falls back to its reserve estimate.
+        # mis-attributed, and the counts stay absent.
         if timing.input_token_counts is None:
             timing.input_token_counts = _validated_counts(
                 encode_output.extra.get("input_token_counts"), len(items), non_negative=True
@@ -272,8 +281,8 @@ class EncodePipeline:
         # adapter's own tokenizer (the §P3.5 ground-truth basis). This is a
         # pure fallback: it never runs when the preprocessor or ``extra``
         # already recorded counts, so bge-m3(-flash) keep their exact values.
-        # ``None`` (server-backed / image adapters) leaves the meter on its
-        # reserve estimate rather than billing an approximation.
+        # ``None`` (server-backed / image adapters) leaves the counts absent
+        # rather than approximated.
         if timing.input_token_counts is None:
             try:
                 adapter = registry.get(model)

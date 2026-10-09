@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+import numpy as np
 import torch
 from torch.nn import functional
 
@@ -12,8 +14,14 @@ from sie_server.adapters._flash_base import FlashBaseAdapter
 from sie_server.adapters._flash_pack import build_position_ids, mean_pool_packed
 from sie_server.adapters._spec import AdapterSpec
 from sie_server.adapters._types import ERR_NOT_LOADED, ComputePrecision, PoolingStrategy
-from sie_server.adapters._utils import apply_rotary_pos_emb, extract_texts, validate_output_types
+from sie_server.adapters._utils import (
+    apply_rotary_pos_emb,
+    extract_texts,
+    resolve_query_instruction,
+    validate_output_types,
+)
 from sie_server.adapters.peft_lora_mixin import PEFTLoRAMixin
+from sie_server.adapters.qwen2_flash import _fused_layers
 from sie_server.core.inference_output import EncodeOutput
 from sie_server.types.inputs import Item
 
@@ -56,6 +64,7 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         uses_legacy_transformers_cache: bool = False,
         dense_projection_path: str | None = None,
         causal: bool = False,
+        fused_kernels: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the adapter.
@@ -79,6 +88,11 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             causal: If True, use causal (autoregressive) attention instead of
                 bidirectional. Required for decoder-based embedding models like
                 Qwen3-Embedding that use last-token pooling with causal masking.
+            fused_kernels: If True, run each layer's residual add + RMSNorm,
+                q/k RMSNorm, rotary embedding and SiLU-gated MLP product as
+                single Triton kernels (``_fused_ops``) instead of chains of
+                elementwise PyTorch ops. The kernels round where the eager ops
+                round, so embeddings match the eager path.
         """
         _ = kwargs
         self._model_name_or_path = str(model_name_or_path)
@@ -90,6 +104,7 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         self._query_template = query_template
         self._doc_template = doc_template
         self._causal = causal
+        self._fused_kernels = fused_kernels
         self._uses_legacy_transformers_cache = uses_legacy_transformers_cache
         self._dense_projection_path = dense_projection_path
 
@@ -162,6 +177,14 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         self._model.to(device)
         self._model.eval()
+
+        if self._fused_kernels and not _fused_layers.supported(self._model):
+            logger.warning(
+                "fused_kernels needs Triton and Qwen2/Qwen3 layers with a SiLU-gated MLP; "
+                "%s runs the eager layers instead",
+                self._model_name_or_path,
+            )
+            self._fused_kernels = False
 
         self._dense_dim = self._model.config.hidden_size
 
@@ -250,7 +273,8 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         Args:
             items: List of items to encode.
             output_types: Which outputs to compute (only "dense" supported).
-            instruction: Optional instruction prefix.
+            instruction: Optional instruction prefix. For queries, ``None``
+                falls back to the ``default_instruction`` runtime option.
             is_query: Whether items are queries (affects template selection).
             prepared_items: Not used by this adapter.
 
@@ -272,39 +296,36 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
 
         texts = extract_texts(
             items,
-            instruction,
+            resolve_query_instruction(instruction, opts, is_query=is_query),
             is_query=is_query,
             query_template=query_template,
             doc_template=doc_template,
             err_msg="Qwen2FlashAdapter requires text input",
         )
 
-        # Tokenize each sequence individually (no padding)
-        encodings = [
-            self._tokenizer(
-                text,
-                max_length=self._max_seq_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            for text in texts
-        ]
+        # Tokenize every sequence (no padding) in one batched call: the fast
+        # tokenizer encodes the texts in parallel and returns, per text, exactly
+        # the ids a call on that text alone returns.
+        token_ids = self._tokenizer(
+            texts,
+            max_length=self._max_seq_length,
+            truncation=True,
+            return_attention_mask=False,
+        )["input_ids"]
 
         # Build packed representation
-        seq_lengths = [enc["input_ids"].shape[1] for enc in encodings]
+        seq_lengths = [len(ids) for ids in token_ids]
         total_tokens = sum(seq_lengths)
         max_seqlen = max(seq_lengths)
 
-        # Pack input_ids
-        input_ids_packed = torch.cat([enc["input_ids"].squeeze(0) for enc in encodings]).to(self._device)
-
-        # Build cu_seqlens using cumsum (no Python loop, no GPU sync points)
-        cu_seqlens = torch.zeros(len(texts) + 1, dtype=torch.int32, device=self._device)
-        cu_seqlens[1:] = torch.cumsum(torch.tensor(seq_lengths, dtype=torch.int32, device=self._device), dim=0)
+        # Pack input_ids and cu_seqlens on the host: one copy each, no GPU sync points
+        flat_ids = np.fromiter(itertools.chain.from_iterable(token_ids), dtype=np.int64, count=total_tokens)
+        input_ids_packed = torch.from_numpy(flat_ids).to(self._device)
+        cu_seqlens = torch.from_numpy(np.concatenate(([0], np.cumsum(seq_lengths))).astype(np.int32)).to(self._device)
 
         with torch.inference_mode():
-            # Build position IDs for RoPE
-            position_ids_packed = self._build_position_ids(cu_seqlens, len(texts))
+            # Build position IDs for RoPE (the host-known total avoids a device sync)
+            position_ids_packed = self._build_position_ids(cu_seqlens, len(texts), total_tokens=total_tokens)
 
             # Get word embeddings (Qwen2 has no position embeddings - uses RoPE)
             hidden = self._model.embed_tokens(input_ids_packed)
@@ -343,9 +364,11 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         output.extra["input_token_counts"] = [int(n) for n in seq_lengths]
         return output
 
-    def _build_position_ids(self, cu_seqlens: torch.Tensor, num_seqs: int) -> torch.Tensor:
+    def _build_position_ids(
+        self, cu_seqlens: torch.Tensor, num_seqs: int, *, total_tokens: int | None = None
+    ) -> torch.Tensor:
         """Build position IDs for packed sequences (each restarts at 0)."""
-        return build_position_ids(cu_seqlens)
+        return build_position_ids(cu_seqlens, total_tokens=total_tokens)
 
     def _compute_rope(
         self,
@@ -409,6 +432,9 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
         - GQA (grouped query attention with fewer KV heads)
         - Separate Q/K/V projections
         """
+        if self._fused_kernels:
+            return self._run_transformer_fused(hidden, cu_seqlens, max_seqlen, total_tokens, position_ids)
+
         from flash_attn import flash_attn_varlen_func
 
         num_heads = self._model.config.num_attention_heads
@@ -479,6 +505,23 @@ class Qwen2FlashAdapter(PEFTLoRAMixin, FlashBaseAdapter):
             hidden = hidden + mlp_out
 
         return hidden
+
+    def _run_transformer_fused(
+        self,
+        hidden: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        total_tokens: int,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """The layers of ``_run_transformer_flash`` with the elementwise work in fused kernels (``_fused_layers``)."""
+        rotary_emb = (
+            self._model.rotary_emb if hasattr(self._model, "rotary_emb") else self._model.layers[0].self_attn.rotary_emb
+        )
+        cos, sin = self._compute_rope(rotary_emb, position_ids, max_seqlen)
+        return _fused_layers.run_layers(
+            self._model, hidden, cu_seqlens, max_seqlen, total_tokens, cos, sin, causal=self._causal
+        )
 
     def _pool_embeddings(
         self,

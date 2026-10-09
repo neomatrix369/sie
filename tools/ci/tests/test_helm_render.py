@@ -1509,9 +1509,21 @@ def test_only_the_remote_lane_worker_receives_upstreams_and_credentials(tmp_path
         doc for doc in docs if doc["kind"] == "StatefulSet" and doc["metadata"]["name"] == REMOTE_WORKER[1]
     ]
     (worker,) = [c for c in remote_lane["spec"]["template"]["spec"]["containers"] if c["name"] == "worker"]
-    assert worker["image"].endswith("-cpu-default")
+    assert worker["image"].endswith("-cpu-transformers5")
     assert "--bundle=remote" in worker["args"]
     assert "nvidia.com/gpu" not in worker["resources"]["limits"]
+
+
+def test_the_remote_lane_image_provides_every_remote_bundle_dependency() -> None:
+    values = yaml.safe_load((ROOT / helm.CHART_DIR / "values.yaml").read_text(encoding="utf-8"))
+    image_bundle = values["workers"]["pools"]["remote"]["bundles"]["remote"]["imageBundle"]
+    bundles = ROOT / "packages/sie_server/bundles"
+    remote = yaml.safe_load((bundles / "remote.yaml").read_text(encoding="utf-8"))
+    image = yaml.safe_load((bundles / f"{image_bundle}.yaml").read_text(encoding="utf-8"))
+
+    assert image_bundle == "transformers5"
+    assert remote["deps"]
+    assert remote["deps"].items() <= (image.get("deps") or {}).items()
 
 
 def test_every_lane_names_a_bundle_the_server_ships(tmp_path: Path) -> None:
@@ -1555,7 +1567,9 @@ def bound_rules(docs: list[dict], service_account: str) -> list[dict]:
 def test_no_role_of_the_gateway_reaches_secrets_and_the_remote_lane_has_none(tmp_path: Path) -> None:
     docs = rendered_documents(tmp_path, remote_pool_values())
     (gateway,) = [
-        doc for doc in docs if doc["kind"] == "Deployment" and doc["metadata"]["name"] == GATEWAY.split("/")[0]
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment" and doc["metadata"]["name"] == GATEWAY.split("/", maxsplit=1)[0]
     ]
     gateway_account = gateway["spec"]["template"]["spec"]["serviceAccountName"]
 
@@ -1575,7 +1589,9 @@ def test_the_remote_lane_runs_as_its_own_account_without_identity_or_hugging_fac
 
     lanes = lane_pod_specs(docs)
     (gateway,) = [
-        doc for doc in docs if doc["kind"] == "Deployment" and doc["metadata"]["name"] == GATEWAY.split("/")[0]
+        doc
+        for doc in docs
+        if doc["kind"] == "Deployment" and doc["metadata"]["name"] == GATEWAY.split("/", maxsplit=1)[0]
     ]
     assert lanes[REMOTE_WORKER[1]]["serviceAccountName"] == REMOTE_SERVICE_ACCOUNT
     assert lanes[REMOTE_WORKER[1]]["automountServiceAccountToken"] is False
@@ -1698,6 +1714,126 @@ def test_changing_an_upstream_restarts_the_remote_lane(tmp_path: Path) -> None:
     assert checksum(before) != checksum(after)
 
 
+EVIDENCE_CONFIG_MAP = "remote-equivalence-evidence"
+
+
+def evidence_values(record_file: str = "/etc/sie/equivalence/local-model.json", **remote: object) -> dict:
+    values = remote_pool_values(l4={"enabled": True})
+    values["upstreams"]["open-host"]["equivalence"]["record_files"] = {"local/model": record_file}
+    values["workers"]["remote"] = {"equivalence": {"configMap": EVIDENCE_CONFIG_MAP}, **remote}
+    return values
+
+
+def evidence_mounts(docs: list[dict]) -> dict[tuple[str, str, str], dict]:
+    mounts = {}
+    for doc, spec in pod_specs(docs):
+        volumes = {
+            volume["name"]
+            for volume in spec.get("volumes", [])
+            if volume.get("configMap", {}).get("name") == EVIDENCE_CONFIG_MAP
+        }
+        for container in [*spec.get("initContainers", []), *spec["containers"]]:
+            for mount in container.get("volumeMounts", []):
+                if mount["name"] in volumes:
+                    mounts[(doc["kind"], doc["metadata"]["name"], container["name"])] = mount
+    return mounts
+
+
+def test_only_the_remote_lane_worker_mounts_equivalence_evidence(tmp_path: Path) -> None:
+    docs = rendered_documents(tmp_path, evidence_values())
+
+    assert evidence_mounts(docs) == {
+        REMOTE_WORKER: {"name": "equivalence", "mountPath": "/etc/sie/equivalence", "readOnly": True}
+    }
+    (secret,) = [doc for doc in docs if doc["kind"] == "Secret" and doc["metadata"]["name"] == UPSTREAMS_SECRET]
+    rendered = yaml.safe_load(secret["stringData"]["upstreams.yaml"])
+    assert rendered["upstreams"]["open-host"]["equivalence"]["record_files"] == {
+        "local/model": "/etc/sie/equivalence/local-model.json"
+    }
+
+
+def test_a_remote_lane_without_remote_serving_mounts_no_evidence(tmp_path: Path) -> None:
+    assert evidence_mounts(rendered_documents(tmp_path, evidence_values(serving=False))) == {}
+
+
+def test_the_evidence_config_map_reaches_the_pod_template_only_as_its_volume(tmp_path: Path) -> None:
+    def template(values: dict) -> dict:
+        (statefulset,) = [
+            doc
+            for doc in rendered_documents(tmp_path, values)
+            if doc["kind"] == "StatefulSet" and doc["metadata"]["name"] == REMOTE_WORKER[1]
+        ]
+        return statefulset["spec"]["template"]
+
+    renamed = evidence_values()
+    renamed["workers"]["remote"]["equivalence"]["configMap"] = "other-evidence"
+    template_after = template(renamed)
+    for volume in template_after["spec"]["volumes"]:
+        if volume.get("configMap", {}).get("name") == "other-evidence":
+            volume["configMap"]["name"] = EVIDENCE_CONFIG_MAP
+
+    assert template(evidence_values()) == template_after
+
+
+@pytest.mark.parametrize(
+    "record_file",
+    [
+        "/proofs/local-model.json",
+        "/etc/sie/equivalence/",
+        "/etc/sie/equivalence/..",
+        "/etc/sie/equivalence/nested/local-model.json",
+        "/etc/sie/equivalence-other/local-model.json",
+    ],
+)
+def test_mounted_evidence_requires_each_record_file_to_be_one_of_its_keys(tmp_path: Path, record_file: str) -> None:
+    error = render_error(tmp_path, evidence_values(record_file))
+
+    assert "record files must be keys of workers.remote.equivalence.configMap" in error
+    assert "/proofs/" not in error
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"configMap": "Upper"},
+        {"configMap": "-leading"},
+        {"configMap": "has_underscore"},
+        {"configMap": "proofs..remote"},
+        {"configMap": "proofs.-remote"},
+        {"configMap": "proofs-.remote"},
+        {"configMap": "proofs."},
+        {"configMap": "a" * 254},
+        {"configMap": 5},
+        {"configMap": "evidence", "secret": "evidence"},
+        "evidence",
+    ],
+)
+def test_the_evidence_setting_names_one_valid_config_map(tmp_path: Path, evidence: object) -> None:
+    values = evidence_values()
+    values["workers"]["remote"]["equivalence"] = evidence
+
+    assert "workers.remote.equivalence" in render_error(tmp_path, values)
+
+
+@pytest.mark.parametrize("name", ["evidence", "remote.equivalence-evidence", "a" * 63 + "." + "b" * 63])
+def test_dotted_config_map_names_are_accepted(tmp_path: Path, name: str) -> None:
+    values = evidence_values()
+    values["workers"]["remote"]["equivalence"]["configMap"] = name
+    docs = rendered_documents(tmp_path, values)
+
+    (statefulset,) = [
+        doc for doc in docs if doc["kind"] == "StatefulSet" and doc["metadata"]["name"] == REMOTE_WORKER[1]
+    ]
+    volumes = {volume["name"]: volume for volume in statefulset["spec"]["template"]["spec"]["volumes"]}
+    assert volumes["equivalence"]["configMap"]["name"] == name
+
+
+def test_without_mounted_evidence_record_paths_are_only_checked_for_shape(tmp_path: Path) -> None:
+    docs = rendered_documents(tmp_path, remote_pool_values())
+
+    assert evidence_mounts(docs) == {}
+
+
 def upstream(**overrides: object) -> dict:
     definition: dict = {
         "kind": "sie",
@@ -1797,7 +1933,7 @@ def test_the_mcp_ingress_certificate_cannot_be_sent_upstream(tmp_path: Path) -> 
         ),
         (
             remote_lane(bundles={"remote": {"imageBundle": "remote", "minReplicas": 1, "maxReplicas": 1}}),
-            "no remote worker image is published",
+            "no remote worker image is published; set imageBundle: transformers5",
         ),
         (
             remote_lane(engine="candle"),
@@ -2547,3 +2683,148 @@ def test_without_a_remote_lane_sie_config_receives_no_upstream_names(tmp_path: P
     docs = rendered_documents(tmp_path, {"upstreams": upstreams_fixture()["values"], **L4_POOL})
 
     assert container_env(docs, *CONFIG_SERVICE.split("/"))["SIE_UPSTREAM_NAMES"]["value"] == ""
+
+
+@pytest.mark.parametrize("seconds", [1, 600, 86400])
+def test_remote_fallback_persistence_alert_uses_configured_threshold_and_replica_freshness(
+    tmp_path: Path, seconds: int
+) -> None:
+    values = {
+        "alertRules": {"enabled": True, "remoteFallbackPersistenceSeconds": seconds},
+        "observability": AUTOSCALING_VALUES["observability"],
+    }
+    result = render_template(tmp_path, values, "templates/prometheusrule.yaml")
+    assert result.returncode == 0, result.stderr
+    document = yaml.safe_load(result.stdout)
+    rule = next(
+        rule
+        for group in document["spec"]["groups"]
+        for rule in group["rules"]
+        if rule["alert"] == "SIERemoteFallbackPersistent"
+    )
+    assert rule["expr"].strip().endswith(f"> {seconds}")
+    assert "and on (producer_instance, collector_generation, model)" in rule["expr"]
+    assert 'outcome="committed"' in rule["expr"]
+    assert "[5m]" in rule["expr"]
+    assert "__REMOTE_FALLBACK" not in result.stdout
+
+
+@pytest.mark.parametrize("seconds", [0, -1, 86401, 1.5, "600", True])
+def test_remote_fallback_persistence_alert_refuses_invalid_thresholds(tmp_path: Path, seconds: object) -> None:
+    result = render_template(
+        tmp_path,
+        {
+            "alertRules": {"enabled": True, "remoteFallbackPersistenceSeconds": seconds},
+            "observability": AUTOSCALING_VALUES["observability"],
+        },
+        "templates/prometheusrule.yaml",
+    )
+    assert result.returncode != 0
+    assert "alertRules.remoteFallbackPersistenceSeconds" in result.stderr
+
+
+THRESHOLD_VALUES = {
+    "gateway": {"thresholdRouting": {"enabled": True}},
+    "config": {"configStore": {"enabled": True}},
+}
+
+
+def test_threshold_control_is_isolated_and_gateway_only(tmp_path: Path) -> None:
+    result = render_template(tmp_path, THRESHOLD_VALUES, "templates/threshold-control.yaml")
+    assert result.returncode == 0, result.stderr
+    docs = {doc["kind"]: doc for doc in yaml.safe_load_all(result.stdout) if doc}
+    assert set(docs) == {"ConfigMap", "Deployment", "Service", "NetworkPolicy"}
+    config = docs["ConfigMap"]["data"]["nats.conf"]
+    fixture = (ROOT / "tools/ci/fixtures/sie-threshold-nats.conf").read_text()
+
+    def strip_comments(text: str) -> str:
+        return "\n".join(line for line in text.splitlines() if not line.startswith("#")).strip()
+
+    assert strip_comments(config) == strip_comments(fixture)
+    deployment = docs["Deployment"]["spec"]
+    assert deployment["replicas"] == 1
+    assert deployment["strategy"]["type"] == "Recreate"
+    pod = deployment["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    (container,) = pod["containers"]
+    assert container["env"] == [
+        {
+            "name": "SIE_NATS_AUTH_GATEWAY_PASSWORD",
+            "valueFrom": {"secretKeyRef": {"name": "sie-nats-auth-gateway", "key": "password"}},
+        }
+    ]
+    policy = docs["NetworkPolicy"]["spec"]
+    assert policy["policyTypes"] == ["Ingress", "Egress"]
+    assert policy["egress"] == []
+    assert policy["ingress"][0]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "gateway"
+    assert docs["Service"]["spec"]["ports"] == [{"name": "client", "port": 4222, "targetPort": "client"}]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"nats": {"auth": {"enabled": False}}},
+        {"config": {"enabled": False}},
+        {"config": {"configStore": {"enabled": False}}},
+        {"workers": {"common": {"workerSidecar": {"enabled": False}}}},
+    ],
+)
+def test_threshold_rejects_incomplete_queue_authority(tmp_path: Path, override: dict) -> None:
+    values = {**THRESHOLD_VALUES, **override}
+    result = render_template(tmp_path, values, "templates/threshold-control.yaml")
+    assert result.returncode != 0
+
+
+def test_threshold_flag_is_owned_by_chart_and_propagates(tmp_path: Path) -> None:
+    for template, container_name in [
+        ("templates/gateway-deployment.yaml", "gateway"),
+        ("templates/config-deployment.yaml", "config"),
+    ]:
+        result = render_template(tmp_path, THRESHOLD_VALUES, template)
+        assert result.returncode == 0, result.stderr
+        deployment = next(doc for doc in yaml.safe_load_all(result.stdout) if doc and doc["kind"] == "Deployment")
+        container = next(c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == container_name)
+        env = {item["name"]: item for item in container["env"]}
+        assert env["SIE_THRESHOLD_ROUTING_ENABLED"]["value"] == "true"
+        if container_name == "gateway":
+            assert env["SIE_THRESHOLD_NATS_URL"]["value"] == "nats://sie-sie-cluster-threshold:4222"
+    values = {"gateway": {"extraEnv": [{"name": "SIE_THRESHOLD_ROUTING_ENABLED", "value": "true"}]}}
+    result = render_template(tmp_path, values, "templates/gateway-deployment.yaml")
+    assert result.returncode != 0
+
+
+def test_threshold_flag_reaches_workers_and_refuses_shared_gateway_secret(tmp_path: Path) -> None:
+    docs = worker_statefulsets(tmp_path, {**THRESHOLD_VALUES, **L4_POOL})
+    assert docs
+    for doc in docs:
+        containers = doc["spec"]["template"]["spec"]["containers"]
+        for container in containers:
+            env = {item["name"]: item for item in container.get("env", [])}
+            if container["name"] != "worker-sidecar":
+                assert env["SIE_THRESHOLD_ROUTING_ENABLED"]["value"] == "true"
+                assert "SIE_THRESHOLD_NATS_URL" not in env
+                assert "SIE_NATS_AUTH_GATEWAY_PASSWORD" not in env
+    values = {**THRESHOLD_VALUES, "nats": {"auth": {"existingSecrets": {"gateway": "shared", "worker": "shared"}}}}
+    result = render_template(tmp_path, values, "templates/threshold-control.yaml")
+    assert result.returncode != 0
+    assert "distinct from config and worker" in result.stderr
+
+
+@pytest.mark.parametrize("fullname", ["a" * 90, "a" * 52 + "-" + "b" * 10])
+def test_threshold_long_name_keeps_control_resources_and_gateway_url_aligned(tmp_path: Path, fullname: str) -> None:
+    values = {**THRESHOLD_VALUES, "fullnameOverride": fullname}
+    result = render_template(tmp_path, values, "templates/threshold-control.yaml")
+    assert result.returncode == 0, result.stderr
+    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    names = {doc["metadata"]["name"] for doc in docs}
+    assert len(names) == 1
+    (name,) = names
+    assert len(name) <= 63
+    assert name == fullname[:53].rstrip("-") + "-threshold"
+    deployment = next(doc for doc in docs if doc["kind"] == "Deployment")
+    assert deployment["spec"]["template"]["spec"]["volumes"][0]["configMap"]["name"] == name
+    gateway_result = render_template(tmp_path, values, "templates/gateway-deployment.yaml")
+    assert gateway_result.returncode == 0, gateway_result.stderr
+    gateway = next(doc for doc in yaml.safe_load_all(gateway_result.stdout) if doc and doc["kind"] == "Deployment")
+    env = {item["name"]: item for item in gateway["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["SIE_THRESHOLD_NATS_URL"]["value"] == f"nats://{name}:4222"

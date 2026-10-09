@@ -765,7 +765,7 @@ Enable the remote pool and define the upstreams:
 upstreams:
   team-sie:
     kind: sie
-    base_url: https://sie.example.internal
+    base_url: https://team-sie.example.com
     api_key_secret:
       name: team-sie-upstream
       key: api-key
@@ -783,7 +783,9 @@ Below, `<fullname>` is the chart's full name: `<release>-sie-cluster`, or
 
 - Each `upstreams` entry has the fields of the server's upstreams file:
   `kind` (`sie` or `openai`), `base_url` (https outside loopback, with no
-  credentials, query or fragment), `rate_cap` (required) and an optional
+  credentials, query or fragment, and a certificate from a public CA, because
+  the worker verifies it against its built-in CA bundle and accepts no private
+  CA bundle), `rate_cap` (required) and an optional
   `proxy_url`. An upstream of kind `openai` also declares the `endpoints` it
   offers (`completions`, `chat`, `embeddings`, `rerank`) and may name request
   fields to add to every call (`set_params`) or remove from it
@@ -792,6 +794,17 @@ Below, `<fullname>` is the chart's full name: `<release>-sie-cluster`, or
   into values. The chart checks these fields as the server does when it
   renders, and a test sends the same URLs and definitions through the chart
   and the server's own parser.
+- An upstream of kind `openai` may also declare `equivalence` (`max_age_s`, at
+  most 604800, and `record_files`): the evidence that lets a model serve
+  `encode` or `score` from both its local and its remote profile. Put the
+  evidence files in a ConfigMap you create in the release namespace, for
+  example
+  `kubectl create configmap remote-equivalence -n <NAMESPACE> --from-file=bge-m3.json`,
+  and set `workers.remote.equivalence.configMap` to its name. Remote lanes mount it
+  read-only at `/etc/sie/equivalence`, and every `record_files` path must then
+  be `/etc/sie/equivalence/<key>`. No other lane receives it. Remote lanes read
+  the files when they use them, so replacing the ConfigMap's data takes effect
+  without a restart, once the kubelet has synced the volume.
 - Only the `worker` container of a `remote` lane receives the upstreams file
   (the `<fullname>-upstreams` Secret, mounted read-only) and the credentials
   (environment variables read from the Secrets you name). The file is a
@@ -824,18 +837,27 @@ Below, `<fullname>` is the chart's full name: `<release>-sie-cluster`, or
 - `workers.remote.serving: false` keeps remote lanes running but refuses every
   remote profile and sends nothing upstream. The lanes then receive neither
   the upstreams file nor the credentials.
-- A remote lane runs no model on an accelerator. It runs the `cpu-default`
-  worker image (`imageBundle: default`), which contains the remote adapters, and
-  the render fails when its resolved engine is not `pytorch`, its pool sets
+- A remote lane runs no model on an accelerator. It runs the
+  `cpu-transformers5` worker image (`imageBundle: transformers5`), which
+  contains the remote adapters and the transformers 5 release that the `remote`
+  bundle requires to count a hybrid model's generation with tokenizers in the
+  transformers-5 format. The render fails when its resolved engine is not
+  `pytorch`, its pool sets
   `gpu.count` above 0, requests any resource other than `cpu`, `memory` and
   `ephemeral-storage`, or sets a `runtimeClassName`. It does not inherit
   `workers.common.runtimeClassName`.
 - The worker image must ship the `remote` bundle, which server images do from
   the first release that includes #492. With an older image the worker exits
   at start (`Bundle file not found`) and the lane restarts in a loop.
+- Behaviour change: the remote lane's default image moved from `cpu-default`
+  to `cpu-transformers5`. An install that pins
+  `workers.pools.remote.bundles.remote.imageBundle: default` keeps running,
+  but its worker cannot load tokenizer configs in the transformers-5 format, so
+  a hybrid model whose tokenizer uses that format reports the upstream's counts
+  instead of the worker's own.
 - Workers read their environment at start. After rotating an upstream's
   Secret, restart the remote lane:
-  `kubectl rollout restart statefulset/<fullname>-worker-remote-remote`.
+  `kubectl rollout restart statefulset/<fullname>-worker-remote-remote -n <NAMESPACE>`.
   A change to `upstreams` restarts it automatically.
 
 #### Network policy for remote lanes
@@ -2138,3 +2160,25 @@ around those identities. When tracing is enabled, configure
 Tempo, otherwise the chart fails fast.
 
 Local / non-Helm note: the gateway, Python worker, and Rust worker-sidecar all require `SIE_TRACING_ENABLED=true` and an OTLP endpoint (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, or `OTEL_EXPORTER_OTLP_ENDPOINT`) before exporting traces. Setting only one yields no traces rather than a partial trace. In-cluster, the Helm chart sets both for you.
+
+
+### Experimental threshold routing
+
+`gateway.thresholdRouting.enabled` defaults to `false`. Enabling it creates a
+separate authenticated control broker and admits generation/extraction model
+configs with `routing.policy: threshold`. It requires sie-config with `config.configStore.enabled: true`, authenticated
+NATS and worker sidecars. Apply a configuration mutation through sie-config so
+its persisted epoch is nonzero; gateways wait for a complete export bootstrap
+before acquiring coordination authority. The chart propagates the same opt-in to configuration
+validation and queue workers. Only the gateway password is mounted into the
+control broker, and its NetworkPolicy permits only gateway client traffic.
+
+The shipped control broker has one replica and ephemeral memory streams.
+Gateway replicas share counts and one elected sampler; a control-broker restart
+rebuilds evidence while requests retain ordinary local/fallback behavior. If
+config-store recovery rewinds the epoch, restart the isolated threshold broker
+after all gateways have applied the recovered export. This discards the old
+generation and rebuilds evidence; never reset the inference broker for this. This
+flag does not enable managed Cloud or numerical hybrid routing. See
+[the remote-backend guide](../../../packages/sie_server/REMOTE_BACKENDS.md#experimental-cluster-threshold-routing)
+for the policy, limits and caller controls.

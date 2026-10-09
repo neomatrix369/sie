@@ -642,11 +642,12 @@ class ModelLoader:
         """
         resolved = config.resolve_profile("default")
         postprocessors = adapter.get_postprocessors() or {}
-        if resolved.runtime.get("muvera") is not None and "muvera" not in postprocessors:
-            raise ValueError(
-                f"model profile {name!r} requests MUVERA but adapter "
-                f"{type(adapter).__name__!r} did not register a 'muvera' postprocessor"
-            )
+        for option_key, label in (("muvera", "MUVERA"), ("smve", "SMVE")):
+            if resolved.runtime.get(option_key) is not None and option_key not in postprocessors:
+                raise ValueError(
+                    f"model profile {name!r} requests {label} but adapter "
+                    f"{type(adapter).__name__!r} did not register a {option_key!r} postprocessor"
+                )
 
         # Get preprocessor(s) from adapter - all adapters implement get_preprocessor().
         # Most return a single preprocessor; multi-modal adapters (e.g. NemoColEmbed v1,
@@ -953,7 +954,8 @@ def _merge_adaptive_params(
     if profile is None:
         return engine
     return AdaptiveBatchingParams(
-        enabled=engine.enabled,
+        # A profile can turn adaptive batching off for its model, never on.
+        enabled=engine.enabled and profile.enabled is not False,
         target_p50_ms=profile.target_p50_ms if profile.target_p50_ms is not None else engine.target_p50_ms,
         calibration_multiplier=profile.calibration_multiplier
         if profile.calibration_multiplier is not None

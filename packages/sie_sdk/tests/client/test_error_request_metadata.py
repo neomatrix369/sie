@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
-from sie_sdk.client._shared import handle_error
-from sie_sdk.client.errors import RequestError, ServerError
+from sie_sdk.client._shared import get_retry_after, handle_error
+from sie_sdk.client.errors import AccountStateUnavailableError, RequestError, ServerError
 
 
 def _error_response(status_code: int, headers: dict[str, str]) -> MagicMock:
@@ -70,3 +71,40 @@ def test_error_constructor_positional_compatibility_and_missing_metadata() -> No
 
     assert (request_error.code, request_error.status_code, request_error.request) == ("legacy_code", 400, None)
     assert (server_error.code, server_error.status_code, server_error.request) == ("legacy_code", 500, None)
+
+
+@pytest.mark.parametrize("status_code", [500, 503, 504])
+@pytest.mark.parametrize(
+    ("hint", "expected"),
+    [("5", 5.0), ("0", 0.0), ("nan", None), ("-1", None), ("not-a-date", None), (None, None)],
+)
+def test_terminal_server_error_preserves_validated_http_retry_hint(
+    status_code: int, hint: str | None, expected: float | None
+) -> None:
+    response = httpx.Response(
+        status_code,
+        headers={"Retry-After": hint} if hint is not None else {},
+        json={"error": {"code": "QUEUE_FULL", "message": "upstream unavailable"}},
+    )
+    assert get_retry_after(response) == expected
+    with pytest.raises(ServerError) as excinfo:
+        handle_error(response)
+    assert excinfo.value.retry_after == expected
+    assert excinfo.value.status_code == status_code
+    assert excinfo.value.code == "QUEUE_FULL"
+
+
+@pytest.mark.parametrize("hint", ["5", "0", "nan", "-1", "not-a-date", None])
+def test_account_state_error_preserves_retry_hint_and_request_metadata(hint: str | None) -> None:
+    response = httpx.Response(
+        503,
+        headers={"x-sie-request-id": "req-account", **({"Retry-After": hint} if hint is not None else {})},
+        json={"error": {"code": "ACCOUNT_STATE_UNAVAILABLE", "message": "account unavailable", "param": "account"}},
+    )
+    with pytest.raises(AccountStateUnavailableError) as excinfo:
+        handle_error(response)
+    assert excinfo.value.retry_after == get_retry_after(response)
+    assert excinfo.value.param == "account"
+    assert excinfo.value.request == {"id": "req-account"}
+    assert excinfo.value.code == "ACCOUNT_STATE_UNAVAILABLE"
+    assert excinfo.value.status_code == 503

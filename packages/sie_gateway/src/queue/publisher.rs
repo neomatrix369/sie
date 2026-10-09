@@ -30,6 +30,7 @@ use crate::endpoint::InferenceEndpoint;
 use crate::observability::metrics::{
     self as telemetry, QueueEvent, QueueEventOutcome, QueuePublishObservation, QueuePublishOutcome,
 };
+use crate::types::model::FallbackTrigger;
 
 const PAYLOAD_OFFLOAD_THRESHOLD: usize = 1_024 * 1_024; // 1 MB
 /// Public queue request contract. This is deliberately much larger than the
@@ -178,6 +179,9 @@ impl TokenBucket {
 /// fields into `WorkItemRef`); it is not used on the JetStream wire.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WorkParams {
+    /// Gateway-only dispatch contract; never an additive worker payload flag.
+    #[serde(skip)]
+    pub require_execution_authority_v1: bool,
     pub output_types: Option<Vec<String>>,
     pub instruction: Option<String>,
     pub is_query: bool,
@@ -196,6 +200,15 @@ pub struct WorkParams {
     /// Prompt-cache hint. Same semantics as
     /// :attr:`routing_key`.
     pub prompt_cache_key: Option<String>,
+    /// The trigger of the local refusal a remote attempt stands in for. The
+    /// worker answers such an item instead of redelivering it, because the
+    /// gateway holds that refusal for the caller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<FallbackTrigger>,
+    /// The numerical admission a remote encode or score attempt runs under.
+    /// The pinned worker re-verifies it before the upstream sees the item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub numerical_admission_sha256: Option<String>,
 }
 
 /// Discriminated input for a generate work item.
@@ -559,6 +572,14 @@ struct WorkItemRef<'a> {
     /// workers ignore the unknown map field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<f64>,
+    /// Present only on a remote attempt that stands in for a local refusal.
+    /// Older workers ignore the unknown map field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<FallbackTrigger>,
+    /// Present only on an admitted numerical remote attempt, which is pinned
+    /// to a worker that advertised support for re-verifying it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub numerical_admission_sha256: Option<&'a str>,
     /// Rolling-upgrade negotiation for `result_chunk_v1` specifically. Older
     /// workers ignore this unknown map field; workers must keep publishing the
     /// legacy one-shot ``WorkResult`` unless it is true. A future chunk version
@@ -731,6 +752,10 @@ pub struct WorkResult {
     /// rolling/self-host compatibility.
     #[serde(default)]
     pub execution_binding_sha256: Option<String>,
+    /// Seconds after which a retryable error may succeed, when the worker
+    /// gave a hint. Absent from older workers and from successful results.
+    #[serde(default)]
+    pub retry_after_s: Option<u32>,
 }
 
 /// One bounded fragment of a named-msgpack encoded [`WorkResult`].
@@ -1578,6 +1603,7 @@ fn fail_pending_result_chunk_request(
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         })
         .collect();
     if let Some(sender) = collector.sender.take() {
@@ -1909,6 +1935,17 @@ pub enum PublishTarget {
         model: String,
         worker_id: String,
     },
+    /// Updated-only direct dispatch. Older worker consumers cannot receive it.
+    VerifiedWorker {
+        pool: String,
+        machine_profile: String,
+        bundle: String,
+        model: String,
+        worker_id: String,
+        /// Admitted numerical work, on a subject that only a worker with the
+        /// numerical admission fence consumes.
+        numerical_admission: bool,
+    },
     /// Pool fan-out — any worker subscribed to
     /// `sie.work.{pool}.{machine_profile}.{bundle}.*` can pick it up.
     Pool {
@@ -1930,6 +1967,22 @@ impl PublishTarget {
                 model,
                 worker_id,
             } => work_subject_worker(pool, machine_profile, bundle, model, worker_id),
+            PublishTarget::VerifiedWorker {
+                pool,
+                machine_profile,
+                bundle,
+                model,
+                worker_id,
+                numerical_admission,
+            } => format!(
+                "{}.{}",
+                work_subject_worker(pool, machine_profile, bundle, model, worker_id),
+                if *numerical_admission {
+                    "numerical-admission-v1"
+                } else {
+                    "execution-authority-v1"
+                }
+            ),
             PublishTarget::Pool {
                 pool,
                 machine_profile,
@@ -1939,6 +1992,38 @@ impl PublishTarget {
         }
     }
 
+    fn pool_fallback_subject(&self) -> Option<String> {
+        (!matches!(self, Self::VerifiedWorker { .. })).then(|| self.as_pool_fallback().subject())
+    }
+
+    pub(crate) fn verified_model_is_unambiguous(model: &str) -> bool {
+        normalize_model_id(model)
+            .replace("__", "/")
+            .replace("_dot_", ".")
+            == model
+    }
+
+    fn validate_execution_contract(&self, params: &WorkParams, hash: &str) -> Result<(), String> {
+        let verified = matches!(self, Self::VerifiedWorker { .. });
+        let admitted = matches!(
+            self,
+            Self::VerifiedWorker {
+                numerical_admission: true,
+                ..
+            }
+        );
+        if (params.require_execution_authority_v1 && !verified)
+            || params.numerical_admission_sha256.is_some() != admitted
+            || (verified && (hash.is_empty() || !Self::verified_model_is_unambiguous(self.model())))
+        {
+            return Err(
+                "Verified local dispatch requires a versioned worker target and execution hash"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Stable metric label describing the target kind. Wired up to
     /// publish-side metrics in a follow-up; carried in the API
     /// surface now so future callers don't have to extend `PublishTarget`.
@@ -1946,6 +2031,7 @@ impl PublishTarget {
     pub fn label(&self) -> &'static str {
         match self {
             PublishTarget::Worker { .. } => "worker",
+            PublishTarget::VerifiedWorker { .. } => "verified_worker",
             PublishTarget::Pool { .. } => "pool",
         }
     }
@@ -1956,6 +2042,7 @@ impl PublishTarget {
     #[allow(dead_code)]
     pub fn as_pool_fallback(&self) -> PublishTarget {
         match self {
+            PublishTarget::VerifiedWorker { .. } => self.clone(),
             PublishTarget::Worker {
                 pool,
                 machine_profile,
@@ -1979,19 +2066,26 @@ impl PublishTarget {
 
     pub fn model(&self) -> &str {
         match self {
-            PublishTarget::Worker { model, .. } | PublishTarget::Pool { model, .. } => model,
+            PublishTarget::Worker { model, .. }
+            | PublishTarget::VerifiedWorker { model, .. }
+            | PublishTarget::Pool { model, .. } => model,
         }
     }
 
     pub fn pool(&self) -> &str {
         match self {
-            PublishTarget::Worker { pool, .. } | PublishTarget::Pool { pool, .. } => pool,
+            PublishTarget::Worker { pool, .. }
+            | PublishTarget::VerifiedWorker { pool, .. }
+            | PublishTarget::Pool { pool, .. } => pool,
         }
     }
 
     pub fn machine_profile(&self) -> &str {
         match self {
             PublishTarget::Worker {
+                machine_profile, ..
+            }
+            | PublishTarget::VerifiedWorker {
                 machine_profile, ..
             }
             | PublishTarget::Pool {
@@ -2002,7 +2096,9 @@ impl PublishTarget {
 
     pub fn bundle(&self) -> &str {
         match self {
-            PublishTarget::Worker { bundle, .. } | PublishTarget::Pool { bundle, .. } => bundle,
+            PublishTarget::Worker { bundle, .. }
+            | PublishTarget::VerifiedWorker { bundle, .. }
+            | PublishTarget::Pool { bundle, .. } => bundle,
         }
     }
 
@@ -2853,6 +2949,16 @@ impl WorkPublisher {
         pool_backpressure_error(&info, self.max_stream_pending).map_or(Ok(()), Err)
     }
 
+    /// Read current admission pressure without allocating a collector,
+    /// reserving capacity, publishing inputs, or accepting local work.
+    pub fn pre_dispatch_backpressure(&self, lane: &LaneKey) -> Result<(), String> {
+        self.check_backpressure(&lane.pool)?;
+        if self.lane_admission.would_reject(lane) {
+            return Err("backpressure: lane in-flight ceiling exceeded".to_string());
+        }
+        Ok(())
+    }
+
     /// Evaluate this publish against its lane's own in-flight ceiling, on top
     /// of the pool-wide [`Self::check_backpressure`].
     fn check_lane_backpressure(
@@ -2916,6 +3022,87 @@ impl WorkPublisher {
                 }
             }
         });
+    }
+
+    /// Queue a model load without input, inference or a result collector.
+    ///
+    /// The sidecar ACKs `load` after readiness and emits no result. Durability
+    /// here confirms only broker acceptance; worker health remains the source
+    /// of readiness. No local-ingest transport is involved.
+    #[allow(dead_code)] // Called by the subsequent cluster fallback routing delivery.
+    pub async fn publish_model_load(
+        &self,
+        target: PublishTarget,
+        engine: &str,
+        bundle_config_hash: &str,
+    ) -> Result<(String, DispatchDurability), String> {
+        self.ensure_stream(target.pool()).await?;
+        self.check_backpressure(target.pool())?;
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let work_item_id = canonical_work_item_id(&request_id, 0);
+        let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let item = WorkItemRef {
+            work_item_id: &work_item_id,
+            request_id: &request_id,
+            item_index: 0,
+            total_items: 1,
+            operation: "load",
+            model_id: target.model(),
+            profile_id: "default",
+            display_model: None,
+            engine,
+            pool_name: target.pool(),
+            admission_pool: "",
+            machine_profile: target.machine_profile(),
+            item: None,
+            payload_ref: None,
+            output_types: None,
+            instruction: None,
+            is_query: false,
+            options: None,
+            query_item: None,
+            query_payload_ref: None,
+            score_items: None,
+            labels: None,
+            output_schema: None,
+            generate: None,
+            routing_key: None,
+            prompt_cache_key: None,
+            bundle_config_hash,
+            router_id: &self.router_id,
+            reply_subject: &reply_subject,
+            timestamp,
+            deadline: Some(timestamp + self.result_timeout.as_secs_f64()),
+            fallback_reason: None,
+            numerical_admission_sha256: None,
+            accepts_result_chunks: false,
+            traceparent: None,
+            tracestate: None,
+        };
+        let encoded = rmp_serde::to_vec_named(&item).map_err(|error| {
+            warn!(error = %error, "failed to encode model load envelope");
+            "model load envelope could not be encoded".to_string()
+        })?;
+        let ack = self
+            .jetstream
+            .publish(target.subject(), encoded.into())
+            .await
+            .map_err(|error| {
+                warn!(error = %error.kind(), "failed to publish model load envelope");
+                "model load could not be published".to_string()
+            })?;
+        let durability = DispatchDurability::from_future(async move {
+            tokio::time::timeout(PUBLISH_ACK_COMPLETION_TIMEOUT, ack)
+                .await
+                .map_err(|_| "model load publish acknowledgement timed out".to_string())?
+                .map(|_| ())
+                .map_err(|_| "model load publish acknowledgement failed".to_string())
+        });
+        Ok((request_id, durability))
     }
 
     /// Decompose a request into work items and publish to JetStream.
@@ -2993,6 +3180,7 @@ impl WorkPublisher {
         ),
         String,
     > {
+        target.validate_execution_contract(params, bundle_config_hash)?;
         validate_queue_request_item_count(items.len())?;
         let ack_count = initial_publish_ack_count(endpoint, items.len());
         let pool = target.pool().to_string();
@@ -3024,9 +3212,9 @@ impl WorkPublisher {
 
         let subject = target.subject();
         let (pool_fallback_subject, direct_fallback_worker_id) = match (&target, endpoint) {
-            (PublishTarget::Worker { .. }, "generate") | (PublishTarget::Pool { .. }, _) => {
-                (None, None)
-            }
+            (PublishTarget::Worker { .. }, "generate")
+            | (PublishTarget::VerifiedWorker { .. }, _)
+            | (PublishTarget::Pool { .. }, _) => (None, None),
             (PublishTarget::Worker { worker_id, .. }, _) => (
                 Some(target.as_pool_fallback().subject()),
                 Some(worker_id.clone()),
@@ -3411,6 +3599,8 @@ impl WorkPublisher {
             reply_subject: shared.reply_subject,
             timestamp: shared.timestamp,
             deadline: shared.deadline,
+            fallback_reason: shared.params.fallback_reason,
+            numerical_admission_sha256: shared.params.numerical_admission_sha256.as_deref(),
             accepts_result_chunks: true,
             traceparent: shared.traceparent,
             tracestate: shared.tracestate,
@@ -3553,6 +3743,7 @@ impl WorkPublisher {
         ),
         String,
     > {
+        target.validate_execution_contract(params, bundle_config_hash)?;
         let model = target.model().to_string();
         let pool = target.pool().to_string();
         let machine_profile = target.machine_profile().to_string();
@@ -3571,7 +3762,7 @@ impl WorkPublisher {
         let request_id = uuid::Uuid::now_v7().to_string();
         let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
         let subject = target.subject();
-        let pool_fallback_subject = target.as_pool_fallback().subject();
+        let pool_fallback_subject = target.pool_fallback_subject();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3584,7 +3775,7 @@ impl WorkPublisher {
         // Metric labels surface the requested (display) id, never the
         // ``:no-spec`` dispatch variant (#1324).
         collector.display_model = display_model.to_string();
-        collector.pool_fallback_subject = Some(pool_fallback_subject.clone());
+        collector.pool_fallback_subject = pool_fallback_subject.clone();
         collector.lane_reservation = lane_reservation;
         // Capture the activity handle before the collector moves into
         // ``pending_streams`` so the caller never has to re-look it up
@@ -3705,6 +3896,7 @@ impl WorkPublisher {
         ),
         String,
     > {
+        target.validate_execution_contract(params, bundle_config_hash)?;
         let model = target.model().to_string();
         let pool = target.pool().to_string();
         let machine_profile = target.machine_profile().to_string();
@@ -3721,7 +3913,7 @@ impl WorkPublisher {
         let request_id = uuid::Uuid::now_v7().to_string();
         let reply_subject = format!("_INBOX.{}.{}", self.router_id, request_id);
         let subject = target.subject();
-        let pool_fallback_subject = target.as_pool_fallback().subject();
+        let pool_fallback_subject = target.pool_fallback_subject();
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -3735,7 +3927,7 @@ impl WorkPublisher {
         // Metric labels surface the requested (display) id, never the
         // ``:no-spec`` dispatch variant (#1324).
         collector.display_model = display_model.to_string();
-        collector.pool_fallback_subject = Some(pool_fallback_subject.clone());
+        collector.pool_fallback_subject = pool_fallback_subject.clone();
         collector.lane_reservation = lane_reservation;
         let chunk_rx = collector.install_chunk_tap();
         self.pending_streams.insert(request_id.clone(), collector);
@@ -4039,6 +4231,8 @@ impl WorkPublisher {
             reply_subject: shared.reply_subject,
             timestamp: shared.timestamp,
             deadline: shared.deadline,
+            fallback_reason: shared.params.fallback_reason,
+            numerical_admission_sha256: shared.params.numerical_admission_sha256.as_deref(),
             accepts_result_chunks: true,
             traceparent: shared.traceparent,
             tracestate: shared.tracestate,
@@ -4335,6 +4529,8 @@ impl WorkPublisher {
             reply_subject: shared.reply_subject,
             timestamp: shared.timestamp,
             deadline: shared.deadline,
+            fallback_reason: shared.params.fallback_reason,
+            numerical_admission_sha256: shared.params.numerical_admission_sha256.as_deref(),
             accepts_result_chunks: true,
             traceparent: shared.traceparent,
             tracestate: shared.tracestate,
@@ -5332,6 +5528,103 @@ pub fn encode_response(
 mod tests {
     use super::*;
 
+    #[test]
+    fn verified_target_keeps_both_fences_and_rejects_legacy_downgrade() {
+        let verified = PublishTarget::VerifiedWorker {
+            pool: "tenant".into(),
+            machine_profile: "l4".into(),
+            bundle: "default".into(),
+            model: "Org/model:local".into(),
+            worker_id: "worker-1".into(),
+            numerical_admission: false,
+        };
+        assert_eq!(
+            verified.subject(),
+            "sie.work.tenant.l4.default.Org__model:local.worker-1.execution-authority-v1"
+        );
+        assert!(verified.pool_fallback_subject().is_none());
+        for model in ["Org__model", "Org/model_dot_v1", "Org/model*bad"] {
+            assert!(!PublishTarget::verified_model_is_unambiguous(model));
+        }
+        assert!(PublishTarget::verified_model_is_unambiguous(
+            "Org/model.v1:local"
+        ));
+        assert_eq!(verified.as_pool_fallback().subject(), verified.subject());
+        let params = WorkParams {
+            require_execution_authority_v1: true,
+            ..Default::default()
+        };
+        assert!(verified
+            .validate_execution_contract(&params, "hash")
+            .is_ok());
+        assert!(verified.validate_execution_contract(&params, "").is_err());
+        let legacy = PublishTarget::Pool {
+            pool: "tenant".into(),
+            machine_profile: "l4".into(),
+            bundle: "default".into(),
+            model: "Org/model:local".into(),
+        };
+        assert!(legacy.validate_execution_contract(&params, "hash").is_err());
+        assert!(legacy
+            .validate_execution_contract(&WorkParams::default(), "")
+            .is_ok());
+        assert!(serde_json::to_value(params)
+            .unwrap()
+            .get("require_execution_authority_v1")
+            .is_none());
+    }
+
+    #[test]
+    fn admitted_work_travels_only_on_the_admission_subject() {
+        let target = |numerical_admission| PublishTarget::VerifiedWorker {
+            pool: "tenant".into(),
+            machine_profile: "l4".into(),
+            bundle: "remote".into(),
+            model: "Org/model:remote".into(),
+            worker_id: "worker-1".into(),
+            numerical_admission,
+        };
+        let admitted = target(true);
+        assert_eq!(
+            admitted.subject(),
+            "sie.work.tenant.l4.remote.Org__model:remote.worker-1.numerical-admission-v1"
+        );
+        assert!(admitted.pool_fallback_subject().is_none());
+        let with_digest = WorkParams {
+            require_execution_authority_v1: true,
+            numerical_admission_sha256: Some("a".repeat(64)),
+            ..Default::default()
+        };
+        let without_digest = WorkParams {
+            require_execution_authority_v1: true,
+            ..Default::default()
+        };
+        assert!(admitted
+            .validate_execution_contract(&with_digest, "hash")
+            .is_ok());
+        assert!(admitted
+            .validate_execution_contract(&without_digest, "hash")
+            .is_err());
+        assert!(target(false)
+            .validate_execution_contract(&with_digest, "hash")
+            .is_err());
+        let pooled = PublishTarget::Pool {
+            pool: "tenant".into(),
+            machine_profile: "l4".into(),
+            bundle: "remote".into(),
+            model: "Org/model:remote".into(),
+        };
+        assert!(pooled
+            .validate_execution_contract(
+                &WorkParams {
+                    numerical_admission_sha256: Some("a".repeat(64)),
+                    ..Default::default()
+                },
+                "hash"
+            )
+            .is_err());
+    }
+
     /// Two lanes on one pool, differing only in machine profile. The pool-wide
     /// check cannot tell them apart — the whole point of B5's first half.
     fn hot_lane() -> LaneKey {
@@ -6185,6 +6478,10 @@ mod tests {
         pub timestamp: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub deadline: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub fallback_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub numerical_admission_sha256: Option<String>,
         #[serde(default)]
         pub accepts_result_chunks: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6560,6 +6857,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         }
     }
 
@@ -7164,6 +7462,7 @@ mod tests {
                     executed_bundle_config_hash: None,
                     execution_identity_sha256: None,
                     execution_binding_sha256: None,
+                    retry_after_s: None,
                 }),
                 None,
             ],
@@ -7238,6 +7537,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         };
         let duplicate = WorkResult {
             result_msgpack: vec![2],
@@ -7302,6 +7602,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         };
         let pool_result = WorkResult {
             result_msgpack: vec![2],
@@ -7527,6 +7828,8 @@ mod tests {
             reply_subject: "_INBOX.r1.req-1".to_string(),
             timestamp: 1700000000.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
             accepts_result_chunks: true,
             traceparent: None,
             tracestate: None,
@@ -7535,14 +7838,17 @@ mod tests {
         let encoded = rmp_serde::to_vec_named(&item).unwrap();
         let decoded: WorkItem = rmp_serde::from_slice(&encoded).unwrap();
         let wire: rmpv::Value = rmp_serde::from_slice(&encoded).unwrap();
-        assert!(
-            wire.as_map()
-                .unwrap()
-                .iter()
-                .all(|(key, _)| key.as_str() != Some("deadline")),
-            "an unknown deadline must stay off the wire"
-        );
+        for absent in ["deadline", "fallback_reason"] {
+            assert!(
+                wire.as_map()
+                    .unwrap()
+                    .iter()
+                    .all(|(key, _)| key.as_str() != Some(absent)),
+                "an absent {absent} must stay off the wire"
+            );
+        }
         assert_eq!(decoded.deadline, None);
+        assert_eq!(decoded.fallback_reason, None);
 
         assert_eq!(decoded.work_item_id, "req-1.0");
         assert_eq!(decoded.request_id, "req-1");
@@ -7588,6 +7894,35 @@ mod tests {
         assert!(!decoded.accepts_result_chunks);
     }
 
+    #[test]
+    fn work_results_carry_the_workers_retry_hint_and_older_ones_decode_without_it() {
+        #[derive(Serialize)]
+        struct SidecarResult<'a> {
+            work_item_id: &'a str,
+            request_id: &'a str,
+            item_index: u32,
+            success: bool,
+            error_code: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            retry_after_s: Option<u32>,
+        }
+        let decode = |retry_after_s| {
+            let bytes = rmp_serde::to_vec_named(&SidecarResult {
+                work_item_id: "req.0",
+                request_id: "req",
+                item_index: 0,
+                success: false,
+                error_code: "QUEUE_FULL",
+                retry_after_s,
+            })
+            .unwrap();
+            rmp_serde::from_slice::<WorkResult>(&bytes).unwrap()
+        };
+
+        assert_eq!(decode(Some(7)).retry_after_s, Some(7));
+        assert_eq!(decode(None).retry_after_s, None);
+    }
+
     /// Regression: `WorkItemRef` is the borrowed view we use on the
     /// publish hot path and it **must** serialize to the exact same
     /// msgpack bytes as the owned `WorkItem`. Any drift in field
@@ -7630,6 +7965,8 @@ mod tests {
             reply_subject: "_INBOX.router-1.req-ref".to_string(),
             timestamp: 1_700_000_000.5,
             deadline: Some(1_700_000_120.5),
+            fallback_reason: Some("saturated".to_string()),
+            numerical_admission_sha256: Some("a".repeat(64)),
             accepts_result_chunks: true,
             traceparent: None,
             tracestate: None,
@@ -7673,6 +8010,8 @@ mod tests {
             reply_subject: &owned.reply_subject,
             timestamp: owned.timestamp,
             deadline: owned.deadline,
+            fallback_reason: Some(FallbackTrigger::Saturated),
+            numerical_admission_sha256: owned.numerical_admission_sha256.as_deref(),
             accepts_result_chunks: true,
             traceparent: owned.traceparent.as_deref(),
             tracestate: owned.tracestate.as_deref(),
@@ -7744,6 +8083,7 @@ mod tests {
             execution_binding_sha256: Some(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
             ),
+            retry_after_s: None,
         };
 
         let encoded = rmp_serde::to_vec(&result).unwrap();
@@ -7854,6 +8194,8 @@ mod tests {
             reply_subject: "_INBOX.r1.req-2".to_string(),
             timestamp: 0.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
             accepts_result_chunks: true,
             traceparent: None,
             tracestate: None,
@@ -7960,6 +8302,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         })
         .expect("encode work result")
     }
@@ -8108,6 +8451,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
@@ -8136,6 +8480,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         };
         let encoded = rmp_serde::to_vec_named(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
@@ -8181,6 +8526,7 @@ mod tests {
             executed_bundle_config_hash: None,
             execution_identity_sha256: None,
             execution_binding_sha256: None,
+            retry_after_s: None,
         };
         let encoded = rmp_serde::to_vec(&result).unwrap();
         let extracted = extract_request_id_fast(&encoded);
@@ -8537,6 +8883,8 @@ mod tests {
             reply_subject: "_INBOX.r.req-x".to_string(),
             timestamp: 1.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
             accepts_result_chunks: true,
             traceparent: None,
             tracestate: None,
@@ -8689,6 +9037,8 @@ mod tests {
             reply_subject: "_INBOX.r.req-tp".to_string(),
             timestamp: 1.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
             accepts_result_chunks: true,
             traceparent: Some(tp.to_string()),
             tracestate: Some(ts.to_string()),
@@ -8736,6 +9086,8 @@ mod tests {
             reply_subject: "_INBOX.r.req-tp2".to_string(),
             timestamp: 1.0,
             deadline: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
             accepts_result_chunks: true,
             traceparent: None,
             tracestate: None,
@@ -8995,6 +9347,179 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn load_only_publish_is_durable_without_inputs_or_result_collectors() {
+        let Ok(url) = std::env::var("NATS_URL") else {
+            assert_ne!(
+                std::env::var("SIE_RUN_NATS_PUBLISHER_TEST").as_deref(),
+                Ok("1"),
+                "mandatory publisher tests require NATS_URL"
+            );
+            return;
+        };
+        let client = async_nats::connect(url)
+            .await
+            .expect("test NATS connection");
+        let pool = format!("itload{}", uuid::Uuid::now_v7().simple());
+        let publisher = Arc::new(WorkPublisher::new(
+            jetstream::new(client.clone()),
+            "load-gateway".to_string(),
+            Arc::new(crate::queue::payload_store::DisabledPayloadStore),
+            Duration::from_secs(60),
+            1024,
+            WorkStreamConfig {
+                max_age: Duration::from_secs(300),
+                storage: jetstream::stream::StorageType::Memory,
+                num_replicas: 1,
+            },
+        ));
+        let context = jetstream::new(client.clone());
+        let mut stream = context
+            .get_or_create_stream(jetstream::stream::Config {
+                name: stream_name(&pool),
+                subjects: vec![format!("sie.work.{pool}.*.*.*")],
+                retention: jetstream::stream::RetentionPolicy::WorkQueue,
+                storage: jetstream::stream::StorageType::Memory,
+                max_age: Duration::from_secs(300),
+                max_messages: 100_000,
+                discard: jetstream::stream::DiscardPolicy::New,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        stream
+            .create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some("warm-worker".into()),
+                filter_subject: format!("sie.work.{pool}.*.*.*"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Direct work belongs to the worker stream, never the pool stream.
+        let worker_stream_name = format!("WORK_WORKER_{pool}");
+        let worker_stream = context
+            .get_or_create_stream(jetstream::stream::Config {
+                name: worker_stream_name.clone(),
+                subjects: vec![format!("sie.work.{pool}.l4.default.*.warm-worker")],
+                retention: jetstream::stream::RetentionPolicy::WorkQueue,
+                storage: jetstream::stream::StorageType::Memory,
+                max_age: Duration::from_secs(300),
+                discard: jetstream::stream::DiscardPolicy::New,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        worker_stream
+            .create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some("warm-worker".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut subscriber = client
+            .subscribe(format!("sie.work.{pool}.>"))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+        for worker in [false, true] {
+            let pool_target = PublishTarget::Pool {
+                pool: pool.clone(),
+                machine_profile: "l4".into(),
+                bundle: "default".into(),
+                model: "acme/warm".into(),
+            };
+            let target = if worker {
+                PublishTarget::Worker {
+                    pool: pool.clone(),
+                    machine_profile: "l4".into(),
+                    bundle: "default".into(),
+                    model: "acme/warm".into(),
+                    worker_id: "warm-worker".into(),
+                }
+            } else {
+                pool_target
+            };
+            let expected_subject = target.subject();
+            let (request_id, durability) =
+                crate::queue::dispatch::WorkDispatcher::publish_model_load(
+                    publisher.as_ref(),
+                    target,
+                    "pytorch",
+                    "exact-config-hash",
+                )
+                .await
+                .unwrap();
+            durability
+                .wait()
+                .await
+                .expect("load publish acknowledgement");
+            let message = tokio::time::timeout(Duration::from_secs(2), subscriber.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(message.subject.as_str(), expected_subject);
+            let item: WorkItem = rmp_serde::from_slice(&message.payload).unwrap();
+            assert_eq!(item.operation, "load");
+            assert_eq!(item.model_id, "acme/warm");
+            assert_eq!(item.profile_id, "default");
+            assert_eq!(item.request_id, request_id);
+            assert_eq!(item.work_item_id, canonical_work_item_id(&request_id, 0));
+            assert_eq!((item.item_index, item.total_items), (0, 1));
+            assert_eq!(item.bundle_config_hash, "exact-config-hash");
+            assert_eq!(item.engine, "pytorch");
+            assert_eq!(item.machine_profile, "l4");
+            assert_eq!(item.pool_name, pool);
+            assert_eq!(item.router_id, "load-gateway");
+            assert!(item.reply_subject.starts_with("_INBOX.load-gateway."));
+            assert_eq!(item.deadline.unwrap() - item.timestamp, 60.0);
+            assert!(item.item.is_none() && item.payload_ref.is_none());
+            assert!(item.query_item.is_none() && item.query_payload_ref.is_none());
+            assert!(item.score_items.is_none() && item.generate.is_none());
+            assert!(item.options.is_none() && item.output_types.is_none());
+            assert!(!item.accepts_result_chunks);
+            assert!(publisher.pending_results.is_empty() && publisher.pending_streams.is_empty());
+            assert!(publisher.offloaded_payload_keys.is_empty());
+        }
+        // A broker rejection must fail durability with fixed text and must
+        // not leave caller-result or payload state behind.
+        let mut bounded = stream.info().await.unwrap().config.clone();
+        bounded.max_message_size = 1;
+        context.update_stream(bounded).await.unwrap();
+        let target = PublishTarget::Pool {
+            pool: pool.clone(),
+            machine_profile: "l4".into(),
+            bundle: "default".into(),
+            model: "acme/warm".into(),
+        };
+        let (_, durability) = publisher
+            .publish_model_load(target, "pytorch", "exact-config-hash")
+            .await
+            .unwrap();
+        assert_eq!(
+            durability.wait().await.unwrap_err(),
+            "model load publish acknowledgement failed"
+        );
+        assert_eq!(stream.info().await.unwrap().state.messages, 1);
+        assert_eq!(
+            context
+                .get_stream(&worker_stream_name)
+                .await
+                .unwrap()
+                .cached_info()
+                .state
+                .messages,
+            1
+        );
+        assert!(publisher.pending_results.is_empty() && publisher.pending_streams.is_empty());
+        assert!(publisher.offloaded_payload_keys.is_empty());
+
+        context.delete_stream(worker_stream_name).await.unwrap();
+        jetstream::new(client)
+            .delete_stream(stream_name(&pool))
+            .await
+            .unwrap();
+    }
+
     /// NATS-gated: a work item carries `display_model` only when the caller
     /// asked for a model other than the route the work runs on, on the batch
     /// and on the generation publish path alike.
@@ -9139,6 +9664,136 @@ mod tests {
             .await;
     }
 
+    /// NATS-gated: a remote attempt carries the trigger of the refusal it
+    /// stands in for, on the batch and on the generation publish path alike;
+    /// other work carries none.
+    #[tokio::test]
+    async fn remote_attempts_carry_their_fallback_reason_on_the_wire() {
+        use futures_util::StreamExt;
+
+        let Ok(url) = std::env::var("NATS_URL") else {
+            assert_ne!(
+                std::env::var("SIE_RUN_NATS_PUBLISHER_TEST").as_deref(),
+                Ok("1"),
+                "mandatory publisher tests require NATS_URL"
+            );
+            return;
+        };
+        let client = async_nats::connect(url)
+            .await
+            .expect("test NATS connection");
+        let pool = format!("itfallback{}", uuid::Uuid::now_v7().simple());
+        let publisher = Arc::new(WorkPublisher::new(
+            jetstream::new(client.clone()),
+            "it-router".to_string(),
+            Arc::new(crate::queue::payload_store::DisabledPayloadStore),
+            Duration::from_secs(5),
+            1024,
+            WorkStreamConfig {
+                max_age: Duration::from_secs(300),
+                storage: jetstream::stream::StorageType::Memory,
+                num_replicas: 1,
+            },
+        ));
+        let subjects = format!("sie.work.{pool}.>");
+        let stream = jetstream::new(client.clone())
+            .get_or_create_stream(jetstream::stream::Config {
+                name: stream_name(&pool),
+                subjects: vec![subjects.clone()],
+                retention: jetstream::stream::RetentionPolicy::WorkQueue,
+                storage: jetstream::stream::StorageType::Memory,
+                max_age: Duration::from_secs(300),
+                max_messages: 100_000,
+                discard: jetstream::stream::DiscardPolicy::New,
+                ..Default::default()
+            })
+            .await
+            .expect("create work stream");
+        stream
+            .create_consumer(jetstream::consumer::pull::Config {
+                durable_name: Some("itworker".to_string()),
+                filter_subject: subjects.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("create work consumer");
+        let mut sub = client.subscribe(subjects).await.expect("subscribe");
+        client.flush().await.expect("flush");
+        let target = || PublishTarget::Pool {
+            pool: pool.clone(),
+            machine_profile: "cpu".to_string(),
+            bundle: "remote".to_string(),
+            model: "acme/model:remote".to_string(),
+        };
+        async fn next_reason(sub: &mut async_nats::Subscriber) -> Option<String> {
+            let msg = tokio::time::timeout(Duration::from_secs(5), sub.next())
+                .await
+                .expect("timed out waiting for the published work item")
+                .expect("subscription closed before a message arrived");
+            let work: WorkItem = rmp_serde::from_slice(&msg.payload).expect("decode work item");
+            work.fallback_reason
+        }
+
+        let mut published = Vec::new();
+        let mut expected = Vec::new();
+        for reason in [
+            None,
+            Some(FallbackTrigger::Provisioning),
+            Some(FallbackTrigger::ModelLoading),
+            Some(FallbackTrigger::Saturated),
+            Some(FallbackTrigger::Unhealthy),
+        ] {
+            let items = vec![rmpv::Value::Map(vec![(
+                rmpv::Value::from("text"),
+                rmpv::Value::from("hello"),
+            )])];
+            let extract = WorkParams {
+                fallback_reason: reason,
+                ..WorkParams::default()
+            };
+            let (_request_id, _rx, durability) = publisher
+                .publish_work(
+                    target(),
+                    &pool,
+                    "extract",
+                    "acme/model:remote",
+                    "acme/model",
+                    "pytorch",
+                    "",
+                    items,
+                    &extract,
+                )
+                .await
+                .expect("publish_work");
+            durability.wait().await.expect("durable publish ACK");
+            published.push(next_reason(&mut sub).await);
+            let generate = WorkParams {
+                generate: Some(GenerateParams {
+                    input: GenerateInput::Prompt {
+                        prompt: "hi".to_string(),
+                    },
+                    max_new_tokens: 4,
+                    ..Default::default()
+                }),
+                fallback_reason: reason,
+                ..WorkParams::default()
+            };
+            let (_request_id, _rx, _notify, durability) = publisher
+                .publish_generate_streaming(target(), "acme/model", "pytorch", "", &generate, &pool)
+                .await
+                .expect("publish_generate_streaming");
+            durability.wait().await.expect("durable publish ACK");
+            published.push(next_reason(&mut sub).await);
+            let wire = reason.map(|reason| reason.as_str().to_string());
+            expected.extend([wire.clone(), wire]);
+        }
+
+        assert_eq!(published, expected);
+        let _ = jetstream::new(client.clone())
+            .delete_stream(stream_name(&pool))
+            .await;
+    }
+
     /// Integration test (issue #1500): drive a real `WorkPublisher` encode
     /// publish over a live NATS/JetStream broker, with the inbound trace
     /// context scoped over the publish via `with_context` exactly as
@@ -9248,6 +9903,7 @@ mod tests {
         let cx = crate::observability::propagation::extract_context_from_headers(&headers);
 
         let params = WorkParams {
+            require_execution_authority_v1: false,
             output_types: None,
             instruction: None,
             is_query: false,
@@ -9258,6 +9914,8 @@ mod tests {
             generate: None,
             routing_key: None,
             prompt_cache_key: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         };
         let items = vec![rmpv::Value::Map(vec![(
             rmpv::Value::String("text".into()),
@@ -9528,6 +10186,7 @@ mod tests {
         client.flush().await.expect("flush subscription");
 
         let params = WorkParams {
+            require_execution_authority_v1: false,
             output_types: None,
             instruction: None,
             is_query: false,
@@ -9538,6 +10197,8 @@ mod tests {
             generate: None,
             routing_key: None,
             prompt_cache_key: None,
+            fallback_reason: None,
+            numerical_admission_sha256: None,
         };
         let items = vec![rmpv::Value::Map(vec![(
             rmpv::Value::String("image".into()),

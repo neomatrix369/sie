@@ -17,6 +17,7 @@ from sie_server.adapters.errors import InputTooLongError, UpstreamUnavailableErr
 from sie_server.api.ws import (
     BundleConfigView,
     BundleMetadataUnavailableError,
+    bundle_model_is_supported,
     compute_bundle_config_hash_cached,
     compute_bundle_config_view,
 )
@@ -103,7 +104,6 @@ _INFERENCE_ERROR_CODE: Final[str] = "inference_error"
 # which under a systemic failure is also the correct answer, because every one
 # of them was going to fail anyway.
 _MAX_ENCODE_ISOLATION_PASSES: Final[int] = 24
-_UPSTREAM_NAK_MAX_DELAY_S: Final[float] = 60.0
 _CANONICAL_AUDIO_SAMPLE_RATE: Final[int] = 16_000
 _MAX_AUDIO_CHANNELS: Final[int] = 2
 _MIN_AUDIO_SAMPLE_RATE: Final[int] = 8_000
@@ -672,6 +672,23 @@ class QueueExecutor:
             self._control_plane_adapters[bundle_id] = scope
             self._view_state_version += 1
 
+    def accepts_execution_config(self, bundle_id: str, model_id: str, expected_hashes: set[str]) -> bool:
+        """Check pinned execution against live authority; caller retains a registry lease."""
+        if not bundle_id or not expected_hashes:
+            return False
+        view = self.bundle_config_view(bundle_id)
+        return bool(
+            view.bundle_config_hash
+            and expected_hashes == {view.bundle_config_hash}
+            and model_id not in view.unsupported_models
+            and bundle_model_is_supported(
+                self._registry,
+                bundle_id,
+                model_id,
+                control_plane_adapters=self._control_plane_adapters.get(bundle_id),
+            )
+        )
+
     async def apply_model_config(self, req: ApplyModelConfigRequest) -> ApplyModelConfigResponse:
         """Validate and add a bundle-scoped config delta to the local registry.
 
@@ -767,7 +784,12 @@ class QueueExecutor:
                 for expanded in expand_profile_variants([model_config]).values():
                     validate_no_legacy_scalar_lora_id(name=expanded.sie_id, config=expanded)
                     validate_profile_upstreams(expanded)
-                    validate_model_routing(expanded)
+                    await asyncio.to_thread(
+                        validate_model_routing,
+                        expanded,
+                        device=self._registry.profile_execution_device(expanded.sie_id),
+                        engine_config=self._registry.engine_config,
+                    )
                 configs.append(model_config)
             except (TypeError, ValueError, yaml.YAMLError) as exc:
                 if not model_id:
@@ -1531,7 +1553,7 @@ class QueueExecutor:
         # Adapter for the metering backfill (§7.3). Read via the registry — the
         # same sync accessor the encode seam uses — so a reranker that owns its
         # tokenization can re-derive real per-pair counts. ``None`` (evicted
-        # mid-batch) simply leaves the meter on its reserve estimate.
+        # mid-batch) leaves the counts absent.
         try:
             score_adapter = self._registry.get(model_id)
         except KeyError:
@@ -1843,8 +1865,7 @@ def _encode_units(token_count: int | None, image_count: int | None) -> UnitCount
     Nothing bills less: a zero contributes no credits either way, and the only
     behaviour that changes is a settlement that used to FAULT (billing nothing)
     now releasing that dimension and billing the images. An item with neither
-    dimension yields ``None`` so the metering edge falls back to its reserve
-    estimate.
+    dimension yields ``None``, so its counts are absent.
     """
     images = image_count if (image_count is not None and image_count > 0) else None
     if token_count is not None and token_count > 0:
@@ -1876,6 +1897,13 @@ def _with_images(units: UnitCounts | None, image_count: int | None) -> UnitCount
         images=image_count,
         audio_ms=units.audio_ms,
     )
+
+
+def _with_input_tokens(units: UnitCounts | None, token_count: int) -> UnitCounts:
+    """Set an authoritative input-token count while preserving other units."""
+    if units is None:
+        return UnitCounts(input_tokens=token_count)
+    return msgspec.structs.replace(units, input_tokens=token_count)
 
 
 def _with_pages(units: UnitCounts | None, page_count: int | None) -> UnitCounts | None:
@@ -1928,8 +1956,8 @@ def _page_total(pages: Any, expected_len: int) -> int | None:
     """Sum an adapter-surfaced per-item page list (``ExtractOutput.pages``) into a
     single billable page count for the work item.
 
-    Returns ``None`` — leaving the pages dimension unset so the meter falls back
-    to its reserve estimate — unless the list is well-formed (aligned 1:1 with
+    Returns ``None`` — leaving the pages dimension unset, with no estimate in its
+    place — unless the list is well-formed (aligned 1:1 with
     the item's outputs and non-negative ints). A valid zero remains authoritative;
     malformed data is dropped rather than mis-attributed.
     """
@@ -1954,8 +1982,8 @@ def _units_from_token_counts(counts: Any, expected_len: int) -> UnitCounts | Non
     """Sum authoritative per-item token counts into a work item's ``UnitCounts``.
 
     Mirrors the encode metering contract (§7.3): billing counts, never
-    estimates. Returns ``None`` — leaving ``ItemOutcome.units`` unset so the
-    metering edge falls back to its reserve estimate — unless the adapter
+    estimates. Returns ``None`` — leaving ``ItemOutcome.units`` unset, with no
+    estimate in its place — unless the adapter
     surfaced a well-formed list aligned 1:1 with the item's outputs. A
     misaligned or malformed list is dropped rather than mis-attributed.
     """
@@ -2002,7 +2030,7 @@ def _backfill_score_units(
     §7.3 basis the in-tree ``cross_encoder`` already surfaces. Pure fallback:
     never overwrites counts an adapter already produced (so bge-m3 / cross_encoder
     keep their exact values), and a ``None`` recovery (server-backed adapters)
-    leaves the meter on its reserve estimate.
+    leaves the counts absent.
     """
     if adapter is None:
         return
@@ -2173,6 +2201,11 @@ def _extract_success_outcome(
         # Adapter returned no results for a single-item request — surface an
         # error instead of publishing an object the client reads as success.
         return _error_outcome(bi, _INFERENCE_ERROR_CODE, "adapter returned no extraction results")
+    error = extraction_results[0].get("error")
+    if isinstance(error, dict) and error.get("code") == ErrorCode.INPUT_TOO_LONG.value:
+        # Length-rejected items have zero billable input tokens, even when an
+        # adapter reports a count or cannot meter the valid siblings.
+        units = _with_input_tokens(units, 0)
     item_id = server_item.id if server_item.id is not None else f"item-{bi.item_index}"
     result_msgpack = pack_msgpack({**extraction_results[0], "id": item_id}, use_bin_type=True)
 
@@ -2216,17 +2249,27 @@ def _oom_nak_outcome(bi: EncodeBatchItem | ScoreBatchItem | ExtractBatchItem) ->
     )
 
 
-def _upstream_nak_outcome(bi: EncodeBatchItem | ScoreBatchItem | ExtractBatchItem, retry_after_s: int) -> ItemOutcome:
-    # Never shorter than the base delay: a work item has a fixed number of
-    # deliveries, and a one-second hint would spend them long before the
-    # gateway stops waiting for the result.
-    delay_s = min(_UPSTREAM_NAK_MAX_DELAY_S, max(_default_nak_delay_s(), float(retry_after_s)))
+def _upstream_refusal_outcome(
+    bi: EncodeBatchItem | ScoreBatchItem | ExtractBatchItem, error: UpstreamUnavailableError
+) -> ItemOutcome:
+    """A retryable error with the upstream's wait for an item its upstream did not serve.
+
+    The code is the single server's (``api.helpers.upstream_unavailable_exception``):
+    ``MODEL_LOADING`` while the model is not ready upstream, ``QUEUE_FULL``
+    otherwise. The message is fixed text.
+    """
+    if error.kind == "not_ready":
+        code, message = ErrorCode.MODEL_LOADING, "The model is loading on its upstream, please retry"
+    else:
+        code, message = ErrorCode.QUEUE_FULL, f"The upstream serving the model is {error.kind}, please retry"
     return ItemOutcome(
         work_item_id=bi.work_item_id,
         request_id=bi.request_id,
         item_index=bi.item_index,
-        disposition="nak_retry",
-        nak_delay_ms=int(delay_s * 1000),
+        disposition="publish_error_and_ack",
+        error=message,
+        error_code=code.value,
+        retry_after_s=error.retry_after_s,
     )
 
 
@@ -2245,9 +2288,7 @@ def _inference_exception_outcome(
         # against a future caller that submits through the queueing path.
         return _nak_outcome(bi)
     if isinstance(exc, UpstreamUnavailableError):
-        # A remote profile's upstream did not serve the item, and asking again
-        # later may succeed: redeliver instead of publishing a terminal error.
-        return _upstream_nak_outcome(bi, exc.retry_after_s)
+        return _upstream_refusal_outcome(bi, exc)
     if isinstance(exc, InputTooLongError):
         # The input exceeds the model's window: INPUT_TOO_LONG (HTTP 400), as
         # the HTTP path reports it, not a server-side inference failure.
