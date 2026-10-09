@@ -19,19 +19,20 @@ SIE_ENDPOINT=https://your-sie-gateway.example.com
 SIE_API_KEY=your_gateway_token
 ```
 
-Reload the server so it picks up the new env (a plain restart is not enough for
-Compose — env is baked in at container create time):
+Restart the stack so the server picks up the new env. Re-run the same start
+command: it exports the Atlas Local settings the server container needs, which a
+bare `docker compose` call leaves empty.
 
 ```bash
-# Compose (typical after ./start-services.sh)
-docker compose up -d --force-recreate server
+# Compose (after ./start-services.sh --mongodb-local)
+./start-services.sh --mongodb-local
 
 # Host-run server instead: reload or restart uvicorn
 ```
 
 Load only SIE vars into the **current shell** before gateway curls (do not
-`source .env` wholesale — that overwrites the host CLI `MONGODB_ATLAS_LOCAL_URI` export
-from [Getting started](./getting-started.md) with the Atlas placeholder):
+`source .env` wholesale — it overwrites the `MONGODB_ATLAS_LOCAL_URI` export
+you set in [Getting started](./getting-started.md)):
 
 ```bash
 export SIE_ENABLED=true
