@@ -87,11 +87,14 @@ class PreparedItem[T: Payload]:
             across modalities; the BatchFormer sum is only meaningful within
             one modality.
         original_index: Position in original request for result reordering.
+        runs_alone: Never batched with other items; such items are served one
+            per batch in arrival order.
     """
 
     payload: T
     cost: int
     original_index: int
+    runs_alone: bool = False
 
 
 @dataclass(slots=True)
@@ -358,6 +361,13 @@ class GlmOcrPayload(Payload):
 
 # Type alias for GLM-OCR prepared item
 GlmOcrPreparedItem = PreparedItem[GlmOcrPayload]
+
+
+@dataclass(slots=True)
+class LightOnOCR3Payload(GlmOcrPayload):
+    """Complete Qwen3.5 processor inputs bound to the trained OCR prompt mode."""
+
+    instruction: str | None = None
 
 
 @dataclass(slots=True)

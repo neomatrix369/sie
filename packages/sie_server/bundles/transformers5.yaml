@@ -13,6 +13,10 @@ adapters:
 - sie_server.adapters.st_sparse_vision.adapter
 # TopK-Embed-V1 multi-vector text + page-image models (Qwen3.5 backbone, transformers>=5.2).
 - sie_server.adapters.topk_embed.adapter
+# Parakeet-TDT speech-to-text (ParakeetForTDT).
+- sie_server.adapters.parakeet.adapter
+# SAM 3 open-vocabulary detection (Sam3Model / Sam3Processor exist only in transformers 5.x).
+- sie_server.adapters.sam3.adapter
 deps:
   # Transformers 5.x for models requiring newer architecture support
   # (e.g., LightOnOCR-2-1B needs LightOnOcrForConditionalGeneration,
@@ -47,6 +51,9 @@ deps:
   opf:
     url: git+https://github.com/openai/privacy-filter@f7f00ca7fb869683eb732c010299d901457f19c3
   tiktoken: '==0.12.0'
+  # Parakeet's feature extractor builds its mel filter bank with librosa and
+  # refuses to load without it. Exact: the version Parakeet-TDT was validated with.
+  librosa: '==1.0.0'
   # TopK-Embed-V1 packed path (adapters/topk_embed/packed.py): the Gated
   # DeltaNet chunked delta rule and causal conv (flash-linear-attention's
   # Triton kernels) and FlashAttention's varlen attention. CUDA only; without

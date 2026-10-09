@@ -136,6 +136,27 @@ upstream's `usage` without `input_tokens`. Generation fails closed: a
 generation, chat or completion response without exact final usage is an
 error, never a success.
 
+Queued generation for a model with local weights, served by an `openai`
+upstream, is counted as if it had run locally. The worker renders the model's
+chat template and counts the prompt with the model's tokenizer. It counts the
+completion from every text the upstream returned, private reasoning included,
+with the same tokenizer. The terminal chunk reports that count without cached
+tokens, and carries the upstream's own counts in `usage.upstream_usage`. The
+gateway decodes that field for consumers of its stream outcome and never
+returns it to a caller. A request whose messages the local template cannot
+render, or whose counted prompt exceeds the context length, fails before it is
+sent. When the local tokenizer does not load, or has no chat template for a
+chat request, the upstream's counts are reported instead. An `sie` upstream
+serves the same model and counts with its tokenizer, so its counts are reported
+as they are. Single-node serving reports the upstream's counts.
+
+The `remote` bundle installs transformers 5, so the worker can load tokenizer
+configs in the transformers-5 format (`tokenizer_class: TokenizersBackend`),
+such as GLM-5.3-Flash's. In a cluster the chart runs the remote lane on the
+`cpu-transformers5` image, which provides it. A remote lane pinned to another
+image keeps serving, but a model whose tokenizer uses that format reports the
+upstream's counts there.
+
 ## OpenAI-compatible embeddings and rerank
 
 Define a `kind: openai` upstream with a base URL that includes the provider's
@@ -200,7 +221,10 @@ received no answer, so it is `QUEUE_FULL`. Any other failure is
 
 Each upstream has a required rate cap and a circuit breaker. The limits are
 shared by that worker process's adapters, not across replicas: adding remote
-worker replicas increases the aggregate permitted traffic. Under
+worker replicas increases the aggregate permitted traffic. Background identity
+refreshes never consume the inference rate cap; they have a smaller budget of
+their own, described under
+[Admitting SIE identity fallback](#admitting-sie-identity-fallback). Under
 `remote_only`, unavailable upstreams, open breakers and reached caps return
 retryable `503` responses with `Retry-After`. In a cluster the remote worker
 answers such a request at once instead of redelivering it, and the gateway
@@ -378,6 +402,22 @@ its own and holds off the next read for 2 seconds. The next check after expiry
 refreshes metadata. A concurrent refresh
 refuses another bridge instead of waiting or starting a second metadata request.
 Changes to the installed upstream discard the previous observation.
+
+Background identity refreshes never consume the inference rate cap. A check
+that does not wait, such as the admission a cluster's remote lane reports and
+checks before an admitted remote attempt, refreshes the observation in the
+background before it expires. These refreshes draw on limits of their own for
+each upstream in each worker process: a tenth of
+`rate_cap.requests_per_minute`, at least one read a minute, one read at a
+time, and a circuit breaker with the upstream's `breaker` settings. Inference
+calls never use this budget. A refresh these limits refuse is not sent and
+counts as a failed read. While such checks continue, each model's observation
+is read about every 20 seconds, so the limits keep about a third as many
+models admitted as they allow reads a minute: two per process for an upstream
+capped at 60 requests a minute. Past that, admissions lapse and requests stay
+local. Reads that a check waits for, at configuration load, at hot reload and
+before a single-node bridge, count against the upstream's rate cap and breaker
+like inference calls.
 
 Because configuration load runs this comparison, a single-node server whose
 models directory holds a hybrid SIE-identity `encode` or `score` model depends

@@ -1,6 +1,8 @@
 sie_id: gliner-community/gliner_medium-v2.5
 hf_id: gliner-community/gliner_medium-v2.5
 hf_revision: 88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da
+hf_tokenizer_dependencies:
+  gliner-community/gliner_medium-v2.5: 88c3b98b57ad5e7d66fb209ed61c53f4b1fd05da
 inputs:
   text: true
   image: false
@@ -13,6 +15,11 @@ tasks:
 profiles:
   default:
     max_batch_tokens: 16384
+    # The adaptive controller compares request latency, queue time included, with
+    # its target, so under load it keeps shrinking GLiNER's batches; with it off,
+    # GLiNER keeps full batches and a steady throughput under load.
+    adaptive_batching:
+      enabled: false
     compute_precision: null
     adapter_path: sie_server.adapters.gliner:GLiNERAdapter
     adapter_options:
