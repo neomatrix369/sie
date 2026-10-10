@@ -51,8 +51,8 @@ curl --connect-timeout 5 --max-time 15 \
 # → ok
 ```
 
-**2. Model can encode** — accept only HTTP **200**; retry **503** (warm-up) and
-**504** (gateway timeout, retryable with `Retry-After: 5`);
+**2. Model can encode** — accept only HTTP **200**; retry **503** (model loading) and
+**504** (gateway timeout, retryable);
 stop on terminal failures (e.g. **502**, **401**):
 
 ```bash
